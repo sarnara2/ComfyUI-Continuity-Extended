@@ -2,6 +2,17 @@
 // contract: a key must match the string in the code to the character, and a
 // missing key simply shows the English.
 export const ko = {
+ "Replace @{handle}": "@{handle} 교체",
+ "Replacement handle": "교체할 태그",
+ "Replacement scope": "교체 범위",
+ "Name or number — no @ needed": "이름 또는 번호 입력 — @는 생략",
+ "This occurrence": "선택한 태그만",
+ "All matching in this segment": "이 세그먼트의 동일 태그 모두",
+ "Only the clicked citation changes.": "클릭한 태그 하나만 바뀝니다.",
+ "{count} exact matches in this segment. Other prompts stay unchanged.": "이 세그먼트의 같은 태그 {count}개만 바뀝니다. 다른 프롬프트는 유지됩니다.",
+ "Replace {count} matches": "동일 태그 {count}개 교체",
+ "Edit cast member": "출연진 편집",
+ "The prompt changed. Close and reopen the replacement picker.": "프롬프트가 변경됐습니다. 교체창을 닫고 다시 열어주세요.",
  "Reference preview": "참조 미리보기",
  "Previous reference": "이전 참조",
  "Next reference": "다음 참조",

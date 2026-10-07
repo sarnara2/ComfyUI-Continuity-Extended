@@ -67,6 +67,20 @@ const COMMAND = /\/([\w-]*)$/;
 const QUOTED = /[\u0022\u201c]([^\u0022\u201c\u201d\n]{1,400})[\u0022\u201d]$/;
 const MAX_SUGGESTIONS = 40;
 
+function handlePattern(handle) {
+  const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`@${escaped}(?![A-Za-z0-9_-])`, "g");
+}
+
+/** Replace an exact citation, retaining any :scope suffix. */
+export function replacePromptHandle(text, from, to, at, all = false) {
+  const pattern = handlePattern(from);
+  if (all) return text.replace(pattern, () => `@${to}`);
+  const match = pattern.exec(text.slice(at));
+  if (!match || match.index !== 0) return text;
+  return `${text.slice(0, at)}@${to}${text.slice(at + from.length + 1)}`;
+}
+
 /* A finished spoken line, as `sayText` writes one and `build` reads one back.
 
    Every piece of it is the guide's: `(S@anna)` is the speaker token
@@ -313,6 +327,8 @@ export class PromptBox {
    * @param {object} hooks
    * @param {()=>object} hooks.getState      current creator state
    * @param {(text:string)=>void} hooks.onInput   prompt text changed
+   * @param {boolean} [hooks.replaceHandles] click a citation to replace it
+   *   in this prompt, optionally replacing all exact matches in this prompt
    * @param {(row:object)=>string|null} hooks.onAttach  attach an input-folder file, -> handle
    * @param {(kind:string)=>string|null} hooks.attachBlocked  why attaching is impossible, or null
    * @param {()=>object[]} [hooks.getPool]   the piece's reference pool, for a
@@ -389,7 +405,8 @@ export class PromptBox {
       // The second class is the affordance: a cast chip is only worth a pointer
       // where clicking it opens somebody, and that is the host's answer
       // rather than the box's.
-      class: `mmc-prompt${hooks.onCastChip ? " mmc-prompt-castable" : ""}`,
+      class: `mmc-prompt${hooks.onCastChip ? " mmc-prompt-castable" : ""}${
+        hooks.replaceHandles ? " mmc-prompt-replaceable" : ""}`,
       contenteditable: "true",
       spellcheck: "false",
       role: "textbox",
@@ -448,6 +465,12 @@ export class PromptBox {
         this.editSaid(said);
         return;
       }
+      const replace = this.replaceChip(event);
+      if (replace) {
+        event.preventDefault();
+        this.editHandle(replace);
+        return;
+      }
       const chip = this.castChip(event);
       if (chip) {
         event.preventDefault();
@@ -475,7 +498,8 @@ export class PromptBox {
     // Only the names, and only where they open somebody. A file's chip is not a
     // control, so selecting it is the ordinary thing to be doing with it.
     this.root.addEventListener("mousedown", (event) => {
-      if (this.castChip(event) || this.refChip(event) || event.target?.closest?.("[data-say]")) event.preventDefault();
+      if (this.replaceChip(event) || this.castChip(event) || this.refChip(event)
+          || event.target?.closest?.("[data-say]")) event.preventDefault();
     });
 
     // The graph canvas swallows keys and drags otherwise, and answers a copy
@@ -922,7 +946,9 @@ export class PromptBox {
       ...(scope ? { "data-scope": scope } : {}),
       // Said on the chip, because a gesture nobody can see is a gesture nobody
       // finds. The pointer is the other half of it — see .mmc-prompt-castable.
-      title: subject && this.hooks.onCastChip
+      title: this.hooks.replaceHandles
+        ? t("Replace @{handle}", { handle })
+        : subject && this.hooks.onCastChip
         ? t("Edit @{handle}", { handle })
         : !subject && this.hooks.onRefChip
           ? t("What @{handle} is for", { handle })
@@ -944,6 +970,174 @@ export class PromptBox {
     if (!this.hooks.onRefChip) return null;
     const chip = event.target?.closest?.(".mmc-ref[data-handle]:not(.mmc-ref-cast)");
     return chip && this.root.contains(chip) ? chip : null;
+  }
+
+  replaceChip(event) {
+    if (!this.hooks.replaceHandles) return null;
+    const chip = event.target?.closest?.(".mmc-ref[data-handle]");
+    return chip && this.root.contains(chip) ? chip : null;
+  }
+
+  /** Read offsets as getValue does, including browser-created wrappers. */
+  handleOffset(chip) {
+    let text = "";
+    const walk = (parent) => {
+      for (const node of parent.childNodes) {
+        if (node === chip) return true;
+        if (node.nodeType === Node.TEXT_NODE) text += bare(node.nodeValue);
+        else if (node.dataset?.say !== undefined) text += node.dataset.say;
+        else if (node.dataset?.handle) {
+          text += `@${node.dataset.handle}${node.dataset.scope ? `:${node.dataset.scope}` : ""}`;
+        } else if (node.tagName === "BR") text += "\n";
+        else {
+          if (BLOCK.has(node.tagName) && text && !text.endsWith("\n")) text += "\n";
+          if (walk(node)) return true;
+        }
+      }
+      return false;
+    };
+    return walk(this.root) ? text.length : null;
+  }
+
+  editHandle(chip) {
+    const at = this.handleOffset(chip);
+    if (at === null) return;
+    this.closeMenu();
+    const handle = chip.dataset.handle;
+    const cast = (this.hooks.getCast?.() ?? []).some((s) => s.handle === handle);
+    const screen = (this.hooks.getScreens?.() ?? []).some((s) => s.handle === handle);
+    this.replacing = {
+      handle, at, before: this.getValue(), all: false,
+      kind: cast ? "cast" : screen ? "screen" : "reference",
+    };
+    this.query = "";
+    this.mode = "replace";
+    this.anchor = chip.getBoundingClientRect();
+    this.menu = el("div", {
+      class: "mmc-mention mmc-pop mmc-handle-replace", role: "dialog",
+      "aria-label": t("Replace @{handle}", { handle }),
+    });
+    const field = el("input", {
+      class: "mmc-say-field", type: "text", spellcheck: "false",
+      placeholder: t("Name or number — no @ needed"),
+      "aria-label": t("Replacement handle"),
+    });
+    const scope = (all, label) => el("button", {
+      class: "mmc-say-dial", type: "button", text: label,
+      "aria-pressed": all === false,
+      onclick: () => { this.replacing.all = all; this.updateReplacement(); },
+    });
+    const one = scope(false, t("This occurrence"));
+    const every = scope(true, t("All matching in this segment"));
+    const note = el("div", { class: "mmc-mention-sub mmc-handle-note", role: "status" });
+    const list = el("div", { class: "mmc-handle-list" });
+    const apply = el("button", {
+      class: "mmc-say-dial mmc-handle-apply", type: "button", text: t("Replace"),
+      onclick: () => this.applyReplacement(),
+    });
+    Object.assign(this.replacing, { field, one, every, note, list, apply });
+    const actions = el("div", { class: "mmc-handle-actions" }, [
+      el("button", {
+        class: "mmc-say-dial", type: "button", text: t("Cancel"),
+        onclick: () => { this.closeMenu(); this.root.focus(); },
+      }), apply,
+    ]);
+    this.menu.append(
+      el("div", { class: "mmc-mention-head", text: t("Replace @{handle}", { handle }) }),
+      el("div", { class: "mmc-handle-search" }, [
+        el("span", { class: "mmc-handle-prefix", text: "@", "aria-hidden": "true" }), field,
+      ]),
+      el("div", { class: "mmc-handle-scope", role: "group", "aria-label": t("Replacement scope") }, [one, every]),
+      note, list, actions,
+    );
+    // Keep the old cast-editor shortcut available without replacing any text.
+    if (cast && this.hooks.onCastChip) {
+      actions.insertBefore(el("button", {
+        class: "mmc-say-dial mmc-handle-edit", type: "button", text: t("Edit cast member"),
+        onclick: () => { this.closeMenu(); this.hooks.onCastChip(handle); },
+      }), actions.firstChild);
+    }
+    field.addEventListener("input", () => {
+      this.query = field.value.trim().replace(/^@/, "").toLowerCase();
+      this.active = 0;
+      this.renderMenu();
+      this.updateReplacement();
+    });
+    this.menu.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.key === "Escape") { event.preventDefault(); this.closeMenu(); this.root.focus(); }
+      if (event.target !== field) return;
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault(); this.move(event.key === "ArrowDown" ? 1 : -1);
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (!this.replacementHandle()) this.choose(this.active);
+        this.applyReplacement();
+      }
+    });
+    floatAbove(this.menu);
+    document.body.appendChild(this.menu);
+    this.watchAway();
+    this.renderMenu();
+    this.updateReplacement();
+    field.focus();
+  }
+
+  replacementHandle() {
+    const value = this.replacing.field.value.trim().replace(/^@/, "").toLowerCase();
+    const exact = this.flat.find((option) => option.handle.toLowerCase() === value);
+    if (exact) return exact.handle;
+    // Prefer the clicked handle's numbering family; do not invent a new name.
+    const prefix = this.replacing.handle.match(/^(.*(?:_|-))\d+$/)?.[1]
+      ?? `${this.replacing.handle}_`;
+    const sibling = /^\d+$/.test(value)
+      ? this.flat.find((option) => option.handle.toLowerCase() === `${prefix}${value}`.toLowerCase())
+      : null;
+    if (sibling) return sibling.handle;
+    // Otherwise a number alone must identify one available handle unambiguously.
+    const numbered = /^\d+$/.test(value)
+      ? this.flat.filter((option) => option.handle.match(/(?:_|-)(\d+)$/)?.[1] === value)
+      : [];
+    return numbered.length === 1 ? numbered[0].handle : null;
+  }
+
+  updateReplacement() {
+    const change = this.replacing;
+    if (!change) return;
+    const count = [...change.before.matchAll(handlePattern(change.handle))].length;
+    change.one.setAttribute("aria-pressed", String(!change.all));
+    change.every.setAttribute("aria-pressed", String(change.all));
+    change.note.textContent = change.all
+      ? t("{count} exact matches in this segment. Other prompts stay unchanged.", { count })
+      : t("Only the clicked citation changes.");
+    const target = this.replacementHandle();
+    change.apply.disabled = !target || target === change.handle;
+    change.apply.textContent = change.all ? t("Replace {count} matches", { count }) : t("Replace");
+  }
+
+  applyReplacement() {
+    const change = this.replacing;
+    if (!change) return;
+    const handle = this.replacementHandle();
+    if (!handle || handle === change.handle) return;
+    if (this.getValue() !== change.before) {
+      change.note.textContent = t("The prompt changed. Close and reopen the replacement picker.");
+      return;
+    }
+    // Resolve again against today's state; a listed asset can be removed while open.
+    if (!this.groups().some((group) => group.options.some((option) => option.handle === handle))) return;
+    const text = replacePromptHandle(change.before, change.handle, handle, change.at, change.all);
+    const before = this.chipped;
+    const at = change.all
+      ? replacePromptHandle(change.before.slice(0, change.at), change.handle, handle, 0, true).length
+      : change.at;
+    this.closeMenu();
+    this.setValue(text);
+    // The normal editing path owns waking and muting this shot's references.
+    this.chipped = before;
+    this.placeCaret(at + handle.length + 1);
+    this.onEdit();
   }
 
   /**
@@ -1489,7 +1683,8 @@ export class PromptBox {
       const length = node.nodeType === Node.TEXT_NODE
         ? bare(node.nodeValue).length
         : node.dataset?.say !== undefined ? node.dataset.say.length
-        : node.dataset?.handle ? node.dataset.handle.length + 1 : 1;
+        : node.dataset?.handle ? node.dataset.handle.length + 1
+          + (node.dataset.scope ? node.dataset.scope.length + 1 : 0) : 1;
       if (node.nodeType === Node.TEXT_NODE && index <= at + length) {
         const range = document.createRange();
         range.setStart(node, rawOffset(node.nodeValue, Math.max(0, index - at)));
@@ -1734,6 +1929,7 @@ export class PromptBox {
     this.editing = null;
     this.anchor = null;
     this.asking = false;
+    this.replacing = null;
   }
 
   place() {
@@ -1748,7 +1944,7 @@ export class PromptBox {
     const box = this.menu.getBoundingClientRect();
     const height = box.height || 260;
     const top = anchor.top - height - 8 > 8 ? anchor.top - height - 8 : anchor.bottom + 8;
-    this.menu.style.left = `${Math.max(8, Math.min(anchor.left, window.innerWidth - 340))}px`;
+    this.menu.style.left = `${Math.max(8, Math.min(anchor.left, window.innerWidth - (box.width || 330) - 8))}px`;
     this.menu.style.top = `${Math.max(8, Math.min(top, window.innerHeight - height - 8))}px`;
   }
 
@@ -2086,6 +2282,15 @@ export class PromptBox {
    * cases where you are going to type a few letters anyway.
    */
   groups() {
+    if (this.replacing) {
+      const { cast, attached, screens, pool } = this.options();
+      if (this.replacing.kind === "cast") return [{ head: t("In this piece"), options: cast }];
+      if (this.replacing.kind === "screen") return [{ head: t("Screens"), options: screens }];
+      return [
+        { head: this.hooks.attachedLabel?.() ?? t("Attached"), options: attached },
+        { head: t("Piece references"), options: pool },
+      ];
+    }
     if (this.mode === '"') return this.sayOptions();
     if (this.mode === "/") return this.commandOptions();
     const { cast, roster, attached, screens, pool, library } = this.options();
@@ -2128,10 +2333,12 @@ export class PromptBox {
     if (this.rows?.length && signature === this.signature) return;
     this.signature = signature;
 
-    this.menu.replaceChildren();
+    const menu = this.replacing?.list ?? this.menu;
+    menu.replaceChildren();
     this.rows = [];
     if (!this.flat.length) {
-      this.menu.appendChild(el("div", { class: "mmc-mention-empty", text: t("Nothing matches.") }));
+      menu.appendChild(el("div", { class: "mmc-mention-empty", text: t("Nothing matches.") }));
+      this.place();
       return;
     }
 
@@ -2257,7 +2464,7 @@ export class PromptBox {
     // Left arrow does it too — see `onKeyDown` — but a menu opened with the
     // mouse has to be closable with it.
     if (this.mode !== "@" && this.branch) {
-      this.menu.appendChild(el("button", {
+      menu.appendChild(el("button", {
         class: "mmc-mention-back",
         onmouseenter: () => this.highlight(this.active),
         // As above, and this one has always needed it: the way back out of a
@@ -2276,8 +2483,8 @@ export class PromptBox {
     }
     for (const group of groups) {
       if (!group.options.length) continue;
-      this.menu.appendChild(el("div", { class: "mmc-mention-head", text: group.head }));
-      for (const option of group.options) this.menu.appendChild(row(option));
+      menu.appendChild(el("div", { class: "mmc-mention-head", text: group.head }));
+      for (const option of group.options) menu.appendChild(row(option));
     }
     if (this.mode === '"' && !this.branch) this.menu.appendChild(this.sayBar());
     this.place();
@@ -2574,6 +2781,12 @@ export class PromptBox {
   async choose(index) {
     const option = this.flat?.[index];
     if (!option) return;
+    if (this.replacing) {
+      this.replacing.field.value = option.handle;
+      this.highlight(index);
+      this.updateReplacement();
+      return;
+    }
     // On screen writes nothing, and that is the answer rather than a way out of
     // one: §4.5's syntax for a sign, a banner or a subtitle is plain double
     // quotes, so the words are already in the form the model reads. The row

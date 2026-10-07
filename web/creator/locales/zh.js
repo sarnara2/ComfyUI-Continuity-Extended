@@ -3,6 +3,17 @@
 // must match the string in the code to the character, and a missing key simply
 // shows the English.
 export const zh = {
+ "Replace @{handle}": "替换 @{handle}",
+ "Replacement handle": "替换目标标记",
+ "Replacement scope": "替换范围",
+ "Name or number — no @ needed": "输入名称或编号 — 无需输入 @",
+ "This occurrence": "仅此处",
+ "All matching in this segment": "此片段中所有相同标记",
+ "Only the clicked citation changes.": "仅替换点击的引用。",
+ "{count} exact matches in this segment. Other prompts stay unchanged.": "仅替换此片段中完全匹配的 {count} 处引用。其他提示词保持不变。",
+ "Replace {count} matches": "替换 {count} 处",
+ "Edit cast member": "编辑出演者",
+ "The prompt changed. Close and reopen the replacement picker.": "提示词已更改。请关闭并重新打开替换窗口。",
  "Reference preview": "参考素材预览",
  "Previous reference": "上一个参考素材",
  "Next reference": "下一个参考素材",

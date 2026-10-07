@@ -431,7 +431,7 @@ class Fullscreen {
           el("span", { class: "mmc-fs-logo" }, [mark(22)]),
           // The pack, and it is a product name rather than copy, so it is not
           // translated and does not change with what is on the card.
-          el("span", { text: "Continuity" }),
+          el("span", { text: "Continuity - Extended" }),
           el("span", { class: "mmc-fs-caret" }, [icon("chevron", 12)]),
         ]),
         el("span", { class: "mmc-fs-slash", text: "/" }),

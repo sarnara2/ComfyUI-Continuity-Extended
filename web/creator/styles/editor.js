@@ -705,6 +705,35 @@ button.mmc-asset-owner:hover, button.mmc-asset-owner:focus-visible {
 }
 .mmc-mention-empty { color: var(--mmc-faint); font-size: calc(13px * var(--mmc-type)); padding: 14px 10px; }
 
+.mmc-prompt-replaceable .mmc-ref { cursor: pointer; }
+.mmc-prompt-replaceable .mmc-ref:hover {
+  background: color-mix(in srgb, var(--tag, var(--mmc-accent)) 26%, transparent);
+}
+.mmc-mention.mmc-handle-replace {
+  display: flex; flex-direction: column; width: min(360px, calc(100vw - 16px));
+  max-height: min(460px, calc(100vh - 16px)); overflow: hidden; gap: 5px;
+}
+.mmc-handle-search {
+  display: flex; align-items: center; gap: 6px; margin: 0 7px;
+  border: 1px solid var(--mmc-line); border-radius: 9px; background: var(--mmc-surface-3);
+}
+.mmc-handle-prefix { color: var(--mmc-off); padding-left: 10px; font-size: calc(15px * var(--mmc-type)); }
+.mmc-handle-search .mmc-say-field { min-width: 0; border: 0; background: transparent; padding: 8px 6px; }
+.mmc-handle-search:focus-within { border-color: var(--mmc-blue); }
+.mmc-handle-scope { display: flex; flex-wrap: wrap; gap: 5px; margin: 2px 7px; }
+.mmc-handle-scope [aria-pressed="true"] {
+  border-color: var(--mmc-accent); color: var(--mmc-accent); background: var(--mmc-surface-2);
+}
+.mmc-handle-note { padding: 0 9px 4px; white-space: normal; }
+.mmc-handle-list { min-height: 0; max-height: 210px; overflow-y: auto; overscroll-behavior: contain; }
+.mmc-handle-actions {
+  display: flex; justify-content: flex-end; align-items: center; gap: 6px;
+  border-top: 1px solid var(--mmc-line); padding: 8px 4px 3px; flex: none;
+}
+.mmc-handle-edit { margin-right: auto; }
+.mmc-handle-apply { border-color: var(--mmc-accent); color: var(--mmc-accent); }
+.mmc-handle-apply:disabled { opacity: .4; cursor: default; }
+
 /* --- the quote menu's own rows ---------------------------------------------
  *
  * The same rows, answering a different kind of question. Everywhere else in

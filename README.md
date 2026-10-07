@@ -1,4 +1,22 @@
-# Continuity
+# Continuity - Extended
+
+This is sarnara2's personal fork of
+[Continuity](https://github.com/roadmaus/ComfyUI-Continuity), not an upstream release.
+
+## Extended changes
+
+Click a recognized `@handle` in a segment prompt to choose a replacement from the
+project's cast, references or screens. Enter a name or number without typing `@`,
+or select a listed handle. Replace just the clicked occurrence (the default), or
+all exact occurrences of that handle in the current segment. Other segments and
+the global prompt stay unchanged; `@ref-1` does not change `@ref-11`. Existing
+`:scope` suffixes and reference activation rules are preserved. The picker also
+keeps a shortcut to the existing cast editor.
+
+The main node, legacy timeline title and fullscreen wordmark carry `- Extended`.
+Internal node IDs stay unchanged, so existing workflows remain compatible.
+Install this fork **instead of** the upstream pack, not alongside it: both register
+the same node IDs. Original licenses and credits are retained below.
 
 One node for AI video and stills in ComfyUI. Write a prompt, attach media with
 `@`, press Render. Six model families, all through ComfyUI core, all local
@@ -91,20 +109,21 @@ your hardware from weights you downloaded.
 
 ```
 cd ComfyUI/custom_nodes
-git clone https://github.com/roadmaus/ComfyUI-Continuity
+git clone https://github.com/sarnara2/ComfyUI-Continuity-Extended
 ```
 
-That leaves one folder, `ComfyUI-Continuity`, inside `custom_nodes/`. Restart
+That leaves one folder, `ComfyUI-Continuity-Extended`, inside `custom_nodes/`. Restart
 ComfyUI. Nothing to pip install.
 
 ### Already have MiniMax Creator installed
 
-Don't clone. This pack was renamed, and GitHub redirects the old address here,
-so a pull in the folder you already have is the whole update:
+Keep a single installation. To switch an existing checkout to this fork, back up
+or commit local changes first, then change its remote before updating:
 
 ```
 cd ComfyUI/custom_nodes/ComfyUI-MiniMax-Creator
-git pull
+git remote set-url origin https://github.com/sarnara2/ComfyUI-Continuity-Extended.git
+git pull --ff-only
 ```
 
 The folder name doesn't matter to ComfyUI, so rename it or leave it. If it came

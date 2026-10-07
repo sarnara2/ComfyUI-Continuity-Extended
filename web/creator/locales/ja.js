@@ -2,6 +2,17 @@
 // contract: a key must match the string in the code to the character, and a
 // missing key simply shows the English.
 export const ja = {
+ "Replace @{handle}": "@{handle} を置き換える",
+ "Replacement handle": "置き換え先のハンドル",
+ "Replacement scope": "置き換え範囲",
+ "Name or number — no @ needed": "名前または番号を入力 — @ は不要",
+ "This occurrence": "この箇所のみ",
+ "All matching in this segment": "このセグメントの同じハンドルすべて",
+ "Only the clicked citation changes.": "クリックした参照だけを置き換えます。",
+ "{count} exact matches in this segment. Other prompts stay unchanged.": "このセグメントの完全一致する {count} 箇所だけを置き換えます。他のプロンプトは変更しません。",
+ "Replace {count} matches": "{count} 箇所を置き換える",
+ "Edit cast member": "出演者を編集",
+ "The prompt changed. Close and reopen the replacement picker.": "プロンプトが変更されました。置き換えウィンドウを閉じて、再度開いてください。",
  "Reference preview": "参照プレビュー",
  "Previous reference": "前の参照",
  "Next reference": "次の参照",

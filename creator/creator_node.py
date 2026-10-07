@@ -354,7 +354,7 @@ def _render(blob, seed, steps, cfg, sampler_name, scheduler,
 class MiniMaxH3Creator(io.ComfyNode):
     @classmethod
     def define_schema(cls):
-        return _schema("MiniMaxH3Creator", "Continuity", "creator_data")
+        return _schema("MiniMaxH3Creator", "Continuity - Extended", "creator_data")
 
     @classmethod
     def fingerprint_inputs(cls, creator_data, **kwargs):
@@ -396,7 +396,7 @@ class MiniMaxH3Timeline(io.ComfyNode):
 
     @classmethod
     def define_schema(cls):
-        return _schema("MiniMaxH3Timeline", "Continuity Timeline", "timeline_data",
+        return _schema("MiniMaxH3Timeline", "Continuity Timeline - Extended", "timeline_data",
                        deprecated=True)
 
     @classmethod

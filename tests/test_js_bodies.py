@@ -1949,6 +1949,10 @@ try {
     target: box.querySelectorAll('.mmc-ref-cast[data-handle="vera"]')[0],
     preventDefault() {}, stopPropagation() {},
   }));
+  // Replacing citations is the first click now; the original editor is retained
+  // as a shortcut in that picker and still hands off to the window's shelf.
+  document.body.children.at(-1).querySelectorAll(".mmc-handle-edit")[0]
+    ?.listeners.click[0]();
   out.castCard = {
     // The card draws no shelf and no Cast tool of its own...
     noShelf: findAll(sheet, "mmc-cast").length === 0,
@@ -2001,6 +2005,7 @@ try {
     target: box.querySelectorAll('.mmc-ref-cast[data-handle="vera"]')[0],
     preventDefault() {}, stopPropagation() {},
   }));
+  editor.prompt.menu?.querySelectorAll(".mmc-handle-edit")[0]?.listeners.click[0]();
   out.castRebuilt = {
     simple, told, foldedRows, rebuiltFolded,
     toolOnRail: !!tool, toolCount: tool?.text?.includes("1") ?? false,
@@ -2050,6 +2055,8 @@ try {
     box.listeners?.click?.forEach((fn) => fn({
       target: chip, preventDefault() {}, stopPropagation() {},
     }));
+    // Keep exercising the original cast-editor route through its new shortcut.
+    editor.prompt.menu?.querySelectorAll(".mmc-handle-edit")[0]?.listeners.click[0]();
     return true;
   };
   // What the browser would do with the press if nobody stopped it: select the
@@ -2091,10 +2098,9 @@ try {
   };
   out.castClick.noSelectOnName =
     cancelled(held(box, `.mmc-ref-cast[data-handle="vera"]`));
-  // ...and a file's chip is not a control, so it goes on selecting the way any
-  // other part of the sentence does.
-  out.castClick.fileStillSelects =
-    !cancelled(held(box, `.mmc-ref[data-handle="img-1"]`));
+  // File chips now open the replacement picker, and must not get selected.
+  out.castClick.noSelectOnFile =
+    cancelled(held(box, `.mmc-ref[data-handle="img-1"]`));
   // The press is its own undo: the same name again shuts the card it opened.
   press("lego_brickfilm");
   out.castClick.shutAgain = editor.castShelf?.opened ?? null;
@@ -2930,7 +2936,7 @@ try {
   const rowWith = (root, cls, text) =>
     root?.querySelectorAll("." + cls).find((h) => (h.text ?? "").includes(text));
 
-  const mark = rowWith(shell, "mmc-fs-mark", "Continuity");
+  const mark = rowWith(shell, "mmc-fs-mark", "Continuity - Extended");
   press(mark);
   const dash = shell.querySelectorAll(".mmc-dash")[0];
   const settle = () => new Promise((done) => setTimeout(done, 0));
@@ -3758,15 +3764,15 @@ check("...in a box that says so with the pointer", click.get("castable"), True)
 check("a render leaves the face editor where it was", click.get("editorKept"), True)
 check("...the box with it", click.get("boxKept"), True)
 check("...and the chip the press would land on", click.get("chipKept"), True)
-check("clicking a person opens them on the shelf",
+check("a clicked person's editor shortcut opens them on the shelf",
       (click.get("pressedPerson"), click.get("onPerson")), (True, "vera"))
-check("...and clicking a look opens the look",
+check("...and a clicked look's shortcut opens the look",
       (click.get("pressedStyle"), click.get("onStyle")), (True, "lego_brickfilm"))
 # A press on a name is a command, so the browser must not also turn the name
 # into a blue block — which is what a click on a contenteditable="false" chip
 # does if nobody stops it, and it stays one until you click somewhere else.
 check("pressing a name makes no selection", click.get("noSelectOnName"), True)
-check("...while a file's chip still selects", click.get("fileStillSelects"), True)
+check("...and a replaceable file makes no selection", click.get("noSelectOnFile"), True)
 check("clicking the same name again shuts the card", click.get("shutAgain"), None)
 check("...and once more opens it", click.get("reopened"), "lego_brickfilm")
 

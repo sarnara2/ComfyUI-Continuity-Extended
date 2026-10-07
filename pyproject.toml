@@ -7,10 +7,8 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/roadmaus/ComfyUI-Continuity"
-"Bug Tracker" = "https://github.com/roadmaus/ComfyUI-Continuity/issues"
+Repository = "https://github.com/sarnara2/ComfyUI-Continuity-Extended"
 
 [tool.comfy]
-PublisherId = "roadmaus"
-DisplayName = "Continuity"
-Icon = "https://raw.githubusercontent.com/roadmaus/ComfyUI-Continuity/main/docs/img/icon.svg"
+DisplayName = "Continuity - Extended"
+Icon = "https://raw.githubusercontent.com/sarnara2/ComfyUI-Continuity-Extended/main/docs/img/icon.svg"

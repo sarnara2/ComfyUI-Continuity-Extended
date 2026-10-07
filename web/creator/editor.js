@@ -317,6 +317,7 @@ export class CreatorEditor {
 
     this.prompt = new PromptBox({
       getState: () => this.state,
+      replaceHandles: true,
       onInput: (text) => {
         this.state.prompt = text;
         this.onCommit?.();
