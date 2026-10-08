@@ -81,7 +81,7 @@ for (const [language, expected] of languages) {
   for (const chip of missing) truth(chip.getAttribute("title").includes(
     t("Timing is unavailable for this result.")), `${language} unavailable explanation`);
   truth(timingChips({ totalMs: 1000, totalPending: true })[0].getAttribute("title").includes(
-    t("The workflow is still running.")), `${language} pending explanation`);
+    t("The queued renders have not all finished.")), `${language} pending explanation`);
 }
 locale = "en";
 for (const invalid of [undefined, null, NaN, Infinity, -1, "0"]) {
@@ -92,8 +92,8 @@ eq(chipSnapshot(timingChips({ totalMs: 0, tookMs: 0 })).map((c) => c.value),
   ["0:00", "0:00"], "a measured zero is still a valid time");
 const explanations = timingChips({ totalMs: 1000, tookMs: 500 });
 eq(explanations[0].getAttribute("title"),
-  "From workflow execution start to completion, including loading and other nodes; queue waiting is excluded.",
-  "total scope includes loading, not queue waiting");
+  "From the first accepted render to the end of its queued batch, including waiting. Results without queue timing show workflow execution time only.",
+  "total scope includes queued batches and distinguishes older workflow-only timing");
 eq(explanations[1].getAttribute("title"),
   "From the first detected sampling progress or preview to the saved result, including decoding, post-processing and saving; not sampling alone.",
   "render window is not described as sampling alone");
@@ -287,7 +287,7 @@ const pendingMedia = shell.reviewing.media;
 const pendingActions = pendingCard.querySelector(".mmc-stage-actions");
 const pendingClocks = pendingCard.querySelector(".mmc-stage-times");
 Object.assign(pendingMedia, { currentTime: 6.25, paused: false });
-truth(clocks(pendingCard)[0].title.includes("The workflow is still running."), "review explains the pending total");
+truth(clocks(pendingCard)[0].title.includes("The queued renders have not all finished."), "review explains the pending total");
 pendingResult.totalMs = 7000;
 tickReviews();
 eq(values(pendingCard), ["0:07", "0:03"], "pending tick reads updated timing from the same result");
@@ -301,7 +301,7 @@ pendingResult.totalMs = 9000;
 pendingResult.totalPending = false;
 tickReviews();
 eq(values(pendingCard), ["0:09", "0:03"], "terminal tick paints the final total");
-eq(clocks(pendingCard)[0].title.includes("The workflow is still running."), false, "terminal tick removes the pending note");
+eq(clocks(pendingCard)[0].title.includes("The queued renders have not all finished."), false, "terminal tick removes the pending note");
 eq(reviewTimers.size, 0, "terminal repaint stops its timer");
 eq([pendingMedia.currentTime, pendingMedia.paused], [6.25, false], "terminal repaint still does not restart video");
 shell.endReview({ animate: false });

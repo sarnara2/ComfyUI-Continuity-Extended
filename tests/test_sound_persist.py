@@ -56,6 +56,9 @@ function laid(entries = [{ filename: "score.wav", at_s: 0, in_s: 0, out_s: 5 }])
   let commits = 0;
   const lane = new SoundLane({ read: () => piece, onCommit: () => { commits += 1; },
                                flash: () => {} });
+  // This suite exercises the original snap-enabled gestures; free drag and the
+  // new per-track switch are covered by test-sound-clip-snap.cjs in a browser.
+  for (const entry of piece.sound) lane.snaps.add(entry);
   lane.lengths.set("score.wav", 30);
   lane.render();
   return { piece, lane, commits: () => commits };
@@ -226,7 +229,7 @@ const grip = (lane, edge) =>
   const { piece, lane } = laid();
   const node = block(lane);
   press(node, 0);
-  move(node, 40);
+  move(node, 30);
   lift(node);
 
   const saved = S.serializeTimeline(piece);

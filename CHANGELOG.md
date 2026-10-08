@@ -6,6 +6,35 @@ exactly as it was written, wall of text and all.
 
 ## Unreleased
 
+### Extended fork — 2026-10-08
+
+**Timeline and media-picker usability updates for this personal fork.** The five
+timeline sections remember their disclosure state in workflow properties. Queued
+renders share a batch-wide elapsed clock while each result keeps its own render
+span, with one stage for normal and fullscreen views. Media imports can choose
+supported roles and encoding sizes per file or in a batch. Piece-reference
+thumbnails preview on double-click and their handles open file replacement without
+rewriting prompt citations. Soundscape/music headings have `N/A` buttons, and individual
+sound clips have optional boundary snapping that accounts for delivered segments.
+
+The shared picker now has saved external folder shortcuts, horizontal scrolling,
+tab-specific media filtering and selected-folder refresh. Previously observed
+built-in folder pills stay visible while an external folder is selected. Only
+selected/touched external files are copied into managed media roots; removing a
+shortcut does not delete original files or already imported copies. The Windows
+folder chooser uses the larger Explorer-style dialog and raises its own visible
+window above other windows instead of relying only on an invisible owner.
+
+Existing prompt-handle replacement and Extended branding are retained. The
+cancelled workflow-tab preview cache is not added, and there is no new automatic
+source-audio copy feature. Regression checks cover source syntax, isolated browser
+interactions, real temporary-folder operations and API handlers. Actual native
+dialog foreground placement after restart remains a user desktop verification;
+this update does not claim a new GPU-render test.
+
+The [Extended change record](docs/extended-changes.md) maps feature IDs to source
+owners, saved-state contracts and regression checks for future upstream integration.
+
 **Screens: a picture or clip put on a phone, tablet, laptop or TV in the shot,
 with its text as sharp as the file.** A shot can carry up to two screens, each
 a device and a file, and a handle the prompt cites it by where the screen is

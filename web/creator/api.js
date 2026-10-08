@@ -40,6 +40,42 @@ export function listedFolders(root = "input") {
   return cache.get(root)?.folders ?? [];
 }
 
+// External paths exist only while browsing. Accepting a file imports it into
+// input/ or models/refmods/, so no execution-time path resolver is changed.
+let externalUser = null;
+
+async function folderPost(action, body = {}) {
+  const response = await api.fetchApi(`/continuity/folders/${action}`, {
+    method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body),
+  });
+  const answer = await response.json();
+  if (!response.ok) throw new Error(answer.error || t("could not read the folder ({status})", { status: response.status }));
+  return answer;
+}
+
+export async function listExternalFolders() {
+  const answer = await folderPost("list");
+  externalUser = answer.user ?? null;
+  return answer;
+}
+export const chooseExternalFolder = () => folderPost("choose");
+export const removeExternalFolder = (folder) => folderPost("remove", { folder });
+export const revealExternalFolder = async (folder) => (await folderPost("reveal", { folder })).path;
+export const listExternalAssets = ({ folder, kind }) => folderPost("assets", { folder, kind });
+export async function importExternalAssets(assets) {
+  if (!assets.some((row) => isExternalFile(row?.path))) return assets;
+  const answer = await folderPost("import", { assets });
+  return answer.assets;
+}
+export const isExternalFile = (path) => String(path).startsWith("external:");
+
+function externalRoute(action, path, params = new URLSearchParams()) {
+  params.set("filename", path);
+  if (externalUser !== null) params.set("user", externalUser);
+  return `/continuity/folders/${action}?${params}`;
+}
+const externalUrl = (action, path, params) => api.apiURL(externalRoute(action, path, params));
+
 /** Make a folder under a picker root. Returns its root-relative path. */
 export async function makeFolder(root, subfolder) {
   const response = await api.fetchApi("/continuity/folder", {
@@ -180,6 +216,7 @@ function normalizePrefs(raw) {
       input: shelfName(raw?.lastShelf?.input),
       renders: shelfName(raw?.lastShelf?.renders),
     },
+    externalFolder: typeof raw?.externalFolder === "string" ? raw.externalFolder : null,
   };
 }
 
@@ -229,7 +266,8 @@ export async function pickerPrefsHeld() {
   // Remembered folders are records too: an empty star list must not disable
   // the only control that clears where the picker was left.
   return prefs.favorites.length
-    + Object.values(prefs.lastShelf).filter((shelf) => shelf !== "all").length;
+    + Object.values(prefs.lastShelf).filter((shelf) => shelf !== "all").length
+    + (prefs.externalFolder ? 1 : 0);
 }
 
 // ---- settings ---------------------------------------------------------------
@@ -726,7 +764,8 @@ export async function probeAudio(path) {
 
 async function ask(path) {
   try {
-    const response = await api.fetchApi(`/continuity/probe?filename=${encodeURIComponent(path)}`);
+    const response = await api.fetchApi(isExternalFile(path) ? externalRoute("probe", path)
+      : `/continuity/probe?filename=${encodeURIComponent(path)}`);
     const body = await response.json();
     return {
       hasAudio: typeof body.has_audio === "boolean" ? body.has_audio : null,
@@ -802,6 +841,12 @@ export function cropQuery(crop) {
  * `crop` is the asset's framing blob, and a framed picture is served framed.
  */
 export function viewUrl(path, { preview = false, version = null, crop = null } = {}) {
+  if (isExternalFile(path)) {
+    if (preview || isFramed(crop)) return thumbUrl(path, version, cropQuery(crop), { full: !preview });
+    const params = new URLSearchParams();
+    if (version) params.set("v", String(version));
+    return externalUrl("view", path, params);
+  }
   // A cast look's frame is not in the input folder and never was: it is a file
   // this pack ships, served out of WEB_DIRECTORY. Answered here rather than at
   // each of the dozen call sites, for the reason `media.resolve` answers it on
@@ -925,7 +970,7 @@ export function thumbUrl(path, version, crop = null, { full = false } = {}) {
   // `full` keeps the source's size: the subject view clicks on every pixel.
   if (crop) params.set("crop", crop);
   if (full) params.set("full", "1");
-  return api.apiURL(`/continuity/thumb?${params}`);
+  return isExternalFile(path) ? externalUrl("thumb", path, params) : api.apiURL(`/continuity/thumb?${params}`);
 }
 
 /**
@@ -956,7 +1001,8 @@ export function stillUrl(asset) {
  */
 export async function fetchPeaks(path) {
   try {
-    const response = await api.fetchApi(`/continuity/peaks?filename=${encodeURIComponent(path)}`);
+    const response = await api.fetchApi(isExternalFile(path) ? externalRoute("peaks", path)
+      : `/continuity/peaks?filename=${encodeURIComponent(path)}`);
     if (!response.ok) return null;
     const body = await response.json();
     return Array.isArray(body.peaks) ? Float32Array.from(body.peaks) : null;

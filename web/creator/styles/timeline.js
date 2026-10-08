@@ -72,6 +72,17 @@ export const css = `
 .mmc-tl-section-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; flex: 0 1 auto; min-width: 0; }
 .mmc-tl-section-actions:empty { display: none; }
 .mmc-tl-section-actions button { white-space: normal; }
+.mmc-tl-section-head-inline {
+  flex-wrap: nowrap; align-items: center; gap: 2px;
+  border: 1px solid var(--mmc-line); border-radius: 7px;
+  background: var(--mmc-surface); cursor: pointer;
+}
+.mmc-tl-section-head-inline:hover { background: var(--mmc-surface-2); border-color: var(--mmc-line-2); }
+.mmc-tl-section-head-inline .mmc-tl-section-toggle {
+  flex: 0 1 auto; border: 0; background: transparent;
+}
+.mmc-tl-section-head-inline .mmc-tl-section-actions { flex: 0 0 auto; margin-right: 8px; }
+.mmc-pill.mmc-tl-na { height: 24px; min-height: 0; padding: 0 9px; }
 .mmc-tl-section-body { min-width: 0; }
 .mmc-tl-section-body[hidden], .mmc-tl-pool[hidden] { display: none; }
 .mmc-tl-section-warning .mmc-tl-section-hint { color: var(--mmc-warn); }
@@ -96,8 +107,7 @@ export const css = `
 }
 .mmc-tl-pool-add { display: inline-flex; gap: 5px; align-items: center; }
 .mmc-tl-pool-where { font-size: calc(11px * var(--mmc-type)); color: var(--mmc-dim); white-space: nowrap; }
-/* The handle is a button: clicking it writes the citation into the global
-   prompt. Reset to read exactly like the editor's handle span. */
+/* The handle swaps its file while keeping citations. Keep the editor's hue. */
 .mmc-tl-pool-cite {
   background: none; border: 0; padding: 0; font: inherit; cursor: pointer;
 }
@@ -1192,6 +1202,7 @@ export const css = `
    it would say they were different things. */
 .mmc-snd-block {
   position: absolute; top: 3px; bottom: 3px;
+  container-type: inline-size;
   border-radius: 6px; overflow: hidden; cursor: grab;
   background: color-mix(in srgb, var(--mmc-blue) 26%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mmc-blue) 55%, transparent);
@@ -1285,6 +1296,34 @@ export const css = `
 /* Nothing to remove mid-drag, and a cross under the pointer during one is a
    target the gesture can end on by accident. */
 .mmc-snd-block.dragging .mmc-snd-drop { opacity: 0; pointer-events: none; }
+
+/* The matching corner is a per-track snap switch, outside the trim grips. */
+.mmc-snd-magnet {
+  position: absolute; left: 11px; bottom: 3px; z-index: 2;
+  display: grid; place-items: center; width: 18px; height: 18px;
+  border: 1px solid transparent; border-radius: 5px; padding: 0;
+  background: none; cursor: pointer; color: var(--mmc-text); opacity: .5;
+}
+.mmc-snd-magnet svg {
+  width: 12px; height: 12px; stroke: currentColor; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  filter: drop-shadow(0 1px 2px var(--mmc-bg));
+}
+.mmc-snd-block:hover .mmc-snd-magnet,
+.mmc-snd-magnet:focus-visible, .mmc-snd-magnet[aria-pressed="true"] {
+  opacity: 1; background: var(--mmc-scrim-2);
+  border-color: color-mix(in srgb, var(--mmc-blue) 55%, transparent);
+}
+.mmc-snd-magnet[aria-pressed="true"] { color: var(--mmc-accent); }
+.mmc-snd-magnet:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: 1px; }
+.mmc-snd-block.dragging .mmc-snd-magnet { opacity: 0; pointer-events: none; }
+@container (max-width: 58px) {
+  .mmc-snd-magnet { left: 1px; width: 14px; }
+}
+@container (max-width: 43px) {
+  .mmc-snd-magnet { width: 18px; bottom: 23px; }
+  .mmc-snd-label { visibility: hidden; }
+}
 
 /* Where the block has got to, while it is being moved or trimmed. The piece's
    clock, not the file's: a drag is a question about the cut. Clamped off the

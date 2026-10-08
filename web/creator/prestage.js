@@ -357,7 +357,7 @@ export class PreStageEditor {
       setCast: (list) => { this.state.subjects = list; },
       family: () => S.preStageFamilyId(this.state.arch),
       getAssets: () => this.state.refs,
-      addAsset: () => this.attachOneRef(),
+      addAsset: (subject) => this.attachOneRef(subject),
       whereCited: (subject) => {
         const cited = S.citedCast(this.state).some((s) => s.handle === subject.handle);
         return { cited, text: cited ? t("in the prompt") : "" };
@@ -428,7 +428,7 @@ export class PreStageEditor {
 
   /** One picture for the shelf's "+": attached as a reference, handed back
    *  so the shelf can hang it on somebody — or null where refused. */
-  async attachOneRef() {
+  async attachOneRef(subject = null) {
     const blocked = this.refBlocked();
     if (blocked) { this.notice = blocked; this.render(); return null; }
     const room = S.preStageMaxRefs(this.state) - S.preStageCountedRefs(this.state).length;
@@ -439,10 +439,14 @@ export class PreStageEditor {
       capacity: () => ({ used: S.preStageCountedRefs(this.state).length, max: S.preStageMaxRefs(this.state), filesLeft: room }),
     });
     if (!chosen?.length) return null;
-    const ref = applyPick({ handle: S.nextPreStageHandle(this.state), kind: "image", role: "reference" }, chosen[0]);
-    this.state.refs.push(ref);
+    const added = [];
+    for (const picked of chosen.slice(0, room)) {
+      const ref = applyPick({ handle: S.nextPreStageHandle(this.state), kind: "image", role: "reference" }, picked);
+      this.state.refs.push(ref);
+      added.push(ref);
+    }
     this.commit();
-    return ref;
+    return subject ? added : added[0] ?? null;
   }
 
   // ---- init image and style references --------------------------------------

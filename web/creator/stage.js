@@ -36,7 +36,7 @@ import { api } from "../../../scripts/api.js";
 import { el } from "./dom.js";
 import { outputUrl, uiSetting } from "./api.js";
 import { openLoupe } from "./loupe.js";
-import { submission } from "./queue.js";
+import { submission, watchSubmittedPrompts } from "./queue.js";
 import { t } from "./i18n.js";
 import { ExecutionTiming } from "./timing.js";
 
@@ -50,7 +50,7 @@ import { ExecutionTiming } from "./timing.js";
 const EVENTS = ["progress_state", "b_preview_with_metadata", "b_preview",
                 "kj_preview_override", "executing", "executed", "execution_error",
                 "execution_start", "execution_success", "execution_interrupted", "mmc_segment", "mmc_refused",
-                "reconnected", "status"];
+                "reconnected", "status", "mmc_queue_removed"];
 
 /** A progress report this long is a sampler; the loaders and decoders report a
  *  step or two each. What lets the stage open on progress rather than waiting
@@ -176,6 +176,14 @@ export class Stage {
     this.startedAt = null;
     this.renderPromptId = null;
     this.timing = new ExecutionTiming();
+    this.observedPrompts = new Set();
+    this.offSubmitted = watchSubmittedPrompts(
+      (output, targets) => this.claims({ nodes: Object.keys(output ?? {}), targets }),
+      (promptId) => {
+        this.timing.queued(promptId);
+        this.syncTicker();
+        this.renderReadout();
+      });
     this.probes = new Set();
     this.probeAgain = new Set();
     this.probeTimes = new Map();
@@ -212,6 +220,7 @@ export class Stage {
    *  otherwise, and a deleted node would go on decoding previews forever. */
   destroy() {
     this.destroyed = true;
+    this.offSubmitted();
     this.stopFooterSize();
     for (const name of EVENTS) api.removeEventListener(name, this.onEvent);
     this.releaseFrame();
@@ -300,7 +309,9 @@ export class Stage {
         // Kept even though this stage may turn out to have no part in the run:
         // it is the only place the prompt id is ever said, and by the time the
         // stage knows the render is its own the message has long gone by.
+        if (this.timing.runs.get(String(detail.prompt_id))?.terminal) break;
         this.promptId = detail.prompt_id == null ? null : String(detail.prompt_id);
+        this.observePrompt(this.promptId);
         this.timing.start(this.promptId, detail.timestamp);
         this.claimed = false;
         this.lastNewsAt = Date.now();
@@ -327,7 +338,14 @@ export class Stage {
         // Some frontends announce a reattached socket only by sending the queue
         // state down it. A `status` arriving in the middle of a long silence is
         // that, near enough, and costs one small GET to act on.
-        if (this.quiet() > QUIET_MS) this.recoverTimings();
+        if (detail.exec_info?.queue_remaining === 0 && this.timing.queuedRuns().length) this.recoverTimings(true);
+        else if (this.quiet() > QUIET_MS) this.recoverTimings();
+        break;
+
+      case "mmc_queue_removed":
+        this.timing.removed(detail.prompt_id);
+        this.syncTicker();
+        this.renderReadout();
         break;
 
       case "execution_success":
@@ -533,12 +551,18 @@ export class Stage {
     const id = promptId == null ? this.promptId : String(promptId);
     const known = id == null ? null : this.timing.runs.get(id);
     if (!completed && known?.terminal) return false;
-    if (id && this.promptId && id !== this.promptId && known) return false;
+    if (id && this.promptId && id !== this.promptId && this.observedPrompts.has(id)) return false;
     // A stage mounted/reconnected after execution_start can learn the current
     // prompt from progress. Its missing start time stays unknown until history.
     if (id) this.promptId = id;
     this.timing.get(id);
+    this.observePrompt(id);
     return true;
+  }
+
+  observePrompt(id) {
+    if (id) this.observedPrompts.add(id);
+    while (this.observedPrompts.size > 64) this.observedPrompts.delete(this.observedPrompts.values().next().value);
   }
 
   sameRender(promptId) {
@@ -565,6 +589,11 @@ export class Stage {
 
   /** The two clocks describe the shown result, never another stage's queue. */
   clockTiming() {
+    const queued = this.timing.queuedRuns()[0];
+    const shown = this.timing.runs.get(this.renderPromptId);
+    if (queued && queued.batch !== shown?.batch) {
+      return { ...this.timing.read(queued), tookMs: null };
+    }
     if (this.state === "done" && this.result) {
       const { totalMs = null, tookMs = null, totalPending = false } = this.result;
       return { totalMs, tookMs, totalPending };
@@ -578,13 +607,14 @@ export class Stage {
   }
 
   syncTicker() {
-    const needed = this.state === "sampling" || this.timing.pendingResults().length;
+    const needed = this.state === "sampling" || this.timing.pendingResults().length || this.timing.queuedRuns().length;
     if (needed && !this.ticker && !this.destroyed) this.ticker = setInterval(() => this.tick(), 1000);
     if (!needed) { clearInterval(this.ticker); this.ticker = null; }
   }
 
   recoverTimings(force = false) {
     const ids = new Set(this.timing.pendingResults().map((run) => run.promptId));
+    for (const run of this.timing.queuedRuns()) ids.add(run.promptId);
     if (this.state === "sampling" && this.renderPromptId) ids.add(this.renderPromptId);
     if (this.promptId && this.awaitingResult(this.promptId)) ids.add(this.promptId);
     // execution_success is sent just before history is filed. `executing:null`
@@ -776,7 +806,34 @@ export class Stage {
       const response = await api.fetchApi(`/history/${encodeURIComponent(promptId)}`);
       if (!response.ok) return;
       const entry = (await response.json())?.[promptId];
-      if (this.destroyed || !entry) return;
+      if (this.destroyed) return;
+      if (!entry) {
+        const run = this.timing.runs.get(promptId);
+        if (run?.batch && !run.terminal && run.localStart === null) {
+          const queued = await api.fetchApi("/queue");
+          if (!queued.ok || this.destroyed) return;
+          const queue = await queued.json();
+          const present = [...(queue.queue_running ?? []), ...(queue.queue_pending ?? [])]
+            .some((row) => String(row?.[1]) === promptId);
+          if (!present) {
+            // A cached prompt can finish between the history and queue reads.
+            const finished = await api.fetchApi(`/history/${encodeURIComponent(promptId)}`);
+            const saved = finished.ok ? (await finished.json())?.[promptId] : null;
+            if (this.destroyed) return;
+            if (saved) this.timing.fromHistory(promptId, saved);
+            else {
+              this.timing.removed(promptId);
+              if (this.state === "sampling" && this.sameRender(promptId)) {
+                this.fail([{ where: null, what: t("the render ended without a file") }],
+                          { started: true, promptId, recovered: true });
+              }
+            }
+            this.syncTicker();
+            this.renderReadout();
+          }
+        }
+        return;
+      }
       this.timing.fromHistory(promptId, entry);
       this.syncTicker();
       this.renderReadout();
@@ -1116,14 +1173,14 @@ export class Stage {
  *  Labels matter: neither the difference nor the shorter number means model
  *  loading or sampler-only time. Unknown old/cached results are not zero. */
 export function timingChips({ totalMs = null, tookMs = null, totalPending = false } = {}) {
-  const whole = t("From workflow execution start to completion, including loading and other nodes; queue waiting is excluded.");
+  const whole = t("From the first accepted render to the end of its queued batch, including waiting. Results without queue timing show workflow execution time only.");
   const window = t("From the first detected sampling progress or preview to the saved result, including decoding, post-processing and saving; not sampling alone.");
   return [
     [t("Total execution"), totalMs, whole, totalPending],
     [t("Render window"), tookMs, window, false],
   ].map(([label, ms, explanation, pending]) => {
     const known = Number.isFinite(ms) && ms >= 0;
-    const note = pending ? t("The workflow is still running.")
+    const note = pending ? t("The queued renders have not all finished.")
       : known ? "" : t("Timing is unavailable for this result.");
     return el("span", {
       class: "mmc-stage-chip mmc-stage-clock",

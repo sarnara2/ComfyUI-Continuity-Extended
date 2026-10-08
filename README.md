@@ -5,13 +5,41 @@ This is sarnara2's personal fork of
 
 ## Extended changes
 
-Click a recognized `@handle` in a segment prompt to choose a replacement from the
-project's cast, references or screens. Enter a name or number without typing `@`,
-or select a listed handle. Replace just the clicked occurrence (the default), or
-all exact occurrences of that handle in the current segment. Other segments and
-the global prompt stay unchanged; `@ref-1` does not change `@ref-11`. Existing
-`:scope` suffixes and reference activation rules are preserved. The picker also
-keeps a shortcut to the existing cast editor.
+Latest local usability update: **2026-10-08**.
+
+- **Prompt tags:** click a recognized `@handle` to replace one occurrence or all
+  exact occurrences in the current segment. Choose a listed cast/reference/screen
+  handle, or type a name or number without `@`. The cast-editor shortcut remains.
+- **Timeline memory:** the five timeline sections remember whether they are open
+  or closed, including when the saved workflow is loaded again.
+- **Queue timing:** whole-run time includes an accepted batch's queue wait; each
+  result keeps its own render span. Normal and fullscreen views share the stage.
+- **Import options:** choose supported reference roles and MAX/MATCH sizes before
+  importing media, per file or in a batch. Each input only offers relevant options.
+- **Piece-reference controls:** double-click a thumbnail to preview; click its
+  handle to reselect the file without changing the handle or prompt citations.
+- **Quick `N/A`:** small buttons beside soundscape and music replace that field's
+  contents with `N/A`.
+- **Sound snapping:** a per-clip magnet snaps sound edges to delivered segment
+  boundaries, accounting for continuation trims, and nearby sound-clip edges.
+- **Folder shortcuts:** add/remove saved local folders in the shared media picker,
+  filter by tab, and refresh only the selected folder on click, tab switch or reopen.
+  Folder pills scroll horizontally; built-in pills stay available. Windows uses a
+  larger Explorer-style folder chooser with dialog-only foreground handling.
+
+Tag replacement leaves other segments and the global prompt unchanged, treats
+`@ref-1` and `@ref-11` separately, and preserves `:scope` suffixes and activation
+rules. Removing a folder shortcut deletes no original files or imported copies;
+selected external files are copied into existing managed roots before attachment.
+
+For feature IDs, changed files, state contracts, verification limits and future
+upstream-integration notes, see the [Extended change record](docs/extended-changes.md).
+The [changelog](CHANGELOG.md) keeps the dated update summary.
+
+After updating, save the workflow, restart ComfyUI and refresh the browser.
+Regression checks are not a new GPU-render test; the newest native-dialog
+foreground behavior still needs a live desktop check. Folder-only selection
+does not guarantee individual image previews inside the Windows dialog.
 
 The main node, legacy timeline title and fullscreen wordmark carry `- Extended`.
 Internal node IDs stay unchanged, so existing workflows remain compatible.

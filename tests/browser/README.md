@@ -7,7 +7,7 @@ checks: **ComfyUI does not gain a Playwright/runtime dependency**.
 ## Run
 
 Use a recent Node.js version. If `playwright` is already resolvable, install its
-Chromium browser with `npx playwright install chromium`, then run the three scripts
+Chromium browser with `npx playwright install chromium`, then run the scripts
 below from the repository root. Script paths are resolved relative to the script,
 not the current working directory.
 
@@ -23,12 +23,27 @@ node (Join-Path $env:PLAYWRIGHT_MODULE 'cli.js') install chromium
 node tests/browser/test-style-scroll.cjs
 node tests/browser/test-reference-preview.cjs
 node tests/browser/test-timeline-sections-seams.cjs
+node tests/browser/test-pool-reference-actions.cjs
+node tests/browser/test-reference-import-options.cjs
+node tests/browser/test-external-picker-folders.cjs
+
+# Point this at an existing Python interpreter for the sound timeline fixture.
+$env:PYTHON_EXE = 'python'
+node tests/browser/test-sound-clip-snap.cjs
+
+# These two are Node contract checks, not headless-browser interactions.
+node tests/browser/test-reference-import-contexts.cjs
+node tests/browser/test-external-folder-api.cjs
 ```
 
 On other operating systems, the same scripts work with the equivalent environment
 variables. `PLAYWRIGHT_MODULE` is optional and can name any installed Playwright
 module directory. `BROWSER_EXECUTABLE_PATH` optionally selects an existing
 Chromium-based browser executable instead of Playwright's bundled Chromium.
+On Node versions that expose a global `navigator`, the Python/Node fixtures may
+need `NODE_OPTIONS=--no-experimental-global-navigator` to keep their default-locale
+assumptions independent of the host. Set `PYTHON_EXE` to an absolute interpreter
+path if `python` is not on PATH.
 
 The style-strip suite normally runs 12 checks against the current checkout. Set
 `CONTINUITY_BASELINE_DIR` to an older, unmodified checkout to add three comparisons
@@ -55,6 +70,17 @@ scripts do not launch ComfyUI, touch a user browser profile, or modify project d
   popover cleanup, seam option/capability matrices and localized layout. Backend
   capability/state providers, picker responses and unrelated renderers are
   fixtures, not a running ComfyUI application.
+- **Piece-reference actions:** production callbacks for double-click preview,
+  handle-based file replacement, cancellation and stale attachment guards.
+- **Import options:** per-file and bulk choices, capability-filtered controls and
+  existing selection/crop/trim flows. The separate import-context contract checks
+  cover production call-site wiring; they are not live tests of every modal.
+- **Sound snapping:** production SoundLane methods/CSS, per-clip toggles, delivered
+  segment/continuation boundaries, nearby sound edges and normal placement commits.
+- **External folders:** picker DOM methods/CSS, selected-folder refresh, tab filters,
+  persistent built-in pills, shortcut removal and attachment preparation. Folder
+  picker/native APIs are fixtures. Real filesystem and route security have separate
+  Python tests; the API-transport contract checks use mocked requests.
 
 These are isolated browser regression tests, **not end-to-end ComfyUI tests or
 GPU/rendering validation**. Source extraction is intentionally explicit: if a

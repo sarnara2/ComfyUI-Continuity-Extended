@@ -5,13 +5,16 @@ import { el, ICONS, svg, icon, mountOverlay, dismissable } from "./dom.js";
 import { listAssets, listingTruncated, listedFolders, makeFolder, removeFolder,
          revealFolder, viewUrl, stillUrl, upload, moveAsset,
          deleteAsset, loadPickerPrefs, savePickerPrefs, buildPlate,
-         cutPanel, uploadRefMod } from "./api.js";
+         cutPanel, uploadRefMod, listExternalFolders, chooseExternalFolder,
+         listExternalAssets, importExternalAssets, removeExternalFolder,
+         revealExternalFolder } from "./api.js";
 import { openTrim, trimLabel } from "./trim.js";
 import { openPicture, cropLabel } from "./picture.js";
 import { greyField } from "./subject.js";
 import { t } from "./i18n.js";
 import { memberFromMod } from "./presets.js";
 import { queueState, watch as watchQueue, dropQueued } from "./queue.js";
+import { takeOptions, takeWord } from "./state.js";
 
 // "renders" is a tab, not a kind: it browses the output folder instead of a
 // slice of the input one, and the files under it keep their own kinds — a
@@ -81,6 +84,9 @@ function chevron(cls) {
  *   renders one included — a swap has to be the kind whose handle it inherits
  * @param {boolean} options.viewOnly      browse and play, select nothing — the
  *   Timeline's gallery, which has no segment to attach a pick to
+ * @param {object} options.referenceOptions initial {takes, ref_size}, with
+ *   per-file overrides and selection-wide defaults; allowedTakes may narrow
+ *   the real vocabulary per kind for a caller with a fixed-purpose slot
  * @returns {Promise<Array|null>} chosen assets, or null if cancelled
  */
 export function openPicker(options) {
@@ -105,6 +111,13 @@ export class Picker {
     // The image-to-3D tool's shelf: a fourth place, of GLBs, each shown by the
     // picture it was lifted from. See `creator/lift.py`, `shelf`.
     this.meshes = [];
+    this.externalFolders = [];
+    this.externalFolder = null;
+    this.externalAssets = [];
+    this.externalTruncated = false;
+    this.listingSequence = 0;
+    this.builtinLoaded = false;
+    this.materializing = null;
     this.loaded = false;
     // Which shelf the grid shows: "all", "fav", or an input subfolder. Shelves
     // are shared across tabs — a folder is a place, not a kind.
@@ -116,6 +129,11 @@ export class Picker {
     // path -> {trim, track}. Set only for files the user opened the segment
     // editor on; everything else is attached whole and silent, as before.
     this.settings = new Map();
+    this.referenceDefaults = options.referenceOptions && !options.viewOnly
+      ? { takes: options.referenceOptions.takes || "full",
+          ref_size: options.referenceOptions.ref_size === "match" ? "match" : "max" }
+      : null;
+    this.referenceChanges = new Set();
     // Organize mode: clicks mark files for moving or deleting instead of
     // picking them. Its own list, because `selected` means "attach to the
     // node" and is bounded by slots — marking is bounded by nothing.
@@ -162,7 +180,11 @@ export class Picker {
     // The framing each seeded panel already wears rides in through the same
     // per-file settings a segment does, so the picture editor opens on it.
     for (const panel of options.plate?.panels ?? []) {
-      if (panel.crop) this.settings.set(panel.path, { crop: { ...panel.crop } });
+      const setting = panel.crop ? { crop: { ...panel.crop } } : {};
+      if (this.referenceDefaults && this.referenceTakes({ kind: "image", path: panel.path }).includes(panel.takes)) {
+        setting.takes = panel.takes;
+      }
+      if (Object.keys(setting).length) this.settings.set(panel.path, setting);
     }
     // The connected group: paths, in layout order. On a sheet family every
     // selected image is a panel and this stays empty; elsewhere it is what
@@ -236,6 +258,11 @@ export class Picker {
           title: t("Open this folder in the file manager of the machine ComfyUI runs on"),
           onclick: () => this.reveal(),
         }, [icon("folderOpen", 14), el("span", { text: t("Open folder") })]),
+        el("button", {
+          class: "mmc-add-folder", text: t("+ Add folder"),
+          title: t("Choose a folder on this machine. Only the selected folder is refreshed."),
+          onclick: () => this.addExternalFolder(),
+        }),
         el("button", { class: "mmc-upload", text: t("+  Upload {kind}", { kind: t(KIND_LABEL[this.kind].toLowerCase()) }), onclick: () => this.pickFile() }),
       ]),
       this.shelfRow,
@@ -246,6 +273,7 @@ export class Picker {
     this.uploadButton = this.modal.querySelector(".mmc-upload");
     this.organizeButton = this.modal.querySelector(".mmc-organize");
     this.revealButton = this.modal.querySelector(".mmc-reveal");
+    this.addFolderButton = this.modal.querySelector(".mmc-add-folder");
     if (this.kind === "renders") this.uploadButton.style.display = "none";
     // RefMods are not a folder the picker browses, so there is none to open.
     if (this.kind === "refmods") { this.organizeButton.style.display = "none"; this.revealButton.style.display = "none"; this.uploadButton.textContent = this.uploadLabel(); }
@@ -271,22 +299,51 @@ export class Picker {
   }
 
   async load({ force = false } = {}) {
+    const sequence = ++this.listingSequence;
     try {
+      if (!this.restored) {
+        const [prefs, registry] = await Promise.all([loadPickerPrefs(), listExternalFolders()]);
+        if (this.closed || sequence !== this.listingSequence) return;
+        this.prefs = prefs;
+        this.externalFolders = registry.folders ?? [];
+        this.externalFolder = this.kind !== "meshes"
+          ? this.externalFolders.find((folder) => folder.id === prefs.externalFolder)?.id ?? null
+          : null;
+      }
+      if (this.externalFolder) {
+        this.shelf = "all";
+        await this.refreshExternal({ sequence });
+        if (this.closed || sequence !== this.listingSequence) return;
+        // These paths already belong to the attached sheet, so restoring its
+        // known panels does not need a walk of any other media folder.
+        this.selected = (this.plate?.panels ?? []).map((panel) => ({
+          path: panel.path, kind: "image", name: panel.path.split("/").pop(),
+          subfolder: "", size: 0, mtime: 0,
+        }));
+        this.restored = true;
+        this.renderFoot();
+        if (this.plate?.edit && !this.editOpened && this.sheetPanels().length) {
+          this.editOpened = true;
+          this.openSheet();
+        }
+        return;
+      }
       // All three at once. The two folders have nothing to say to each other,
       // and waiting for input to come back before asking for output made a slow
       // disk twice as slow for no reason (#4).
-      const [assets, renders, mods, meshes, prefs] = await Promise.all([
+      const [assets, renders, mods, meshes] = await Promise.all([
         listAssets({ force }),
         this.options.kinds.includes("renders") ? listAssets({ force, root: "output" }) : [],
         this.options.kinds.includes("refmods") ? listAssets({ force, root: "refmods" }) : [],
         this.options.kinds.includes("meshes") ? listAssets({ force, root: "meshes" }) : [],
-        loadPickerPrefs(),
       ]);
+      if (this.closed || sequence !== this.listingSequence) return;
       this.assets = assets;
       this.renders = renders;
       this.mods = mods;
       this.meshes = meshes;
-      this.prefs = prefs;
+      this.builtinLoaded = true;
+      this.loadError = null;
       // A mark on a file the listing no longer has is a mark on nothing.
       this.marked = this.marked.filter((p) => this.activeAssets().some((a) => a.path === p));
       this.loaded = true;
@@ -309,6 +366,7 @@ export class Picker {
           .filter(Boolean);
       }
     } catch (error) {
+      if (this.closed || sequence !== this.listingSequence) return;
       this.assets = [];
       this.renders = [];
       this.mods = [];
@@ -326,6 +384,126 @@ export class Picker {
       this.editOpened = true;
       this.openSheet();
     }
+  }
+
+  updateFolderTools() {
+    const external = Boolean(this.externalFolder);
+    this.organizeButton.style.display = external || ["refmods", "meshes"].includes(this.kind) ? "none" : "";
+    this.revealButton.style.display = this.kind === "meshes" || (!external && this.kind === "refmods") ? "none" : "";
+    this.uploadButton.style.display = external || ["renders", "meshes"].includes(this.kind) ? "none" : "";
+    this.addFolderButton.style.display = this.kind === "meshes" ? "none" : "";
+    if (external && this.organize) this.setOrganize(false);
+  }
+
+  async refreshExternal({ sequence = ++this.listingSequence } = {}) {
+    const folder = this.externalFolder, kind = this.kind;
+    if (!folder) return;
+    this.loaded = false;
+    this.loadError = null;
+    this.updateFolderTools();
+    this.renderGrid();
+    try {
+      const result = await listExternalAssets({ folder, kind: kind === "guides" ? "renders" : kind });
+      if (this.closed || sequence !== this.listingSequence || folder !== this.externalFolder || kind !== this.kind) return;
+      this.externalAssets = result.assets ?? [];
+      this.externalTruncated = result.truncated === true;
+    } catch (error) {
+      if (this.closed || sequence !== this.listingSequence) return;
+      this.externalAssets = [];
+      this.externalTruncated = false;
+      this.loadError = error.message;
+    }
+    this.loaded = true;
+    this.renderShelves();
+    this.renderGrid();
+    this.renderFoot();
+  }
+
+  selectExternalFolder(id) {
+    if (!this.externalFolders.some((folder) => folder.id === id)) return;
+    this.externalFolder = id;
+    this.shelf = "all";
+    this.prefs = { ...this.prefs, externalFolder: id };
+    savePickerPrefs(this.prefs);
+    this.page = 0;
+    this.visibleCount = PAGE_SIZE;
+    this.marked = [];
+    return this.refreshExternal();
+  }
+
+  async addExternalFolder() {
+    if (this.addFolderButton.disabled) return;
+    this.addFolderButton.disabled = true;
+    try {
+      const result = await chooseExternalFolder();
+      if (this.closed || !result?.folder) return;
+      const folder = result.folder;
+      this.externalFolders = [...this.externalFolders.filter((item) => item.id !== folder.id), folder];
+      await this.selectExternalFolder(folder.id);
+    } catch (error) {
+      if (!this.closed) this.warn(error.message);
+    } finally {
+      this.addFolderButton.disabled = false;
+    }
+  }
+
+  async forgetExternalFolder(id) {
+    try {
+      await removeExternalFolder(id);
+      if (this.closed) return;
+      this.externalFolders = this.externalFolders.filter((folder) => folder.id !== id);
+      this.selected = this.selected.filter((asset) => !asset.path.startsWith(`external:${id}/`));
+      this.sheet = this.sheet.filter((path) => !path.startsWith(`external:${id}/`));
+      if (this.externalFolder === id) {
+        // Canonical copies already edited or attached remain valid. A shortcut
+        // being removed cannot remove any file on either side of the import.
+        this.setShelf("all");
+      }
+      this.renderShelves();
+      this.renderFoot();
+    } catch (error) {
+      if (!this.closed) this.warn(error.message);
+    }
+  }
+
+  /** Import only touched files before a legacy editor or attachment reads them. */
+  async materializeRows(rows) {
+    if (this.materializing) await this.materializing;
+    const external = rows.filter((asset) => asset.path.startsWith("external:"));
+    if (!external.length) return true;
+    const operation = (async () => {
+      const imported = await importExternalAssets(external.map((asset) => this.referencePick(asset, false)));
+      if (this.closed) return false;
+      if (imported.length !== external.length || imported.some((row) => !row?.path || row.path.startsWith("external:"))) {
+        throw new Error(t("The selected files could not all be imported."));
+      }
+      external.forEach((asset, index) => {
+        const before = asset.path, picked = imported[index];
+        for (const map of [this.settings, this.cuts, this.rects, this.points]) {
+          if (!map.has(before)) continue;
+          map.set(picked.path, map.get(before));
+          map.delete(before);
+        }
+        this.sheet = this.sheet.map((path) => path === before ? picked.path : path);
+        this.selected = this.selected.map((row) => row.path === before ? asset : row);
+        const held = this.cutUrls.get(before);
+        if (held?.url) URL.revokeObjectURL(held.url);
+        this.cutUrls.delete(before);
+        if (this.prefs.favorites.includes(before) && !this.prefs.favorites.includes(picked.path)) {
+          this.prefs = { ...this.prefs, favorites: [...this.prefs.favorites, picked.path] };
+          savePickerPrefs(this.prefs);
+        }
+        // Asset rows are shared by the grid and selection; changing the one row
+        // keeps crop/trim options and the user's selection on that same file.
+        Object.assign(asset, picked);
+      });
+      this.renderGrid();
+      this.renderFoot();
+      return true;
+    })();
+    this.materializing = operation;
+    try { return await operation; }
+    finally { if (this.materializing === operation) this.materializing = null; }
   }
 
   selectTab(kind) {
@@ -348,6 +526,19 @@ export class Picker {
     if (kind === "refmods" && this.organize) this.setOrganize(false);
     if (kind !== "renders" && kind !== "meshes") this.uploadButton.textContent = this.uploadLabel();
     if (kind === "meshes") this.hideFolderTools();
+    this.addFolderButton.style.display = kind === "meshes" ? "none" : "";
+    if (this.externalFolder && kind !== "meshes") {
+      this.page = 0;
+      this.visibleCount = PAGE_SIZE;
+      this.refreshExternal();
+      return;
+    }
+    if (this.externalFolder) {
+      this.externalFolder = null;
+      this.prefs = { ...this.prefs, externalFolder: null };
+      savePickerPrefs(this.prefs);
+      if (!this.builtinLoaded) { this.load({ force: true }); return; }
+    }
     // Shelves are shared between the input tabs — a folder is a place, not a
     // kind — but the output folder is a different place, so crossing that line
     // opens where that root was last left rather than on a shelf that is not
@@ -389,6 +580,7 @@ export class Picker {
     this.uploadButton.style.display = "none";
     this.organizeButton.style.display = "none";
     this.revealButton.style.display = "none";
+    this.addFolderButton.style.display = "none";
     if (this.organize) this.setOrganize(false);
   }
 
@@ -396,6 +588,14 @@ export class Picker {
    *  renders tab reads a different folder; everything organize-related goes
    *  through it, which is why there is only one implementation of any of it. */
   activeAssets() {
+    if (this.externalFolder) return this.externalAssets;
+    return this.builtinAssets();
+  }
+
+  /** Keep the built-in shelf metadata separate from the folder being shown.
+   *  External browsing changes the grid, not the shortcuts back to input or
+   *  output. These already-loaded rows never trigger another root scan. */
+  builtinAssets() {
     return this.kind === "renders" ? this.renders
       : this.kind === "refmods" ? this.mods
         : this.kind === "meshes" ? this.meshes : this.assets;
@@ -472,7 +672,7 @@ export class Picker {
       for (let i = 1; i <= parts.length; i++) seen.add(parts.slice(0, i).join("/"));
     };
     for (const name of listedFolders(this.rootName())) add(name);
-    for (const asset of this.activeAssets()) if (asset.subfolder) add(asset.subfolder);
+    for (const asset of this.builtinAssets()) if (asset.subfolder) add(asset.subfolder);
     return [...seen].sort((a, b) => a.localeCompare(b));
   }
 
@@ -498,10 +698,25 @@ export class Picker {
   /** The folder being browsed. "all" and the star are shelves, not places, so
    *  both sit at the root. */
   here() {
+    if (this.externalFolder) return "";
     return this.shelf === "all" || this.shelf === "fav" ? "" : this.shelf;
   }
 
   setShelf(shelf) {
+    if (this.externalFolder) {
+      ++this.listingSequence;
+      this.externalFolder = null;
+      this.prefs = { ...this.prefs, externalFolder: null };
+      savePickerPrefs(this.prefs);
+      this.loadError = null;
+      this.updateFolderTools();
+      if (!this.builtinLoaded) {
+        this.shelf = shelf;
+        this.rememberShelf();
+        this.load({ force: true });
+        return;
+      }
+    }
     this.shelf = shelf;
     this.rememberShelf();
     this.page = 0;
@@ -511,7 +726,7 @@ export class Picker {
   }
 
   renderShelves() {
-    if (!this.loaded || this.loadError) {
+    if (!this.loaded) {
       this.shelfRow.style.display = "none";
       return;
     }
@@ -519,20 +734,26 @@ export class Picker {
     // The renders tab is not a kind, so it counts everything the output folder
     // holds; an input tab counts only its own kind, because that is the slice
     // its grid is showing.
-    const scoped = this.kind === "renders"
-      ? (this.options.only ? this.renders.filter((a) => a.kind === this.options.only) : this.renders)
-      : this.kind === "guides" ? this.assets.filter((a) => isGuide(a)
+    const scope = (active, external = false) => this.kind === "renders"
+      ? (this.options.only ? active.filter((a) => a.kind === this.options.only) : active)
+      : this.kind === "guides" ? active.filter((a) => (external || isGuide(a))
                                  && (!this.options.only || a.kind === this.options.only))
-      : this.kind === "meshes" ? this.meshes
-      : this.assets.filter((a) => a.kind === this.kind);
+      : this.kind === "meshes" || this.kind === "refmods" ? active
+      : active.filter((a) => a.kind === this.kind);
+    const scoped = scope(this.activeAssets(), Boolean(this.externalFolder));
     const count = (test) => scoped.filter(test).length;
-    const here = this.here();
+    // A remembered external folder opens without walking built-in roots.
+    // listedFolders() still holds their last observed directory metadata;
+    // absent row counts stay absent rather than counting external files.
+    const builtinScoped = this.externalFolder ? scope(this.builtinAssets()) : scoped;
+    const folderCount = (test) => builtinScoped.filter(test).length;
+    const here = this.externalFolder ? "" : this.here();
 
     // Any chip or crumb can be dropped on: dragging a cell onto a place moves
     // the file there, and that is as true of the parent above as of a child.
     const droppable = (node, target) => {
       node.addEventListener("dragover", (event) => {
-        if (!this.dragging) return;
+        if (!this.dragging || this.externalFolder) return;
         event.preventDefault();
         node.classList.add("drop");
       });
@@ -540,6 +761,7 @@ export class Picker {
       node.addEventListener("drop", (event) => {
         event.preventDefault();
         node.classList.remove("drop");
+        if (this.externalFolder) return;
         this.moveTo(target);
       });
       return node;
@@ -548,7 +770,7 @@ export class Picker {
     const chip = ({ key, label, title, iconName, n, deep, drops = true }) => {
       const node = el("button", {
         class: "mmc-shelf",
-        "aria-selected": this.shelf === key,
+        "aria-selected": !this.externalFolder && this.shelf === key,
         title: title || label,
       }, [
         ...(iconName ? [icon(iconName, 13)] : []),
@@ -572,7 +794,7 @@ export class Picker {
       }, [el("span", { text: label })]);
       return droppable(node, key);
     };
-    crumbs.appendChild(crumb("all", t("All"), this.shelf === "all"));
+    crumbs.appendChild(crumb("all", t("All"), !this.externalFolder && this.shelf === "all"));
     const parts = here ? here.split("/") : [];
     parts.forEach((part, i) => {
       crumbs.appendChild(chevron("mmc-crumb-sep"));
@@ -592,9 +814,24 @@ export class Picker {
     for (const folder of this.childFolders(here)) {
       strip.appendChild(chip({
         key: folder, label: folder.slice(here ? here.length + 1 : 0), title: folder, iconName: "folder",
-        n: count((a) => this.under(a.subfolder, folder)),
+        n: folderCount((a) => this.under(a.subfolder, folder)),
         deep: this.childFolders(folder).length > 0,
       }));
+    }
+    for (const folder of this.kind === "meshes" ? [] : this.externalFolders) {
+      const wrapper = el("div", { class: "mmc-external-folder" });
+      wrapper.appendChild(el("button", {
+        class: "mmc-shelf", "aria-selected": String(this.externalFolder === folder.id),
+        title: t("{path} — click to refresh this folder", { path: folder.path }),
+        onclick: () => this.selectExternalFolder(folder.id),
+      }, [icon("folder", 13), el("span", { class: "mmc-shelf-name", text: folder.name })]));
+      wrapper.appendChild(el("button", {
+        class: "mmc-external-forget", text: "×",
+        title: t("Remove this folder shortcut. Its files are not deleted."),
+        "aria-label": t("Remove folder shortcut: {name}", { name: folder.name }),
+        onclick: (event) => { event.stopPropagation(); this.forgetExternalFolder(folder.id); },
+      }));
+      strip.appendChild(wrapper);
     }
     strip.addEventListener("scroll", () => this.markStripEdges(strip));
     // A trackpad swipes sideways on its own; a wheel only ever sends deltaY,
@@ -607,8 +844,9 @@ export class Picker {
 
     // Folders on the mesh shelf are made in a file manager, if at all: the
     // folder routes act on the media roots.
-    const drop = this.kind === "meshes" ? null : this.emptyShelfChip(here);
-    this.shelfRow.replaceChildren(crumbs, strip, ...(this.kind === "meshes" ? [] : [this.newShelfChip(here)]),
+    const fixed = this.kind === "meshes" || this.kind === "refmods" || this.externalFolder;
+    const drop = fixed ? null : this.emptyShelfChip(here);
+    this.shelfRow.replaceChildren(crumbs, strip, ...(fixed ? [] : [this.newShelfChip(here)]),
                                   ...(drop ? [drop] : []));
     requestAnimationFrame(() => this.markStripEdges(strip));
   }
@@ -701,7 +939,9 @@ export class Picker {
    *  whole of the answer, so it stays up long enough to be read. */
   async reveal() {
     try {
-      this.warn(await revealFolder(this.rootName(), this.here()), { quiet: true });
+      this.warn(await (this.externalFolder
+        ? revealExternalFolder(this.externalFolder)
+        : revealFolder(this.rootName(), this.here())), { quiet: true });
     } catch (error) {
       this.warn(error.path ? `${error.message} — ${error.path}` : error.message, { ms: 12000 });
     }
@@ -725,6 +965,7 @@ export class Picker {
    *  the whole marked set with it — drag and the Move to… menu are two doors
    *  to the same room. */
   async moveTo(folder) {
+    if (this.externalFolder) return;
     const dragged = this.dragging;
     this.dragging = null;
     if (!dragged) return;
@@ -739,6 +980,7 @@ export class Picker {
    *  star, segment settings, mark and selection over to its new path. Per-file
    *  failures (a name collision, say) skip that file rather than the batch. */
   async moveMany(batch, target) {
+    if (this.externalFolder || batch.some((asset) => asset.path.startsWith("external:"))) return;
     const failures = [];
     for (const asset of batch) {
       if ((asset.subfolder || "") === target) continue;
@@ -770,6 +1012,7 @@ export class Picker {
   // ---- organize mode -------------------------------------------------------
 
   setOrganize(on) {
+    if (on && this.externalFolder) return;
     if (this.organize === on) return;
     this.organize = on;
     this.marked = [];
@@ -859,6 +1102,7 @@ export class Picker {
   }
 
   async deleteMarked() {
+    if (this.externalFolder) return;
     this.deleteButton.disabled = true;
     this.deleteButton.textContent = t("Deleting…");
     const failures = [];
@@ -887,7 +1131,7 @@ export class Picker {
     // picker itself writes. A sheet is made *of* the grid's pictures, and a
     // folder of them mixed back in offers every old sheet as a panel for the
     // next one. They stay reachable on their own shelf.
-    const onShelf = this.shelf === "all"
+    const onShelf = this.externalFolder ? () => true : this.shelf === "all"
       ? (asset) => !(asset.subfolder || "").split("/")[0].startsWith("_")
       : this.shelf === "fav" ? (asset) => this.isFav(asset.path)
         : (asset) => this.under(asset.subfolder, this.shelf);
@@ -898,7 +1142,7 @@ export class Picker {
     const only = this.options.only;
     // The guide tab stays the bench's folder with `only` set — a pre-stage asks
     // for still tracings, not for every picture in the input folder.
-    const onKind = only && this.kind === "guides" ? (asset) => isGuide(asset) && asset.kind === only
+    const onKind = only && this.kind === "guides" ? (asset) => (this.externalFolder || isGuide(asset)) && asset.kind === only
       : only ? (asset) => asset.kind === only
       : this.kind === "renders" ? () => true
       // Mods are a place too, and every one is a reference of its own kind.
@@ -906,7 +1150,7 @@ export class Picker {
       : this.kind === "meshes" ? () => true
       // The guide tab is a place, not a kind: everything the bench has traced,
       // clips and stills, and nothing else in the input folder.
-      : this.kind === "guides" ? isGuide
+      : this.kind === "guides" ? (asset) => this.externalFolder ? ["image", "video"].includes(asset.kind) : isGuide(asset)
       : (asset) => asset.kind === this.kind;
     return this.activeAssets().filter((asset) =>
       onKind(asset) && onShelf(asset)
@@ -968,7 +1212,9 @@ export class Picker {
       return;
     }
     if (this.loadError) {
-      this.grid.appendChild(el("div", { class: "mmc-empty", text: t("Could not read the input folder: {error}", { error: this.loadError }) }));
+      this.grid.appendChild(el("div", { class: "mmc-empty", text: this.externalFolder
+        ? t("Could not read this folder: {error}", { error: this.loadError })
+        : t("Could not read the input folder: {error}", { error: this.loadError }) }));
       return;
     }
     const rows = this.visible();
@@ -979,6 +1225,7 @@ export class Picker {
           ? (this.kind === "renders"
               ? t("No renders matching “{query}”.", { query: this.query })
               : t("No {kind} files matching “{query}”.", { kind: t(this.kind), query: this.query }))
+          : this.externalFolder ? t("No {kind} files in this folder.", { kind: t(KIND_LABEL[this.kind].toLowerCase()) })
           : this.kind === "refmods"
             ? t("No RefMods yet — import a .safetensors and they join the cast, or save "
               + "a cast member's pictures from their card.")
@@ -1062,7 +1309,7 @@ export class Picker {
       // The very end of the listing: if the server capped it, this is the one
       // place a browsing user can be told the folder holds more.
       const root = this.kind === "renders" ? "output" : "input";
-      if (this.page === this.pages - 1 && listingTruncated(root)) {
+      if (this.page === this.pages - 1 && (this.externalFolder ? this.externalTruncated : listingTruncated(root))) {
         this.grid.appendChild(el("div", {
           class: "mmc-grid-note",
           text: t("The folder holds more — only the newest {count} files are listed.", { count: this.activeAssets().length }),
@@ -1102,7 +1349,126 @@ export class Picker {
         ? this.marked.includes(path)
         : this.selected.some((a) => a.path === path);
       cell.setAttribute("aria-selected", String(chosen));
+      if (this.referenceDefaults) {
+        const asset = this.selected.find((a) => a.path === path);
+        if (!asset) continue;
+        const picked = this.referencePick(asset, false);
+        for (const field of cell.querySelectorAll(".mmc-reference-field")) {
+          field.value = picked[field.name] ?? "";
+        }
+      }
     }
+  }
+
+  referenceFile(asset) {
+    return this.referenceDefaults && this.referenceTakes(asset).length > 0;
+  }
+
+  referenceTakes(asset) {
+    const picked = { ...asset, ...(this.settings.get(asset.path) || {}), role: "reference" };
+    const keys = takeOptions(picked);
+    const kind = picked.kind === "audio" || picked.track === "sound" ? "audio" : picked.kind;
+    const allowed = this.options.referenceOptions?.allowedTakes?.[kind];
+    return allowed ? keys.filter((key) => allowed.includes(key)) : keys;
+  }
+
+  referenceSizeable(asset) {
+    return this.referenceFile(asset) && !asset.mod
+      && (asset.kind === "image" || asset.kind === "video") && this.targetKind(asset) !== "audio";
+  }
+
+  referencePick(asset, defaults = true) {
+    const picked = { ...asset, ...(this.settings.get(asset.path) || {}) };
+    if (!this.referenceDefaults) return picked;
+    if (!this.referenceFile(asset)) {
+      delete picked.takes;
+      delete picked.ref_size;
+      return picked;
+    }
+    const wanted = picked.takes ?? this.referenceDefaults.takes;
+    const keys = this.referenceTakes(picked);
+    picked.takes = keys.includes(wanted) ? wanted : keys[0];
+    if (this.referenceSizeable(asset)) {
+      picked.ref_size = (picked.ref_size ?? this.referenceDefaults.ref_size) === "match" ? "match" : "max";
+    } else delete picked.ref_size;
+    if (!defaults) {
+      for (const key of ["takes", "ref_size"]) {
+        if (!Object.hasOwn(this.settings.get(asset.path) || {}, key)
+            && !Object.hasOwn(asset, key) && !this.referenceChanges.has(key)
+            && this.options.referenceOptions[key] === undefined) {
+          delete picked[key];
+        }
+      }
+    }
+    return picked;
+  }
+
+  referenceFields(options, picked, change, sizeable) {
+    const field = (name, keys, title) => {
+      const unset = picked[name] === undefined;
+      const mixed = !unset && !keys.includes(picked[name]);
+      const select = el("select", {
+        class: "mmc-reference-field", name, title, "aria-label": title,
+        onchange: (event) => change(name, event.target.value),
+      }, [...(unset || mixed ? [el("option", { value: "", disabled: true,
+          text: t(unset ? "Default" : "Mixed") })] : []),
+        ...keys.map((key) => el("option", {
+        value: key, text: name === "takes" ? t(takeWord(key)) : t(key),
+      }))]);
+      select.value = unset || mixed ? "" : picked[name];
+      return select;
+    };
+    return [field("takes", options, t("What to reference")),
+      ...(sizeable ? [field("ref_size", ["max", "match"], t("Reference encoding size"))] : [])];
+  }
+
+  referenceControls(asset) {
+    if (!this.referenceFile(asset) || this.organize) return null;
+    const controls = el("div", {
+      class: "mmc-cell-reference",
+      onclick: (event) => event.stopPropagation(),
+      onkeydown: (event) => event.stopPropagation(),
+      onmousedown: (event) => event.stopPropagation(),
+      draggable: false,
+    }, this.referenceFields(this.referenceTakes(asset),
+      this.referencePick(asset, false), (key, value) => {
+        this.settings.set(asset.path, { ...this.settings.get(asset.path), [key]: value });
+        this.renderFoot();
+      }, this.referenceSizeable(asset)));
+    return controls;
+  }
+
+  referenceBatch() {
+    if (!this.referenceDefaults || !["image", "video", "audio", "renders", "refmods"].includes(this.kind)) return null;
+    const files = this.selected.filter((asset) => this.referenceFile(asset));
+    const rows = files.length ? files
+      : [{ kind: ["image", "audio"].includes(this.kind) ? this.kind : "video", mod: this.kind === "refmods" }];
+    const options = rows.map((asset) => this.referenceTakes(asset))
+      .reduce((common, keys) => common.filter((key) => keys.includes(key)));
+    if (!options.length) return null;
+    const sizeable = rows.some((asset) => this.referenceSizeable(asset));
+    const picked = {};
+    for (const key of ["takes", "ref_size"]) {
+      const applicable = rows.filter((asset) => key !== "ref_size" || this.referenceSizeable(asset));
+      const values = applicable.flatMap((asset) => [this.referencePick(asset, false)[key],
+        this.referencePick({ kind: asset.kind, track: asset.track, mod: asset.mod }, false)[key]]);
+      if (!values.length || values.every((value) => value === undefined)) continue;
+      const unique = new Set(values);
+      picked[key] = unique.size === 1 ? values[0] : "mixed";
+    }
+    return el("div", {
+      class: "mmc-picker-reference",
+      title: t("Applies to selected files and new selections. Each selected file can override these settings."),
+    }, [el("span", { text: t("Selected / new files") }),
+      ...this.referenceFields(options, picked, (key, value) => {
+        this.referenceDefaults[key] = value;
+        this.referenceChanges.add(key);
+        for (const asset of files) {
+          if (key === "ref_size" && !this.referenceSizeable(asset)) continue;
+          this.settings.set(asset.path, { ...this.settings.get(asset.path), [key]: value });
+        }
+        this.syncSelected();
+      }, sizeable)]);
   }
 
   cell(asset) {
@@ -1219,6 +1585,8 @@ export class Picker {
       if (asset.kind !== "audio") cell.appendChild(this.cropBadge(asset));
     }
     if (asset.kind !== "audio") cell.appendChild(el("div", { class: "mmc-cell-name", text: asset.name }));
+    const referenceControls = this.referenceControls(asset);
+    if (referenceControls) cell.appendChild(referenceControls);
 
     // Stars and dragging on every tab, renders included: a finished clip is the
     // thing most worth starring, and where a render was *written* is not where
@@ -1246,8 +1614,9 @@ export class Picker {
     // Organizing is dragging: the cell rides to a shelf chip. The chips take
     // it from `this.dragging` — dataTransfer only carries strings.
     // A mod's home is the model folders; the shelves are input's.
-    cell.draggable = !asset.mod && asset.kind !== "mesh";
+    cell.draggable = !this.externalFolder && !asset.path.startsWith("external:") && !asset.mod && asset.kind !== "mesh";
     cell.addEventListener("dragstart", (event) => {
+      if (!cell.draggable) { event.preventDefault(); return; }
       this.dragging = asset;
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", asset.path);
@@ -1305,6 +1674,8 @@ export class Picker {
   }
 
   async editPicture(asset) {
+    try { if (!await this.materializeRows([asset])) return; }
+    catch (error) { this.warn(error.message); return; }
     const setting = this.settings.get(asset.path) || {};
     const canCut = this.chipPossible(asset);
     const result = await openPicture({
@@ -1334,6 +1705,8 @@ export class Picker {
   }
 
   async editSegment(asset) {
+    try { if (!await this.materializeRows([asset])) return; }
+    catch (error) { this.warn(error.message); return; }
     const setting = this.settings.get(asset.path) || {};
     const result = await openTrim({
       path: asset.path,
@@ -1352,14 +1725,13 @@ export class Picker {
     // Stored even when it matches the default, because "the user looked at this
     // and left the sound off" has to outrank the on-by-default rule. The
     // framing, set in the other editor, rides along untouched.
-    this.settings.set(asset.path, { ...(setting.crop ? { crop: setting.crop } : {}), ...result });
+    this.settings.set(asset.path, { ...setting, ...result });
     const selected = this.selected.some((a) => a.path === asset.path);
     // Switching to sound-only moves the file between buckets, and the one it
     // lands in may be full. Say so and put the choice back rather than letting a
     // selection through that compile.py would refuse.
     if (selected && !this.fits(this.targetKind(asset))) {
-      this.settings.set(asset.path, { ...(setting.crop ? { crop: setting.crop } : {}),
-                                      ...result, track: setting.track });
+      this.settings.set(asset.path, { ...setting, ...result, track: setting.track });
       this.refreshCell(asset);   // the segment still changed, even if the track did not
       this.warn(t("No {kind} slot left for {name}.", { kind: t(this.targetKind(asset)), name: asset.name }));
       return;
@@ -1466,6 +1838,11 @@ export class Picker {
    *  sheet stage reads. One matte per press, no debounce — the runs of clicks
    *  that need one happen in the subject view, which has its own. */
   previewCut(asset) {
+    if (asset.path.startsWith("external:")) {
+      this.materializeRows([asset]).then((ready) => { if (ready) this.previewCut(asset); })
+        .catch((error) => { if (!this.closed) this.warn(error.message); });
+      return;
+    }
     if (!this.cutOf(asset)) { this.refreshCell(asset); return; }
     const key = JSON.stringify([asset.path, this.points.get(asset.path) ?? [],
                                 this.settings.get(asset.path)?.crop ?? null]);
@@ -1535,12 +1912,23 @@ export class Picker {
    *  and the pictures it was laid out from. `Editor.attachAssets` turns it
    *  into the one entry. */
   sheetAnswer(built, panels) {
+    const settings = panels.length === 1 ? this.referencePick(panels[0], false) : {
+      ...(this.referenceChanges.has("ref_size") || this.options.referenceOptions?.ref_size
+        ? { ref_size: this.referenceDefaults.ref_size } : {}),
+    };
     return {
       plate: true,
       kind: "image",
       path: built.path,
       name: built.path.split("/").pop(),
-      panels: panels.map((asset) => this.panelPayload(asset)),
+      ...(this.referenceDefaults ? {
+        ...(settings.ref_size ? { ref_size: settings.ref_size } : {}),
+        ...(settings.takes ? { takes: settings.takes } : {}),
+      } : {}),
+      panels: panels.map((asset) => ({ ...this.panelPayload(asset),
+        ...(this.referenceFile(asset) && this.referencePick(asset, false).takes
+          ? { takes: this.referencePick(asset, false).takes } : {}),
+      })),
     };
   }
 
@@ -1565,6 +1953,11 @@ export class Picker {
    * references ride alongside.
    */
   openSheet() {
+    if (this.selectedImages().some((asset) => asset.path.startsWith("external:"))) {
+      this.materializeRows(this.selectedImages()).then((ready) => { if (ready) this.openSheet(); })
+        .catch((error) => { if (!this.closed) this.warn(error.message); });
+      return;
+    }
     // The group being edited: the sheet as it stands, plus any images selected
     // since — which is how pictures are added to an existing sheet.
     const inSheet = new Set(this.sheet);
@@ -1920,7 +2313,7 @@ export class Picker {
         if (this.sheetFamily()) {
           shut();
           // A lone uncut picture *is* the reference: attached as itself.
-          this.close([{ ...order[0], ...(this.settings.get(order[0].path) || {}) }]);
+          this.close([this.referencePick(order[0], false)]);
           return;
         }
         // A group of one uncut picture is not a sheet — it dissolves back into
@@ -2016,6 +2409,7 @@ export class Picker {
     this.foot.style.display = this.options.viewOnly && !this.organize ? "none" : "";
 
     if (this.organize) {
+      this.foot.classList.remove("mmc-reference-foot");
       this.slots.classList.remove("full");
       this.slots.textContent = this.marked.length
         ? t("{count} marked", { count: this.marked.length })
@@ -2061,6 +2455,8 @@ export class Picker {
     this.addButton = el("button", {
       class: "mmc-add",
       text: this.sheetFamily() && this.selectedImages().length > 1 ? t("Add sheet") : t("Add"),
+      title: this.externalFolder
+        ? t("Selected files are copied into ComfyUI for use. The original files are unchanged.") : "",
       onclick: () => this.commit(),
     });
     const row = [
@@ -2068,6 +2464,8 @@ export class Picker {
       el("button", { class: "mmc-ghost", text: t("Cancel"), onclick: () => this.close(null) }),
       this.addButton,
     ];
+    const referenceBatch = this.referenceBatch();
+    if (referenceBatch) row.splice(1, 0, referenceBatch);
     // Combine: lay the selected pictures out as one sheet, which then attaches
     // as a single reference and stays paired until it is taken off the piece.
     // Only where that is a choice — a sheet family has no button because its
@@ -2076,7 +2474,7 @@ export class Picker {
     if (this.sheetsPossible() && !this.sheetFamily()) {
       const joinable = new Set([...panels.map((a) => a.path),
                                ...this.selectedImages().map((a) => a.path)]).size;
-      row.splice(2, 0, el("button", {
+      row.splice(row.length - 1, 0, el("button", {
         class: "mmc-ghost mmc-connect",
         text: panels.length ? t("Edit sheet…") : t("Combine…"),
         title: t("Lay the selected pictures out as one sheet — arrange them on the shot's "
@@ -2085,6 +2483,7 @@ export class Picker {
         onclick: () => this.openSheet(),
       }));
     }
+    this.foot.classList.toggle("mmc-reference-foot", Boolean(referenceBatch));
     this.foot.replaceChildren(...row);
     if (this.options.single) {
       this.slots.textContent = this.selected.length ? t("1 selected") : t("Pick one");
@@ -2198,6 +2597,21 @@ export class Picker {
 
   async commit() {
     if (!this.selected.length || this.committing) return;
+    if (this.selected.some((asset) => asset.path.startsWith("external:"))) {
+      this.committing = true;
+      this.renderFoot();
+      let failure;
+      try {
+        if (!await this.materializeRows(this.selected)) return;
+      } catch (error) {
+        failure = error;
+      } finally {
+        this.committing = false;
+        if (!this.closed) this.renderFoot();
+      }
+      if (failure) { if (!this.closed) this.warn(failure.message); return; }
+      if (this.closed) return;
+    }
     // On a sheet family the image selection *is* the sheet, and a *layout* is
     // confirmed by being looked at: two or more pictures still leave through
     // the editor. A lone cut picture no longer does — its cell has been
@@ -2215,7 +2629,7 @@ export class Picker {
     // attach as themselves.
     const cut = loose.filter((asset) => this.chipPossible(asset) && this.sheetNeeded([asset]));
     const plain = loose.filter((asset) => !cut.includes(asset))
-      .map((asset) => ({ ...asset, ...(this.settings.get(asset.path) || {}) }));
+      .map((asset) => this.referencePick(asset, false));
     if (!cut.length && (!panels.length || !this.sheetNeeded(panels))) {
       this.close(plain);
       return;
@@ -2249,6 +2663,8 @@ export class Picker {
   }
 
   close(result) {
+    this.closed = true;
+    ++this.listingSequence;
     clearTimeout(this.warnTimer);
     clearTimeout(this.armTimer);
     // Cancel while a cut sheet waits behind a render: the job would otherwise

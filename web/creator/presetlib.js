@@ -43,7 +43,7 @@ import { rememberedWeights } from "./models.js";
 import { atlasRef } from "./presets/atlasref.js";
 import { openPicker } from "./picker.js";
 import { downloadMod, openLoraMenu, openMenu, noteField, sizeRows, triggerField, MARKER_LABEL,
-         MARKER_NOTE, ROLES, TAKES_NOTE } from "./cast.js";
+         MARKER_NOTE, ROLES, TAKES_NOTE, CAST_REFERENCE_TAKES, referenceRole } from "./cast.js";
 import { openLoras } from "./loras.js";
 import { SUBJECT_TAKES, seedFeatures, showSeconds, splitTriggers, tagIndex, tidyWears, wearOn,
          GUIDE_LORA_STRENGTH, guideLoraStyle, DEFAULT_VIDEO_FAMILY, checkpointsOf, routing, routesOf } from "./state.js";
@@ -1839,15 +1839,22 @@ class PresetLibrary {
     const chosen = await openPicker({
       kinds: mods ? ["refmods"] : ["image", "video", "audio", "renders", "refmods"],
       kind: mods ? "refmods" : "image",
-      capacity: () => ({ used: 0, max: 8, filesLeft: 8 }),
+      referenceOptions: { allowedTakes: CAST_REFERENCE_TAKES },
+      capacity: (kind) => ({ used: 0, max: kind === "audio" ? 1 : 8, filesLeft: 8 }),
       plate: spec ? { ...spec, panels: [] } : null,
     });
     if (!chosen?.length) return;
     for (const asset of chosen) {
       const kind = asset.kind ?? "image";
-      const slot = (ROLES.find((role) => role.fits({ kind })) ?? ROLE.from).key;
+      const slot = referenceRole({ ...asset, kind });
+      if (slot === "voice") member.files = (member.files ?? []).filter((file) => file.slot !== "voice");
       member.files = [...(member.files ?? []), {
         slot, filename: asset.path, kind,
+        ...(asset.takes ? { takes: asset.takes } : {}),
+        ...(asset.ref_size ? { ref_size: asset.ref_size } : {}),
+        ...(asset.track ? { track: asset.track } : {}),
+        ...(asset.trim ? { trim: { ...asset.trim } } : {}),
+        ...(asset.crop ? { crop: { ...asset.crop } } : {}),
         ...(asset.panels?.length
           ? { panels: asset.panels.map((panel) => ({ ...panel })) } : {}),
       }];

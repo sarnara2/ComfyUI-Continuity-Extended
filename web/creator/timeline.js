@@ -10,7 +10,7 @@
 import { api } from "../../../scripts/api.js";
 import { compiledPrompt, probe, viewUrl, primeSettings, buildPlate, stillUrl } from "./api.js";
 import { openRestyle } from "./restyle.js";
-import { CastShelf } from "./cast.js";
+import { CastShelf, CAST_REFERENCE_TAKES } from "./cast.js";
 import { castFamilies, keepAsMod } from "./refmod.js";
 import { clearButton } from "./clear.js";
 import { el, icon, mountOverlay, swappable, closeOwnedPopovers } from "./dom.js";
@@ -26,6 +26,7 @@ import { openSettings } from "./settings.js";
 import { SoundLane } from "./soundlane.js";
 import { openTrim, trimLabel } from "./trim.js";
 import { openPicture, editPicture, asPick, cropLabel } from "./picture.js";
+import { isVisualReference, previewable, openReferencePreview } from "./reference-preview.js";
 import { openAspectPopover, openResolutionPopover, openChoicePopover, facesPill, neuralPill, guideLoraPill, stepperPill,
          aspectGlyph, resolutionPillText, PILL_GLYPH } from "./pills.js";
 import { refine, refineButton, chosenModel as refineModel } from "./refine.js";
@@ -353,9 +354,11 @@ async function compiledFor(timeline, card, seed) {
 }
 
 class Timeline {
-  constructor({ timeline, onCommit, edit = null, io = null }, resolve) {
+  constructor({ timeline, onCommit, edit = null, io = null, sections = null, soundSnaps = null }, resolve) {
     this.timeline = timeline;
     this.onCommit = onCommit;
+    this.sections = sections;
+    this.soundSnaps = soundSnaps;
     this.resolve = resolve;
     // The node's sampler widgets, so a card's preset can carry the row it was
     // dialled at. The modal owns none of them — the sampler belongs to the node,
@@ -543,10 +546,32 @@ class Timeline {
     this.promptBox?.setValue(text);
   }
 
+  sectionOptions(key) {
+    return {
+      initialOpen: this.sections?.read(key) ?? true,
+      onOpenChange: (opened) => this.sections?.write(key, opened),
+    };
+  }
+
+  noAudioButton(key, input, label) {
+    const title = t("Set {field} to N/A", { field: label });
+    return el("button", {
+      type: "button", class: "mmc-pill mmc-tl-na", text: "N/A",
+      title, "aria-label": title,
+      onclick: (event) => {
+        event.stopPropagation();
+        this.timeline[key] = "N/A";
+        input.value = "N/A";
+        this.commit();
+      },
+    });
+  }
+
   mount() {
     this.promptBox = this.globalPromptBox();
     this.promptBox.setValue(this.timeline.prompt ?? "");
     this.promptSection = createDisclosure({
+      ...this.sectionOptions("global_prompt"),
       // Display label only. The serialized key remains `prompt`.
       title: "global_prompt", content: this.promptBox.frame,
       onBeforeCollapse: () => this.promptBox.closeMenu(),
@@ -570,8 +595,12 @@ class Timeline {
                    + "Empty leaves it to the model; write N/A for none."),
     });
 
-    this.soundscapeSection = createDisclosure({ title: t("overall_soundscape"), content: this.soundscapeBox });
-    this.musicSection = createDisclosure({ title: t("non_diegetic_music"), content: this.musicBox });
+    this.soundscapeSection = createDisclosure({ ...this.sectionOptions("overall_soundscape"),
+      title: t("overall_soundscape"), content: this.soundscapeBox, inlineActions: true,
+      actions: [this.noAudioButton("soundscape", this.soundscapeBox, t("overall_soundscape"))] });
+    this.musicSection = createDisclosure({ ...this.sectionOptions("non_diegetic_music"),
+      title: t("non_diegetic_music"), content: this.musicBox, inlineActions: true,
+      actions: [this.noAudioButton("music", this.musicBox, t("non_diegetic_music"))] });
     this.soundscapeBox.setAttribute("aria-labelledby", this.soundscapeSection.titleId);
     this.musicBox.setAttribute("aria-labelledby", this.musicSection.titleId);
     this.audioHost = el("div", { class: "mmc-tl-audio" }, [
@@ -580,6 +609,7 @@ class Timeline {
 
     this.poolHost = el("div", { class: "mmc-tl-pool" });
     this.poolSection = createDisclosure({
+      ...this.sectionOptions("references"),
       title: t("Piece references"),
       onBeforeCollapse: () => closeOwnedPopovers(this.poolSection.body),
     });
@@ -603,6 +633,7 @@ class Timeline {
     // strip's.
     this.sound = new SoundLane({
       read: () => this.timeline,
+      snaps: this.soundSnaps,
       onCommit: () => this.commit(),
       flash: (message) => this.flash?.(message),
     });
@@ -816,14 +847,19 @@ class Timeline {
       ? el("img", { class: "mmc-asset-thumb", alt: "",
                     src: viewUrl(asset.filename, { preview: true, crop: S.thumbCrop(asset) }) })
       : el("span", { class: "mmc-asset-thumb", text: asset.kind === "video" ? "▶" : "♪" });
-    // The pool is the one place a swap pays the most: @char rides into every
-    // segment that cites it, so re-casting the character is one click here
-    // rather than a re-add and a rewrite in each of them.
-    swappable(thumb, {
-      title: t("Swap the file behind @{handle} — the handle stays, so every citation still fits.",
-               { handle: asset.handle }),
-      onclick: () => this.replacePoolAsset(asset),
-    });
+    if (isVisualReference(asset)) {
+      previewable(thumb, {
+        title: t("Double-click to preview @{handle}. Click the handle to replace its file.",
+                 { handle: asset.handle }),
+        open: (returnFocus) => openReferencePreview([asset], { returnFocus }),
+      });
+    } else {
+      swappable(thumb, {
+        title: t("Swap the file behind @{handle} — the handle stays, so every citation still fits.",
+                 { handle: asset.handle }),
+        onclick: () => this.replacePoolAsset(asset),
+      });
+    }
     return el("div", {
       // Not idle where a double exists: the file is being used, and dimming the
       // chip that says so would contradict its own text. A cast file is idle on
@@ -853,11 +889,12 @@ class Timeline {
     }, [
       thumb,
       el("button", {
+        type: "button",
         class: `mmc-asset-handle mmc-tl-pool-cite mmc-tag-${S.tagIndex(asset.handle)}`,
         text: `@${asset.handle}`,
-        title: t("Write @{handle} into the global prompt, so it applies to every segment.",
+        title: t("Swap the file behind @{handle} — the handle stays, so every citation still fits.",
                  { handle: asset.handle }),
-        onclick: () => this.citeInGlobal(asset),
+        onclick: () => this.replacePoolAsset(asset),
       }),
       // Whose it is, in their own hue — the one the shelf below draws them in,
       // and the one their name wears mid-sentence. The chip is then readable as
@@ -992,11 +1029,12 @@ class Timeline {
   renderCast() {
     this.castShelf ??= new CastShelf({
       disclosure: true,
+      ...this.sectionOptions("cast"),
       getCast: () => this.timeline.subjects ?? [],
       setCast: (list) => { this.timeline.subjects = list; },
       family: () => S.pieceFamily(this.timeline),
       getAssets: () => S.castAssets(this.timeline),
-      addAsset: () => this.attachOneCastAsset(),
+      addAsset: (subject) => this.attachOneCastAsset(subject),
       whereCited: (subject) => {
         if (S.subjectCitedGlobally(this.timeline, subject)) {
           return { cited: true, text: t("in every shot") };
@@ -1010,9 +1048,7 @@ class Timeline {
             : "",
         };
       },
-      // Into the global prompt, which is in front of every shot — the same
-      // gesture the pool's own handle button makes, and the answer to "they are
-      // in the piece, in all of it".
+      // A cast citation in the global prompt applies to every shot.
       cite: (subject) => this.citeName(subject.handle),
       // The roster, both ways — see the same pair on the node face. Casting
       // somebody out of the library attaches their files to the pool, which is
@@ -1148,9 +1184,8 @@ class Timeline {
     };
   }
 
-  /** One file, attached for the cast shelf's "attach a file…".
-   *  `addPoolAssets` takes several and answers nothing; a subject is being given
-   *  one thing, and the shelf needs to know which entry it was.
+  /** Files attached for the cast shelf's "attach a file…".
+   *  Return all new entries so the shelf can bind a whole selection.
    *
    *  Onto the pool, or onto a lone shot's own row where that is where the cast's
    *  files live — the same rule `presets.addSubjectToPiece` follows, and for the
@@ -1163,40 +1198,46 @@ class Timeline {
     const chosen = await openPicker({
       kinds: ["image", "video", "audio", "renders", "refmods"],
       kind: "image",
-      capacity: (kind) => (single
-        ? S.capacity(host, kind, this.timeline)
-        : { used: 0, max: S.refCaps(this.timeline).files, filesLeft: S.refCaps(this.timeline).files }),
+      referenceOptions: { allowedTakes: CAST_REFERENCE_TAKES },
+      capacity: (kind) => {
+        const slots = single ? S.capacity(host, kind, this.timeline)
+          : { used: 0, max: S.refCaps(this.timeline).files, filesLeft: S.refCaps(this.timeline).files };
+        // A cast member has one voice, but may keep several visual references.
+        return kind === "audio" ? { ...slots, max: Math.min(slots.max, slots.used + 1) } : slots;
+      },
       // The scissors ride along: a picture attached while casting somebody is
       // the purest cutout case there is — the `takes` prose already promises
       // the background is dropped, and the chip makes the pixels agree.
       plate: this.poolPlate(),
     });
     if (!chosen?.length) return null;
-    const picked = chosen[0];
     if (!Array.isArray(host.assets)) host.assets = [];
-    // A cut picture (or a sheet) arrives as a plate: one reference, numbered
-    // the way this host numbers — a card's references are img-N, the pool's
-    // are ref-N.
-    if (picked.plate) {
-      const entry = S.plateEntry(picked, S.takenHandles(host),
-        single ? {} : { plate: "ref", panel: "ref" });
+    const entries = [];
+    for (const picked of chosen) {
+      // Sheets use this host's handles too: img-N on one shot, ref-N in the pool.
+      if (picked.plate) {
+        const entry = S.plateEntry(picked, S.takenHandles(host),
+          single ? {} : { plate: "ref", panel: "ref" });
+        host.assets.push(entry);
+        entries.push(entry);
+        continue;
+      }
+      const entry = {
+        handle: single ? S.nextHandle(host, picked.kind) : S.nextPoolHandle(this.timeline),
+        kind: picked.kind,
+        role: "reference",
+        filename: picked.path ?? picked.filename,
+        ref_size: picked.ref_size ?? "max",
+      };
+      if (picked.trim) entry.trim = picked.trim;
+      if (picked.crop) entry.crop = picked.crop;
+      if (entry.kind === "video") entry.track = S.trackFor(picked);
+      if (picked.takes) entry.takes = S.takes({ ...entry, takes: picked.takes });
       host.assets.push(entry);
-      this.commit();
-      return entry;
+      entries.push(entry);
     }
-    const entry = {
-      handle: single ? S.nextHandle(host, picked.kind) : S.nextPoolHandle(this.timeline),
-      kind: picked.kind,
-      role: "reference",
-      filename: picked.path ?? picked.filename,
-      ref_size: "max",
-    };
-    if (picked.trim) entry.trim = picked.trim;
-    if (picked.crop) entry.crop = picked.crop;
-    if (entry.kind === "video") entry.track = S.trackFor(picked);
-    host.assets.push(entry);
     this.commit();
-    return entry;
+    return entries;
   }
 
   /** Write a name into the global prompt, so it applies to every shot. The
@@ -1237,6 +1278,7 @@ class Timeline {
     const chosen = await openPicker({
       kinds: ["image", "video", "audio", "renders", "refmods"],
       kind: "image",
+      referenceOptions: {},
       // The per-segment reference caps are compile's, applied where a segment
       // actually cites — the pool itself has no ceiling worth enforcing here.
       capacity: () => ({ used: 0, max: S.refCaps(this.timeline).files, filesLeft: S.refCaps(this.timeline).files }),
@@ -1267,9 +1309,10 @@ class Timeline {
       role: "reference",
       filename: picked.path,
       // Fidelity is why a reference is attached — same default as the editor.
-      ref_size: "max",
+      ref_size: picked.ref_size ?? "max",
     };
     if (picked.kind === "video") entry.track = S.trackFor(picked);
+    if (picked.takes) entry.takes = S.takes({ ...entry, takes: picked.takes });
     if (picked.trim) entry.trim = picked.trim;
     if (picked.crop) entry.crop = picked.crop;
     return entry;
@@ -1302,13 +1345,15 @@ class Timeline {
     const chosen = await openPicker({
       kinds: ["image", "renders"],
       kind: "image",
+      referenceOptions: { takes: S.takes(asset), ref_size: S.refSize(asset) },
       capacity: () => ({ used: 0, max: S.refCaps(this.timeline).files,
                          filesLeft: S.refCaps(this.timeline).files }),
       plate: { ...spec, panels: (asset.panels?.length
         ? asset.panels.map((panel) => ({ path: panel.filename, cut: Boolean(panel.cut),
             ...(panel.rect ? { rect: [...panel.rect] } : {}),
             ...(panel.points?.length ? { points: panel.points.map((p) => ({ ...p })) } : {}),
-            ...(panel.crop ? { crop: { ...panel.crop } } : {}) }))
+            ...(panel.crop ? { crop: { ...panel.crop } } : {}),
+            ...(panel.takes ? { takes: panel.takes } : {}) }))
         : [{ path: asset.filename, cut: false }]) },
     });
     if (!chosen) return;
@@ -1328,7 +1373,8 @@ class Timeline {
     this.timeline.assets.splice(at, 1);
     if (sheet) {
       this.timeline.assets.splice(at, 0, S.plateEntry(
-        sheet, S.takenHandles(this.timeline),
+        { ...sheet, takes: sheet.takes ?? asset.takes, ref_size: sheet.ref_size ?? asset.ref_size },
+        S.takenHandles(this.timeline),
         { plate: "ref", panel: "ref", handle: asset.handle, kept }));
     } else {
       // Narrowed to one, or taken apart: the first pick that was a panel steps
@@ -1339,18 +1385,16 @@ class Timeline {
         const before = kept.get(heir.path);
         this.timeline.assets.splice(at, 0, {
           handle: asset.handle, kind: "image", role: "reference",
-          filename: heir.path, ref_size: "max",
+          filename: heir.path, ref_size: heir.ref_size ?? asset.ref_size ?? "max",
+          ...((heir.takes ?? before?.takes ?? asset.takes)
+            ? { takes: heir.takes ?? before?.takes ?? asset.takes } : {}),
           ...(("crop" in heir ? heir.crop : before?.crop)
             ? { crop: "crop" in heir ? heir.crop : before.crop } : {}),
         });
       }
     }
     for (const picked of loose) {
-      this.timeline.assets.push({
-        handle: S.nextPoolHandle(this.timeline), kind: picked.kind,
-        role: "reference", filename: picked.path, ref_size: "max",
-        ...(picked.crop ? { crop: picked.crop } : {}),
-      });
+      this.timeline.assets.push(this.poolEntry(picked));
     }
     this.commit();
     this.renderPool();
@@ -1405,21 +1449,29 @@ class Timeline {
       kind: asset.kind,
       only: asset.kind,
       single: true,
+      referenceOptions: { takes: S.takes(asset), ref_size: S.refSize(asset) },
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
     });
     const picked = chosen?.[0];
-    if (!picked || picked.path === asset.filename) return;
+    if (!picked || !(this.timeline.assets ?? []).includes(asset)) return;
     if (picked.plate) {
       this.foldPoolSheet(asset, chosen);
       return;
     }
+    const changedFile = asset.filename !== picked.path;
     asset.filename = picked.path;
-    if (picked.trim) asset.trim = picked.trim;
-    else delete asset.trim;
-    if (picked.crop) asset.crop = picked.crop;
-    else delete asset.crop;
-    S.dropMods(asset);
-    if (asset.kind === "video") asset.track = S.trackFor(picked);
+    if (changedFile || Object.hasOwn(picked, "trim")) {
+      if (picked.trim) asset.trim = picked.trim;
+      else delete asset.trim;
+    }
+    if (changedFile || Object.hasOwn(picked, "crop")) {
+      if (picked.crop) asset.crop = picked.crop;
+      else delete asset.crop;
+    }
+    if (changedFile || Object.hasOwn(picked, "crop")) S.dropMods(asset);
+    if (asset.kind === "video" && (changedFile || Object.hasOwn(picked, "track"))) asset.track = S.trackFor(picked);
+    if (picked.takes) asset.takes = S.takes({ ...asset, takes: picked.takes });
+    if (picked.ref_size) asset.ref_size = picked.ref_size;
     this.commit();
   }
 
@@ -3485,7 +3537,7 @@ export class TimelineBody {
    *  this node rather than anything the render reads, so it lives on the node
    *  and not in the blob. */
   constructor({ read, write, widgets = {}, onWidgetChange, nodeId,
-                preStage = null, face = null, fullscreen = null }) {
+                preStage = null, face = null, fullscreen = null, sections = null }) {
     this.read = read;
     this.write = write;
     this.widgets = widgets;
@@ -3493,6 +3545,8 @@ export class TimelineBody {
     this.nodeId = nodeId;
     this.preStage = preStage;
     this.face = face;
+    this.sections = sections;
+    this.soundSnaps = new Set();
     // The way *into* the shell. The way out is the shell's own corner, and the
     // command and its keybinding have always existed — but a keystroke nobody
     // has been told about is not a door, and the setting in ComfyUI's own page
@@ -3932,6 +3986,8 @@ export class TimelineBody {
     openTimeline({
       timeline: this.timeline,
       onCommit: () => this.commit(),
+      sections: this.sections,
+      soundSnaps: this.soundSnaps,
       edit,
       // Lent so a card's preset can carry the sampler row — see `Timeline.io`.
       io: () => this.widgetIO(),
@@ -4118,6 +4174,7 @@ export class TimelineBody {
     const chosen = await openPicker({
       kinds: [kind, "renders", "refmods"],
       kind,
+      referenceOptions: {},
       capacity: () => ({ used: 0, max: S.refCaps(this.timeline).files, filesLeft: S.refCaps(this.timeline).files }),
       // `sheet` off, as on the modal's pool picker: the pool serves many
       // segments, so loose pictures stay loose and Connect builds a sheet.
@@ -4138,12 +4195,12 @@ export class TimelineBody {
         kind: picked.kind,
         role: "reference",
         filename: picked.path,
-        ref_size: "max",
+        ref_size: picked.ref_size ?? "max",
       };
       if (picked.kind === "video") entry.track = S.trackFor(picked);
+      if (picked.takes) entry.takes = S.takes({ ...entry, takes: picked.takes });
       if (picked.trim) entry.trim = picked.trim;
       if (picked.crop) entry.crop = picked.crop;
-    if (picked.crop) entry.crop = picked.crop;
       this.timeline.assets.push(entry);
     }
     this.commit();

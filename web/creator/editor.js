@@ -12,7 +12,7 @@
 // commits *while the user is typing in it*.
 
 import { el, icon, ICONS, dismissable, keepScroll, placeNear, svg, swappable } from "./dom.js";
-import { CastShelf } from "./cast.js";
+import { CastShelf, CAST_REFERENCE_TAKES } from "./cast.js";
 import { isVisualReference, previewable, openReferencePreview } from "./reference-preview.js";
 import { castFamilies, keepAsMod } from "./refmod.js";
 import { t } from "./i18n.js";
@@ -680,6 +680,7 @@ export class CreatorEditor {
       kinds: edit ? ["image", "renders"] : ["image", "video", "audio", "renders", "refmods"],
       aspect: this.pickerAspect(),
       kind,
+      referenceOptions: sheet ? { takes: S.takes(sheet), ref_size: S.refSize(sheet) } : {},
       capacity: (k) => S.capacity(this.state, k, this.piece, sheet),
       cardSeconds: this.cardSeconds(),
       // A plain attachment seeds as the sheet of one it already is. Its own
@@ -693,7 +694,8 @@ export class CreatorEditor {
               ? sheet.panels.map((panel) => ({ path: panel.filename, cut: Boolean(panel.cut),
                   ...(panel.rect ? { rect: [...panel.rect] } : {}),
                   ...(panel.points?.length ? { points: panel.points.map((p) => ({ ...p })) } : {}),
-                  ...(panel.crop ? { crop: { ...panel.crop } } : {}) }))
+                  ...(panel.crop ? { crop: { ...panel.crop } } : {}),
+                  ...(panel.takes ? { takes: panel.takes } : {}) }))
               : [{ path: sheet.filename, cut: false }])
           : [] } : null,
     });
@@ -814,7 +816,8 @@ export class CreatorEditor {
     this.state.assets.splice(at, 1);
     if (sheet) {
       this.state.assets.splice(at, 0,
-        S.plateEntry(sheet, S.takenHandles(this.state), { handle: seed.handle, kept }));
+        S.plateEntry({ ...sheet, takes: sheet.takes ?? seed.takes,
+          ref_size: sheet.ref_size ?? seed.ref_size }, S.takenHandles(this.state), { handle: seed.handle, kept }));
     } else {
       // The sheet came back as loose pictures — narrowed to one, or taken
       // apart. The first pick that was a panel steps into the seed's place and
@@ -826,8 +829,8 @@ export class CreatorEditor {
         const before = kept.get(heir.path);
         this.state.assets.splice(at, 0, {
           handle: seed.handle, kind: "image", role: "reference",
-          filename: heir.path, ref_size: "max",
-          ...(before?.takes && before.takes !== "full" ? { takes: before.takes } : {}),
+          filename: heir.path, ref_size: heir.ref_size ?? seed.ref_size ?? "max",
+          ...((heir.takes ?? before?.takes) ? { takes: heir.takes ?? before.takes } : {}),
           // The framing was drawn on this file and stays with it, whether it
           // came off a panel or the picker's cell. A pick that says `crop`
           // at all — the picture editor's, null included — is the answer.
@@ -914,6 +917,7 @@ export class CreatorEditor {
       kinds: ["renders", "image", "video", "audio", "refmods"],
       aspect: this.pickerAspect(),
       kind: "renders",
+      referenceOptions: sheet ? { takes: S.takes(sheet), ref_size: S.refSize(sheet) } : {},
       capacity: (k) => S.capacity(this.state, k, this.piece, sheet),
       cardSeconds: this.cardSeconds(),
       plate: spec ? { ...spec,
@@ -922,7 +926,8 @@ export class CreatorEditor {
               ? sheet.panels.map((panel) => ({ path: panel.filename, cut: Boolean(panel.cut),
                   ...(panel.rect ? { rect: [...panel.rect] } : {}),
                   ...(panel.points?.length ? { points: panel.points.map((p) => ({ ...p })) } : {}),
-                  ...(panel.crop ? { crop: { ...panel.crop } } : {}) }))
+                  ...(panel.crop ? { crop: { ...panel.crop } } : {}),
+                  ...(panel.takes ? { takes: panel.takes } : {}) }))
               : [{ path: sheet.filename, cut: false }])
           : [] } : null,
     });
@@ -950,9 +955,10 @@ export class CreatorEditor {
         kind: asset.kind,
         role: "reference",
         filename: asset.path,
-        ref_size: "max",
+        ref_size: asset.ref_size ?? "max",
       };
       if (asset.kind === "video") entry.track = S.trackFor(asset);
+      if (S.takeOptions(entry).includes(asset.takes)) entry.takes = asset.takes;
       if (asset.trim) entry.trim = asset.trim;
       if (asset.crop) entry.crop = asset.crop;
       this.state.assets.push(entry);
@@ -1023,6 +1029,8 @@ export class CreatorEditor {
       kind: asset.kind,
       only: asset.kind,
       single: true,
+      ...(asset.role === "reference"
+        ? { referenceOptions: { takes: S.takes(asset), ref_size: S.refSize(asset) } } : {}),
       // The slot it occupies is the slot it will occupy: a swap adds nothing to
       // count, so the reference caps have nothing to say about it.
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
@@ -1030,32 +1038,41 @@ export class CreatorEditor {
       // door a fresh attachment has, so a swap is not a poorer way in.
     });
     const picked = chosen?.[0];
-    if (!picked || picked.path === asset.filename) return;
+    if (!picked || !this.state.assets.includes(asset)) return;
     if (picked.plate) {
       if (asset.role === "reference") await this.mergeSheet(asset, chosen);
       else { applyPick(asset, picked); this.commit(); }
       this.probeKeyframe();
       return;
     }
+    const fileChanged = picked.path !== asset.filename;
     asset.filename = picked.path;
     // Saved renditions belong to the old picture, not to the handle. Keeping
     // one here would show the new file but still condition H3 on the old one.
-    S.dropMods(asset);
+    if (fileChanged || Object.hasOwn(picked, "crop")) S.dropMods(asset);
     // A trim is a range in the old file's timeline and means nothing in
     // another's — either the picker's segment editor set one for this pick, or
     // the new file starts whole.
-    if (picked.trim) asset.trim = picked.trim;
-    else delete asset.trim;
+    if (fileChanged || Object.hasOwn(picked, "trim")) {
+      if (picked.trim) asset.trim = picked.trim;
+      else delete asset.trim;
+    }
     // And the framing: a window on the old picture is a window on nothing in
     // particular on the new one.
-    if (picked.crop) asset.crop = picked.crop;
-    else delete asset.crop;
+    if (fileChanged || Object.hasOwn(picked, "crop")) {
+      if (picked.crop) asset.crop = picked.crop;
+      else delete asset.crop;
+    }
     // Same for sound: whether this clip has any is a fact about this clip, and
     // the old one's answer must not carry over onto a silent replacement.
-    if (asset.kind === "video") asset.track = S.trackFor(picked);
+    if (asset.kind === "video" && (fileChanged || Object.hasOwn(picked, "track"))) {
+      asset.track = S.trackFor(picked);
+    }
+    if (S.takeOptions(asset).includes(picked.takes)) asset.takes = picked.takes;
+    if (S.sizeable(asset) && picked.ref_size) asset.ref_size = picked.ref_size;
     this.commit();
     this.probeKeyframe();
-    if (asset.role === "reference" && asset.kind === "video" && !picked.track) {
+    if (fileChanged && asset.role === "reference" && asset.kind === "video" && !picked.track) {
       await this.applySoundDefault(asset);
     }
   }
@@ -1937,7 +1954,7 @@ export class CreatorEditor {
       // it is refused, and the shelf says why, which is more use than a picture
       // that is on the node and not in the menu.
       getAssets: () => [...(this.state.assets ?? []), ...(this.state.pool ?? [])],
-      addAsset: () => this.attachOneAsset(),
+      addAsset: (subject) => this.attachOneAsset(subject),
       whereCited: (subject) => {
         const cited = S.citedCast({ ...this.state, cast: [subject] }).length > 0;
         // Named only inside an alternative this seed passes over: cut at queue
@@ -2045,10 +2062,8 @@ export class CreatorEditor {
     this.render();
   }
 
-  /** One file, attached to this shot, for the cast shelf's "attach a file…".
-   *  `addReferences` takes several and answers nothing; a subject is being given
-   *  one thing, and the shelf needs to know which entry it was. */
-  async attachOneAsset() {
+  /** Picked files, attached to this shot, for the cast shelf's plus tile. */
+  async attachOneAsset(subject = null) {
     const blocked = S.blockedReason(this.state, "reference");
     if (blocked) { this.flash(blocked); return null; }
     const spec = this.plateSpec();
@@ -2056,7 +2071,11 @@ export class CreatorEditor {
       kinds: ["image", "video", "audio", "renders", "refmods"],
       aspect: this.pickerAspect(),
       kind: "image",
-      capacity: (k) => S.capacity(this.state, k, this.piece),
+      referenceOptions: { allowedTakes: CAST_REFERENCE_TAKES },
+      capacity: (kind) => {
+        const room = S.capacity(this.state, kind, this.piece);
+        return kind === "audio" ? { ...room, max: Math.min(room.max, room.used + 1) } : room;
+      },
       // The scissors ride along: a picture attached while casting somebody is
       // the purest cutout case there is — the `takes` prose already promises
       // the background is dropped, and the chip makes the pixels agree.
@@ -2064,8 +2083,9 @@ export class CreatorEditor {
     });
     if (!chosen?.length) return null;
     const before = new Set(this.state.assets.map((a) => a.handle));
-    await this.attachAssets(chosen.slice(0, 1));
-    return this.state.assets.find((a) => !before.has(a.handle)) ?? null;
+    await this.attachAssets(chosen);
+    const added = this.state.assets.filter((a) => !before.has(a.handle));
+    return subject ? added : added[0] ?? null;
   }
 
   /** Write a subject's name into the prompt. The answer to the commonest way to

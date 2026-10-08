@@ -28,7 +28,7 @@
 // dragging the second would silently turn "sound like this" into "this is the
 // sound".
 
-import { el, icon } from "./dom.js";
+import { el, icon, svg } from "./dom.js";
 import { probe } from "./api.js";
 import { t } from "./i18n.js";
 import { peaks, draw } from "./waveform.js";
@@ -72,10 +72,12 @@ export class SoundLane {
    * @param {() => void} options.onCommit   called after any edit lands
    * @param {(message: string) => void} options.flash  how this surface complains
    */
-  constructor({ read, onCommit, flash }) {
+  constructor({ read, onCommit, flash, snaps = null }) {
     this.read = read;
     this.onCommit = onCommit;
     this.flash = flash ?? (() => {});
+    this.snaps = snaps ?? new Set();
+    this.entries = [];
     // path -> seconds. A block needs its file's whole length to know how far a
     // trim handle may travel, and that is a fact about the file rather than
     // about the piece, so it comes from the probe route and is remembered here.
@@ -141,10 +143,15 @@ export class SoundLane {
    */
   snapPoints(exclude) {
     const points = [0, this.total()];
-    for (const window of S.passWindows(this.piece)) {
+    const passes = S.passes(this.piece);
+    for (const [index, window] of S.passWindows(this.piece).entries()) {
       points.push(window.at, window.at + window.frames);
+      for (const cut of S.cutTimes(passes[index].segments).at.slice(1)) {
+        const frame = window.sampledAt + atFrame(cut, this.rules());
+        if (frame > window.at && frame < window.at + window.frames) points.push(frame);
+      }
     }
-    for (const block of lane(this.piece)) {
+    for (const block of this.blocks()) {
       if (block.index === exclude) continue;
       points.push(block.at, block.at + block.frames);
     }
@@ -155,6 +162,7 @@ export class SoundLane {
    *  Returns the frame and what it landed on, so the drag can draw the line
    *  that says why it stopped there. */
   snap(frame, exclude) {
+    if (!this.snapping(exclude)) return { frame, snapped: null };
     const reach = SNAP_PX * this.perPixel();
     let best = null;
     for (const point of this.snapPoints(exclude)) {
@@ -162,6 +170,38 @@ export class SoundLane {
       if (gap <= reach && (best === null || gap < Math.abs(best - frame))) best = point;
     }
     return best === null ? { frame, snapped: null } : { frame: best, snapped: best };
+  }
+
+  snapping(index) { return this.snaps.has(this.piece.sound?.[index]); }
+
+  /** A body drag follows either edge, not the place the pointer grabbed it. */
+  snapMove(frame, index) {
+    if (!this.snapping(index)) return { frame, snapped: null };
+    const block = this.at(this.blocks(), index);
+    const reach = SNAP_PX * this.perPixel();
+    let best = null;
+    for (const point of this.snapPoints(index)) {
+      for (const offset of [0, block.frames]) {
+        const at = point - offset;
+        const gap = Math.abs(at - frame);
+        if (at < 0 || at + block.frames > this.total() || gap > reach) continue;
+        if (best === null || gap < best.gap) best = { frame: at, snapped: point, gap };
+      }
+    }
+    return best ?? { frame, snapped: null };
+  }
+
+  // syncSound can shorten a clip by replacing its entry. Keep the view choice
+  // on that same track; removed tracks must not accumulate in the shared set.
+  syncSnaps() {
+    const entries = this.piece.sound ?? [];
+    entries.forEach((entry, index) => {
+      const before = this.entries[index];
+      if (this.snaps.has(before) && before.filename === entry.filename
+          && before.at_s === entry.at_s && before.in_s === entry.in_s) this.snaps.add(entry);
+    });
+    for (const entry of this.snaps) if (!entries.includes(entry)) this.snaps.delete(entry);
+    this.entries = entries.slice();
   }
 
   // ---- editing -------------------------------------------------------------
@@ -195,15 +235,23 @@ export class SoundLane {
   /** The blocks as the blob stores them, back from the working list. */
   store(blocks) {
     const rules = this.rules();
-    return blocks
+    const enabled = [];
+    const sound = blocks
       .slice()
       .sort((a, b) => a.at - b.at)
-      .map((block) => ({
-        filename: block.filename,
-        at_s: Number((block.at / rules.fps).toFixed(3)),
-        in_s: Number(block.in_s.toFixed(3)),
-        out_s: Number(block.out_s.toFixed(3)),
-      }));
+      .map((block) => {
+        const entry = {
+          filename: block.filename,
+          at_s: Number((block.at / rules.fps).toFixed(3)),
+          in_s: Number(block.in_s.toFixed(3)),
+          out_s: Number(block.out_s.toFixed(3)),
+        };
+        if (this.snapping(block.index)) enabled.push(entry);
+        return entry;
+      });
+    this.snaps.clear();
+    for (const entry of enabled) this.snaps.add(entry);
+    return sound;
   }
 
   /**
@@ -446,6 +494,7 @@ export class SoundLane {
    */
   drag(node, index, begin, done) {
     node.addEventListener("pointerdown", (event) => {
+      if (event.button > 0 || this.working) return;
       event.preventDefault();
       event.stopPropagation();
       node.setPointerCapture(event.pointerId);
@@ -455,12 +504,14 @@ export class SoundLane {
       const step = begin(from);
       let dirty = false;
       const move = (moved) => {
-        const { frame, snapped } = this.snap(this.frameAt(moved), index);
-        this.showSnap(snapped);
+        if (moved.pointerId !== undefined && moved.pointerId !== event.pointerId) return;
+        const frame = this.frameAt(moved);
+        if (!dirty && frame === from) return;
         dirty = true;
-        step(frame);
+        this.showSnap(step(frame) ?? null);
       };
-      const up = () => {
+      const up = (released) => {
+        if (released.pointerId !== undefined && released.pointerId !== event.pointerId) return;
         node.removeEventListener("pointermove", move);
         node.removeEventListener("pointerup", up);
         node.removeEventListener("pointercancel", up);
@@ -469,6 +520,12 @@ export class SoundLane {
         const blocks = this.working;
         this.working = null;
         this.dragging = null;
+        this.nodes.get(index)?.classList.remove("dragging");
+        if (released.type === "pointercancel") {
+          this.moved = true;
+          if (dirty) this.render();
+          return;
+        }
         // A press that never moved is a click on its way to opening the block,
         // and neither writing nor rendering must get in front of it: a click
         // only lands when the same node saw both halves of the press.
@@ -565,6 +622,7 @@ export class SoundLane {
   // ---- render --------------------------------------------------------------
 
   render() {
+    this.syncSnaps();
     const piece = this.piece;
     const windows = S.passWindows(piece);
     const blocks = lane(piece);
@@ -762,6 +820,7 @@ export class SoundLane {
       ]),
       this.grip(block, "head"),
       this.grip(block, "tail"),
+      this.magnet(block),
       this.dropper(block, name),
     ]);
 
@@ -777,7 +836,9 @@ export class SoundLane {
       this.moved = false;
       return (frame) => {
         if (frame !== from) this.moved = true;
-        this.slide(block.index, origin + (frame - from));
+        const result = this.snapMove(origin + (frame - from), block.index);
+        this.slide(block.index, result.frame);
+        return this.at(this.blocks(), block.index)?.at === result.frame ? result.snapped : null;
       };
     });
     this.arrows(node, (step) => {
@@ -807,7 +868,13 @@ export class SoundLane {
     let matched = null;
     this.drag(node, block.index, () => {
       matched = this.matchedCard(block);
-      return (frame) => this.trim(block.index, edge, frame);
+      return (frame) => {
+        const result = this.snap(frame, block.index);
+        this.trim(block.index, edge, result.frame);
+        const now = this.at(this.blocks(), block.index);
+        return (edge === "head" ? now.at : now.at + now.frames) === result.frame
+          ? result.snapped : null;
+      };
     }, () => {
       if (matched === null) return;
       const now = this.at(lane(this.piece), block.index);
@@ -822,6 +889,24 @@ export class SoundLane {
       const now = this.at(lane(this.piece), block.index);
       if (now) this.rematch(was, now.frames / this.rules().fps);
     });
+    return node;
+  }
+
+  magnet(block) {
+    const title = t("Snap this track's edges to shot boundaries and nearby tracks while dragging.");
+    const node = el("button", {
+      class: "mmc-snd-magnet", type: "button",
+      "aria-label": title, title, "aria-pressed": this.snapping(block.index),
+      onpointerdown: (event) => event.stopPropagation(),
+      onkeydown: (event) => event.stopPropagation(),
+      onclick: (event) => {
+        event.stopPropagation();
+        const entry = this.piece.sound[block.index];
+        if (this.snaps.has(entry)) this.snaps.delete(entry);
+        else this.snaps.add(entry);
+        node.setAttribute("aria-pressed", String(this.snapping(block.index)));
+      },
+    }, [svg('<path d="M6 3v9a6 6 0 0 0 12 0V3h-4v9a2 2 0 0 1-4 0V3z"/><path d="M6 7h4M14 7h4"/>', 12)]);
     return node;
   }
 

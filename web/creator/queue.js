@@ -97,7 +97,7 @@ if (typeof api.queuePrompt === "function") {
     const snapshots = [];
     for (const listener of submissions) {
       try {
-        const snapshot = listener.capture(output);
+        const snapshot = listener.capture(output, targets);
         if (snapshot) snapshots.push([listener, snapshot]);
       } catch (error) { console.warn("[Continuity] could not snapshot a submitted strip", error); }
     }
@@ -159,7 +159,10 @@ export async function cancelPrompt(promptId) {
     });
     if (!response.ok) throw new Error(t("Could not cancel the render."));
     status = await promptQueueState(promptId);
-    if (status === null) return "removed";
+    if (status === null) {
+      api.dispatchEvent(new CustomEvent("mmc_queue_removed", { detail: { prompt_id: String(promptId) } }));
+      return "removed";
+    }
     if (status === "queued") throw new Error(t("The render is still on the queue."));
   }
   if (status === "running") {

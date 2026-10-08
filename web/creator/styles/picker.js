@@ -26,15 +26,16 @@ export const css = `
   margin-left: auto; width: calc(34px * var(--mmc-type)); height: calc(34px * var(--mmc-type)); border-radius: 50%;
   background: var(--mmc-surface-2); border: 0; color: var(--mmc-text); cursor: pointer; font-size: calc(16px * var(--mmc-type));
 }
-.mmc-modal-bar { display: flex; gap: 12px; padding: 16px 24px; align-items: center; }
+.mmc-modal-bar { display: flex; gap: 10px; padding: 16px 24px; align-items: center; }
 .mmc-search {
-  flex: 1; height: calc(40px * var(--mmc-type)); border-radius: 12px; background: var(--mmc-surface);
+  flex: 1 1 0; min-width: 120px; height: calc(40px * var(--mmc-type)); border-radius: 12px; background: var(--mmc-surface);
   border: 1px solid var(--mmc-line); color: var(--mmc-text); padding: 0 14px;
   font-size: calc(14px * var(--mmc-type)); font-family: inherit; outline: none;
 }
 .mmc-upload {
   height: calc(40px * var(--mmc-type)); padding: 0 18px; border-radius: 20px; background: var(--mmc-ink); border: 0;
   color: var(--mmc-on-ink); font-size: calc(14px * var(--mmc-type)); font-weight: 500; font-family: inherit; cursor: pointer;
+  flex: none; white-space: nowrap;
 }
 /* padding-bottom clears the floating Add/Cancel bar, which is positioned over
    the grid — without it the last row sits underneath and cannot be clicked. */
@@ -125,6 +126,32 @@ export const css = `
 /* The framing badge: the segment badge's twin, in the same corner on a still
    and one row under it on a clip. The star has the other corner. */
 .mmc-cell-trim + .mmc-cell-crop { top: 36px; }
+
+.mmc-picker-reference { display: flex; align-items: center; gap: 6px; }
+.mmc-picker-reference > span { color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); }
+.mmc-reference-field {
+  min-width: 0; max-width: calc(132px * var(--mmc-type)); height: calc(28px * var(--mmc-type));
+  padding: 0 7px; border-radius: 9px; border: 1px solid var(--mmc-line);
+  background: var(--mmc-surface); color: var(--mmc-text);
+  font-size: calc(11px * var(--mmc-type)); font-family: inherit; cursor: pointer;
+}
+.mmc-reference-field[name="ref_size"] { width: calc(70px * var(--mmc-type)); }
+.mmc-reference-field:focus-visible { outline: 1px solid var(--mmc-accent); }
+.mmc-cell-reference {
+  position: absolute; left: 5px; right: 5px; bottom: 25px; display: none; gap: 4px;
+  padding: 4px; border-radius: 9px; background: var(--mmc-scrim-3);
+}
+.mmc-cell[aria-selected="true"] .mmc-cell-reference { display: flex; }
+.mmc-cell-reference .mmc-reference-field { flex: 1; width: 0; padding: 0 3px; font-size: calc(10px * var(--mmc-type)); }
+.mmc-cell-reference .mmc-reference-field[name="ref_size"] { flex: 0 0 60px; }
+.mmc-cell[aria-selected="true"]:has(.mmc-cell-reference) .mmc-cell-home { bottom: 67px; }
+.mmc-reference-foot { max-width: calc(100% - 48px); flex-wrap: wrap; }
+@media (max-width: 640px) {
+  .mmc-modal-foot.mmc-reference-foot { left: 24px; right: 24px; bottom: 18px; }
+  .mmc-reference-foot .mmc-picker-reference { flex: 1 1 100%; }
+  .mmc-reference-foot .mmc-picker-reference > span { margin-right: auto; }
+  .mmc-modal:has(.mmc-reference-foot) .mmc-grid { padding-bottom: 152px; }
+}
 
 /* --- shelves -------------------------------------------------------------- */
 /* One row of places between the search bar and the grid, and one line of it
@@ -230,17 +257,33 @@ export const css = `
 /* --- organize mode --------------------------------------------------------- */
 /* The bar toggle. Outlined next to the solid Upload button — a mode you enter,
    not an action you fire — and lit like a selected shelf while it is on. */
-.mmc-organize, .mmc-reveal {
+.mmc-organize, .mmc-reveal, .mmc-add-folder {
   display: flex; align-items: center; gap: 7px; height: calc(40px * var(--mmc-type)); padding: 0 16px;
   border-radius: 20px; background: none; border: 1px solid var(--mmc-line);
   color: var(--mmc-dim); font-size: calc(14px * var(--mmc-type)); font-family: inherit; cursor: pointer;
-  white-space: nowrap;
+  white-space: nowrap; flex: none;
 }
-.mmc-organize:hover, .mmc-reveal:hover { color: var(--mmc-text); background: var(--mmc-surface-2); }
+.mmc-organize:hover, .mmc-reveal:hover, .mmc-add-folder:hover { color: var(--mmc-text); background: var(--mmc-surface-2); }
+.mmc-add-folder:disabled { opacity: .5; cursor: wait; }
 .mmc-organize[aria-pressed="true"] {
   color: var(--mmc-bg); background: var(--mmc-accent); border-color: var(--mmc-accent);
 }
 .mmc-organize svg, .mmc-reveal svg { width: 14px; height: 14px; flex: none; }
+.mmc-external-folder { position: relative; flex: none; }
+.mmc-external-folder .mmc-shelf { padding-right: 30px; }
+.mmc-external-forget {
+  position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+  width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; color: var(--mmc-dim); cursor: pointer;
+  font-size: calc(15px * var(--mmc-type)); font-family: inherit;
+}
+.mmc-external-forget:hover { color: var(--mmc-warn); background: var(--mmc-surface-3); }
+.mmc-external-folder:has(.mmc-shelf[aria-selected="true"]) .mmc-external-forget { color: var(--mmc-bg); }
+@media (max-width: 760px) {
+  .mmc-modal-bar { flex-wrap: wrap; gap: 8px; }
+  .mmc-modal-bar .mmc-search { flex-basis: 100%; min-width: 0; }
+  .mmc-organize, .mmc-reveal, .mmc-add-folder, .mmc-upload { height: 34px; padding: 0 12px; font-size: calc(12px * var(--mmc-type)); }
+}
 /* Open folder wears the same outline: it is the other door out of this window
    onto the same directory, an action rather than a mode, so it never lights. */
 /* Delete reads as danger from the start, and arming it turns it solid: the

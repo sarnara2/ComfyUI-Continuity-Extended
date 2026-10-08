@@ -638,6 +638,7 @@ function storedFile(asset, slot, note = "", trigger = "") {
     kind: asset.kind ?? "image",
     ...(asset.track ? { track: asset.track } : {}),
     ...(asset.ref_size ? { ref_size: asset.ref_size } : {}),
+    ...(asset.takes ? { takes: asset.takes } : {}),
     // What it lends them, in the user's words — the half of a picture's
     // meaning that neither its filename nor its slot can say.
     ...(note ? { note } : {}),
@@ -646,6 +647,7 @@ function storedFile(asset, slot, note = "", trigger = "") {
     // sentence each is for.
     ...(trigger ? { trigger } : {}),
     ...(asset.trim ? { trim: asset.trim } : {}),
+    ...(asset.crop ? { crop: { ...asset.crop } } : {}),
     // The picture's saved renditions, by latent space: a member who comes
     // back out of the library comes back with the mods their pictures had.
     ...(asset.mods && Object.keys(asset.mods).length ? { mods: { ...asset.mods } } : {}),
@@ -660,6 +662,7 @@ function storedFile(asset, slot, note = "", trigger = "") {
           ...(panel.points?.length
             ? { points: panel.points.map((point) => ({ ...point })) } : {}),
           ...(panel.takes ? { takes: panel.takes } : {}),
+          ...(panel.crop ? { crop: { ...panel.crop } } : {}),
         })) }
       : {}),
   };
@@ -1420,7 +1423,7 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
         // the panels themselves, so each keeps the narrowing it was stored with.
         const panels = file.panels.map((panel) => ({ ...panel }));
         asset = S.plateEntry(
-          { path: file.filename, panels },
+          { path: file.filename, panels, takes: file.takes, ref_size: file.ref_size },
           S.takenHandles(single ? host : timeline),
           { ...(single ? {} : { plate: "ref", panel: "ref" }),
             kept: new Map(panels.map((panel) => [panel.path, panel])) });
@@ -1433,7 +1436,10 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
           filename: file.filename,
           ref_size: file.ref_size ?? "max",
           ...(file.track ? { track: file.track } : {}),
+          ...(S.takeOptions({ kind, role: "reference", track: file.track }).includes(file.takes)
+            ? { takes: file.takes } : {}),
           ...(file.trim ? { trim: file.trim } : {}),
+          ...(file.crop ? { crop: { ...file.crop } } : {}),
           ...(file.mods ? { mods: { ...file.mods } } : {}),
         };
       }
@@ -1444,6 +1450,7 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
       // lands on a file the piece already held as much as on a new one.
       asset.ref_size = file.ref_size;
     }
+    if (S.takeOptions(asset).includes(file.takes)) asset.takes = file.takes;
     // Their renditions land on the file either way — a mod the library knows
     // of a picture the piece already holds is a mod of that picture.
     if (file.mods && asset.role === "reference" && !asset.panels?.length) {

@@ -7,7 +7,40 @@ const span = (start, end) => start !== null && end !== null && end >= start ? en
 const TERMINAL = new Set(["execution_success", "execution_error", "execution_interrupted"]);
 
 export class ExecutionTiming {
-  constructor() { this.runs = new Map(); }
+  constructor() { this.runs = new Map(); this.batch = null; }
+
+  queued(promptId, now = Date.now()) {
+    const run = this.get(promptId);
+    if (!run || run.batch) return;
+    if (!this.batch || this.batch.end !== null) {
+      this.batch = { start: now, end: null, runs: new Set() };
+    }
+    run.batch = this.batch;
+    this.batch.runs.add(run);
+    this.finishBatch(run.batch, now);
+  }
+
+  finishBatch(batch, now = Date.now()) {
+    if (!batch) return;
+    if (batch.end === null && [...batch.runs].every((run) => run.terminal)) {
+      const ends = [...batch.runs].map((run) => run.localEnd);
+      batch.unknownEnd = ends.some((end) => end === null);
+      batch.end = batch.unknownEnd ? now : Math.max(batch.start, ...ends);
+    }
+    for (const run of batch.runs) this.refresh(run, now);
+  }
+
+  queuedRuns() {
+    return this.batch?.end === null ? [...this.batch.runs].filter((run) => !run.terminal) : [];
+  }
+
+  removed(promptId, now = Date.now()) {
+    const run = this.runs.get(String(promptId));
+    if (!run?.batch || run.terminal) return;
+    run.terminal = "queue_removed";
+    run.localEnd = now;
+    this.finishBatch(run.batch, now);
+  }
 
   get(promptId) {
     if (promptId === null || promptId === undefined || promptId === "") return null;
@@ -43,6 +76,7 @@ export class ExecutionTiming {
     run.end ??= stamp(timestamp);
     run.localEnd ??= now;
     this.refresh(run, now);
+    this.finishBatch(run.batch, now);
   }
 
   fromHistory(promptId, entry) {
@@ -60,11 +94,23 @@ export class ExecutionTiming {
     // the clock stopped, not when: no recovery-time local endpoint is invented.
     run.terminal ??= entry?.status?.status_str === "success" ? "execution_success"
       : entry?.status?.status_str === "error" ? "execution_error" : "history";
+    const anchor = run.localStart !== null ? run : [...(run.batch?.runs ?? [])]
+      .find((item) => item.localStart !== null && item.start !== null);
+    // Project only a server duration from an observed local start. An end read
+    // after reconnect must not include the time the browser was disconnected.
+    if (anchor?.start !== null && anchor?.start !== undefined && run.end !== null) {
+      run.localEnd ??= anchor.localStart + (run.end - anchor.start);
+    }
     this.refresh(run);
+    this.finishBatch(run.batch);
   }
 
   read(run, now = Date.now()) {
     if (!run) return { totalMs: null, totalPending: false };
+    if (run.batch) return {
+      totalMs: run.batch.unknownEnd ? null : span(run.batch.start, run.batch.end ?? now),
+      totalPending: run.batch.end === null,
+    };
     const totalMs = run.terminal
       ? (span(run.start, run.end) ?? span(run.localStart, run.localEnd))
       : span(run.localStart, now);

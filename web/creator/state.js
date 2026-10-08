@@ -242,9 +242,10 @@ export function plateEntry(picked, taken, {
     kind: "image",
     role: "reference",
     filename: picked.path,
-    ref_size: "max",
+    ref_size: picked.ref_size === "match" ? "match" : "max",
     panels: [],
   };
+  if (takeOptions(entry).includes(picked.takes)) entry.takes = picked.takes;
   taken.add(entry.handle);
   for (const source of picked.panels ?? []) {
     const before = kept.get(source.path);
@@ -259,7 +260,8 @@ export function plateEntry(picked, taken, {
     if (source.rect) made.rect = source.rect;
     if (source.points?.length) made.points = source.points;
     if (source.crop) made.crop = source.crop;
-    if (before?.takes) made.takes = before.takes;
+    if (TAKES.image.includes(source.takes)) made.takes = source.takes;
+    else if (before?.takes) made.takes = before.takes;
     taken.add(made.handle);
     entry.panels.push(made);
   }

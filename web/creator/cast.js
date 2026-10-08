@@ -108,6 +108,21 @@ export const ROLES = [
 
 const ROLE = Object.fromEntries(ROLES.map((role) => [role.key, role]));
 
+export const CAST_REFERENCE_TAKES = {
+  image: [...S.SUBJECT_TAKES, "motion"],
+  video: [...S.SUBJECT_TAKES, "motion", "edit", "continue"],
+  audio: ["voice"],
+};
+
+/** A pre-picked narrowing uses the matching cast slot where there is one. */
+export function referenceRole(asset) {
+  const wanted = asset.takes === "motion" ? "motion"
+    : ["edit", "continue"].includes(asset.takes) ? "replaces"
+    : asset.takes === "voice" ? "voice" : "from";
+  return (ROLES.find((role) => role.key === wanted && role.fits(asset))
+    ?? ROLES.find((role) => role.fits(asset)))?.key ?? "from";
+}
+
 /** The three roles that hold several files rather than one.
  *
  *  Their looks, obviously — several pictures of one person are one person. The
@@ -490,7 +505,8 @@ function weightField({ entry, touch, done }) {
 export class CastShelf {
   constructor({ getCast, setCast, getAssets, addAsset, whereCited, cite, touch, commit,
                 keep = null, library = null, mod = null, vae = null, families = null, rename = null,
-                dropAssets = null, canvas = null, family = null, disclosure = false }) {
+                dropAssets = null, canvas = null, family = null, disclosure = false,
+                initialOpen = true, onOpenChange }) {
     this.getCast = getCast;
     this.family = family ?? (() => S.DEFAULT_VIDEO_FAMILY);
     this.dropAssets = dropAssets;
@@ -529,6 +545,8 @@ export class CastShelf {
     // A Timeline-only visibility choice, never part of creator_data. The
     // node-face shelf keeps its existing layout and member-level disclosure.
     this.disclosureEnabled = disclosure;
+    this.initialOpen = initialOpen;
+    this.onOpenChange = onOpenChange;
     this.section = null;
     // What each family gets when it renders them — the derived half of a
     // member, drawn per family. The panel owns which tab is open; everything
@@ -689,6 +707,7 @@ export class CastShelf {
     if (this.disclosureEnabled) {
       if (!this.section) {
         this.section = createDisclosure({ title, hint, content, actions: this.headerActions,
+          initialOpen: this.initialOpen, onOpenChange: this.onOpenChange,
           onBeforeCollapse: () => closeOwnedPopovers(this.section.body) });
         this.sectionWarning = el("div", { class: "mmc-tl-pool-bad mmc-cast-section-warning", role: "status" });
         this.section.root.append(this.sectionWarning);
@@ -1712,7 +1731,7 @@ export class CastShelf {
         label: `@${asset.handle}`,
         note: asset.filename,
         onPick: () => {
-          const key = ROLES.find((role) => role.fits(asset))?.key ?? "from";
+          const key = referenceRole(asset);
           this.addRole(subject, asset.handle, key);
           // Hung on somebody, so narrowed to what they are — a picture of @anna is
           // a person reference, and the row that says so is the same row the
@@ -1729,11 +1748,13 @@ export class CastShelf {
           label: t("Attach a file…"),
           note: t("Adds it to this shot and hangs it on them"),
           onPick: async () => {
-            const asset = await this.addAsset();
-            if (!asset) return;
-            const key = ROLES.find((role) => role.fits(asset))?.key ?? "from";
-            this.addRole(subject, asset.handle, key);
-            S.inheritTake(subject, key, asset);
+            const picked = await this.addAsset(subject);
+            if (!this.getCast().includes(subject)) return;
+            for (const asset of (Array.isArray(picked) ? picked : picked ? [picked] : [])) {
+              const key = referenceRole(asset);
+              this.addRole(subject, asset.handle, key);
+              S.inheritTake(subject, key, asset);
+            }
             this.save();
           },
         }],

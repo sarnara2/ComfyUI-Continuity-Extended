@@ -64,6 +64,20 @@ const STASH = "mmc_prestage_stash";
 // face that can show the piece, so nothing reads this.
 const FACE_PIN = "mmc_face_piece";
 
+const SECTION_STATE = "mmc_timeline_sections";
+
+// View preferences ride the workflow, not the render's creator_data blob.
+const sectionControls = (node) => ({
+  read: (key) => node.properties?.[SECTION_STATE]?.[key] !== false,
+  write: (key, opened) => {
+    node.properties = node.properties || {};
+    node.properties[SECTION_STATE] = {
+      ...node.properties[SECTION_STATE], [key]: opened,
+    };
+    node.graph?.setDirtyCanvas(true, true);
+  },
+});
+
 /** What the body's piece-view toggle writes through. */
 const faceControls = (node) => ({
   pinned: () => node.properties?.[FACE_PIN] === true,
@@ -426,6 +440,7 @@ app.registerExtension({
         nodeId: () => node.id,
         preStage: preStageControls(node),
         face: faceControls(node),
+        sections: sectionControls(node),
         // Deferred a frame for the same reason the setting's path is: this runs
         // before the node is in the graph, and the editor scans the graph for
         // the piece and its PreStage.
