@@ -80,7 +80,7 @@ shelf.root.addEventListener("dblclick", () => { bubbled++; });
 const out = { members: [], empty: [] };
 const before = JSON.stringify({ subjects, assets });
 
-for (const [handle, expected] of [["subject", assets[0]], ["prop", assets[1]]]) {
+for (const [handle, expected] of [["subject", assets[0]], ["prop", assets[2]]]) {
   shelf.openMember(handle);
   const face = topFace();
   let preventsBlur = false;
@@ -145,17 +145,17 @@ out.video = { face: videoFace.tagName, media: video?.tagName,
 closeViewer();
 out.video.cleaned = video.pauseCalls === 1 && video.loadCalls === 1 && !("src" in video.attrs);
 
-// A mixed appearance list starts on the existing representative still, but
-// navigation exposes the attached video without changing its role or handle.
+// A mixed appearance list starts at its first reference, including video.
+// Navigation exposes the following still without changing its role or handle.
 shelf.openMember("prop");
 fire(topFace(), "dblclick");
 const nav = viewer().querySelector(".mmc-reference-preview-nav");
-fire(nav.children[0], "click");
+fire(nav.children[2], "click");
 out.mixed = { media: previewMedia()?.tagName, source: previewMedia()?.attrs.src,
-  expected: viewUrl(assets[2].filename) };
+  expected: viewUrl(assets[1].filename) };
 closeViewer();
 
-shelf.openMember("subject");
+shelf.openMember("prop", { forceOpen: true });
 const lower = shelf.root.querySelector(".mmc-cast-top").parent.querySelector(".mmc-cast-ref");
 fire(lower.querySelector(".mmc-cast-ref-thumb"), "click");
 const menu = document.body.querySelector(".mmc-cast-menu");
@@ -238,10 +238,10 @@ check("newly added members also preview their own image", got["appended"],
 check("members without a visual source safely keep their blank header", got["empty"],
       [{"handle": handle, "blank": True, "preview": False, "opened": handle} for handle in ("words", "missing")])
 check("video-only appearance uses a playable source and releases it on close", got["video"],
-      {"face": "IMG", "media": "VIDEO", "source": got["video"]["expected"],
+      {"face": "SPAN", "media": "VIDEO", "source": got["video"]["expected"],
        "expected": got["video"]["expected"], "controls": True, "autoplay": False, "cleaned": True})
-check("mixed appearance can navigate from its representative still to video", got["mixed"],
-      {"media": "VIDEO", "source": got["mixed"]["expected"], "expected": got["mixed"]["expected"]})
+check("mixed appearance can navigate from its first reference video to the next still", got["mixed"],
+      {"media": "IMG", "source": got["mixed"]["expected"], "expected": got["mixed"]["expected"]})
 check("lower reference thumbnails retain their role-menu interaction", got["lower"],
       {"hasRoleMenu": True, "previewAfterClick": False, "doubleClickHandler": False,
        "thumbDoubleClickHandler": False, "previewAfterDoubleClick": False})

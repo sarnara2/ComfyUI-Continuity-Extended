@@ -4,6 +4,8 @@ No ComfyUI/GPU is needed: timestamped wire events and history responses drive
 the actual listeners, with a deterministic browser clock and DOM shim.
 """
 
+from pathlib import Path
+
 import layout
 
 layout.skip_without_node()
@@ -354,7 +356,10 @@ console.log(JSON.stringify({ cases, activeTimers: timers.size }));
 """
 
 with layout.pack(skip=["atlas"], extra_stubs={"api.js": API}) as target:
-    got = layout.in_pack(CHECK.replace('await import("./dom.mjs");', DOM), target)
+    # Keep the DOM shim out of node's --eval command line: Windows limits it
+    # to 32 KiB, independently of the JavaScript being valid.
+    Path(target, "dom.mjs").write_text(DOM, encoding="utf-8")
+    got = layout.in_pack(CHECK, target)
 
 check("all event/lifecycle scenarios completed", len(got["cases"]), 15)
 check("all stage timers disposed", got["activeTimers"], 0)

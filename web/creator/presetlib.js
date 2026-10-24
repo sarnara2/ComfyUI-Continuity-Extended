@@ -35,6 +35,7 @@
 
 import { el, icon, mountOverlay } from "./dom.js";
 import { t } from "./i18n.js";
+import { readViewPrefs, patchViewPrefs } from "./viewprefs.js";
 import { deleteRefMod, describeRefMod, isRefMod, makeRefMod, moveRefMod, renderMeta, stillUrl,
          uploadRefMod, viewUrl } from "./api.js";
 import { DEFAULT_SPACE, SUBFOLDER as MOD_FOLDER, castFamilies, modIn, modRow, modRows, modeWord, remakeMods, remakeRows } from "./refmod.js";
@@ -191,9 +192,16 @@ class PresetLibrary {
     // came for — unless the caller asked for a tab by name, which is what a
     // "From the library" button on a shelf is doing. The tabs are still there to
     // browse the rest.
-    this.scope = restyle ? "style" : (scope ?? target?.scope ?? "piece");
-    this.query = "";
-    this.shelf = SHELF_ALL;
+    const remembered = readViewPrefs("presets:browse").scope;
+    const requested = restyle ? "style" : (scope ?? (reveal ? "cast" : remembered) ?? target?.scope ?? "piece");
+    this.scope = [requested, target?.scope, "piece"].find((one) => P.SCOPES.includes(one));
+    const view = reveal ? {} : readViewPrefs(`presets:scope:${this.scope}`);
+    this.viewQuery = view.query ?? "";
+    this.query = this.viewQuery.toLowerCase();
+    this.shelf = view.shelf ?? SHELF_ALL;
+    this.rowsReady = false;
+    this.atlasReady = false;
+    this.closed = false;
     this.rows = [];
     this.selected = null;      // the row the inspector is showing
     this.body = null;          // its sections, once fetched
@@ -258,7 +266,12 @@ class PresetLibrary {
       class: "mmc-search",
       type: "search",
       placeholder: t("Search presets…"),
-      oninput: (event) => { this.query = event.target.value.toLowerCase(); this.renderGrid(); },
+      value: this.viewQuery,
+      oninput: (event) => {
+        this.query = event.target.value.toLowerCase();
+        patchViewPrefs(`presets:scope:${this.scope}`, { query: event.target.value });
+        this.renderGrid();
+      },
       onkeydown: (event) => event.stopPropagation(),
     });
 
@@ -381,10 +394,13 @@ class PresetLibrary {
   async load() {
     try {
       const stored = await P.listPresets({ force: true });
+      if (this.closed) return;
       // Builtins last within their scope: a shipped starter is a suggestion and
       // your own work is the library.
       this.rows = [...stored, ...BUILTIN];
+      this.rowsReady = true;
     } catch (error) {
+      if (this.closed) return;
       this.rows = [...BUILTIN];
       this.say(t("Could not read the library — {error}", { error: error.message }));
     }
@@ -393,6 +409,7 @@ class PresetLibrary {
   }
 
   close() {
+    this.closed = true;
     this.observer?.disconnect();
     this.observer = null;
     this.unmount();
@@ -408,6 +425,12 @@ class PresetLibrary {
   selectScope(scope) {
     if (scope === this.scope) return;
     this.scope = scope;
+    patchViewPrefs("presets:browse", { scope });
+    const view = readViewPrefs(`presets:scope:${scope}`);
+    this.viewQuery = view.query ?? "";
+    this.query = this.viewQuery.toLowerCase();
+    this.shelf = view.shelf ?? SHELF_ALL;
+    this.search.value = this.viewQuery;
     this.selected = null;
     this.body = null;
     // A shelf is a place, not a scope — but "starred" and a hand-made folder
@@ -742,11 +765,14 @@ class PresetLibrary {
       const [module, stars] = await Promise.all([
         import("./presets/stylelib.js"), P.starredStyles(),
       ]);
+      if (this.closed) return;
       // Copies, not the module's rows: the catalogue is shared and read-only,
       // and the star is this user's, kept beside it (see `P.starredStyles`).
       this.styles = module.styleRows().map((row) => ({ ...row, starred: stars.has(row.id) }));
       this.atlas = module.ATLAS;
+      this.atlasReady = true;
     } catch (error) {
+      if (this.closed) return;
       // Remembered, not only announced: the grid's empty line used to read
       // "could not be read" whenever the catalogue was empty, which was also
       // true before anybody had asked for it — so a tab that had simply never
@@ -816,7 +842,10 @@ class PresetLibrary {
       // folders, which is what a shelf already is.
       ...this.folders().map((folder) => [folder, folder]),
     ];
-    if (!shelves.some(([key]) => key === this.shelf)) this.shelf = SHELF_ALL;
+    // The constructor's empty list is not today's folder inventory. Keep a
+    // restored folder until this scope's own asynchronous source has arrived.
+    const ready = this.scope === "style" ? this.atlasReady : this.rowsReady;
+    if (ready && !shelves.some(([key]) => key === this.shelf)) this.shelf = SHELF_ALL;
     // Rebuilt on every pick so the lit chip follows the shelf; the row's
     // scroll is kept because a rebuild resets it and the chip you just
     // pressed is usually the one scrolled into view.
@@ -830,7 +859,11 @@ class PresetLibrary {
       "data-shelf": key,
       "aria-pressed": key === this.shelf,
       text: label,
-      onclick: () => { this.shelf = key; this.renderShelves(); this.renderGrid(); },
+      onclick: () => {
+        this.shelf = key;
+        patchViewPrefs(`presets:scope:${this.scope}`, { shelf: key });
+        this.renderShelves(); this.renderGrid();
+      },
     })));
     this.shelfRow.scrollTo({ left: scrolled, behavior: "instant" });
     if (focusedKey != null) {
@@ -1837,6 +1870,8 @@ class PresetLibrary {
   async addFile(member, { mods = false } = {}) {
     const spec = this.target?.plate?.() ?? null;
     const chosen = await openPicker({
+      selectionPurpose: mods ? "preset-cast-refmods" : "preset-cast-files",
+      rememberSelection: false,
       kinds: mods ? ["refmods"] : ["image", "video", "audio", "renders", "refmods"],
       kind: mods ? "refmods" : "image",
       referenceOptions: { allowedTakes: CAST_REFERENCE_TAKES },
@@ -1886,6 +1921,7 @@ class PresetLibrary {
     };
     openMenu(anchor, {
       title: t("What this file lends them"),
+      sizes,
       lead: (close) => el("div", { class: "mmc-cast-menu-words" }, [
         noteField({
           value: file.note ?? "",
@@ -1914,7 +1950,7 @@ class PresetLibrary {
             },
           },
         ],
-      }, ...(sizes.length ? [{ head: t("Encoded at"), rows: sizes }] : []),
+      },
       // The other mode, on the row itself: this file, from its picture.
       ...(isRefMod(file.filename) && this.target?.vae && !this.encoding ? [{
         head: t("Encoded as"),
@@ -1924,6 +1960,7 @@ class PresetLibrary {
       ...(isRefMod(file.filename) ? [{ head: t("The file"), rows: [
         { label: t("Download .safetensors"),
           note: `models/refmods/${file.filename.replace(/^refmod:/, "")}.safetensors`,
+          path: true,
           onPick: () => downloadMod(file.filename) },
         { label: t("Show in library"),
           note: t("The Saved references panel, on this file."),
@@ -2395,6 +2432,9 @@ class PresetLibrary {
           t("added to the cast"),
         ].join(" · ");
       }
+      case "subjects": {
+        return (body.subjects?.members ?? []).map((member) => `@${member.handle || "subject"}`).join(" · ") || t("empty");
+      }
       case "shot": {
         const shot = body.shot ?? {};
         return [t("{n} s", { n: showSeconds(shot.duration_s ?? 0) }),
@@ -2453,6 +2493,7 @@ class PresetLibrary {
    */
   async saveFromRender() {
     const chosen = await openPicker({
+      selectionPurpose: "preset-from-render",
       kinds: ["renders"],
       kind: "renders",
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
@@ -2542,6 +2583,7 @@ class PresetLibrary {
    *  opens, because picking a render is exactly what it is for. */
   async pickCover(row) {
     const chosen = await openPicker({
+      selectionPurpose: "preset-cover",
       kinds: ["renders"],
       kind: "renders",
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),

@@ -353,6 +353,10 @@ export const SECTIONS = [
     key: "cast", label: "Cast", hue: 6,
     hint: "One cast member, their references, and what they take from them.",
   },
+  {
+    key: "subjects", label: "Cast roster", hue: 6,
+    hint: "The complete cast roster, with each member's files and rules.",
+  },
   // The one section no capture produces. A style comes from the shipped atlas
   // rather than off a node, and it is the only section that *edits* the field it
   // lands on instead of replacing it — see `leadWithStyle`. Hue 7 is the one
@@ -368,11 +372,11 @@ export const SECTION = Object.fromEntries(SECTIONS.map((s) => [s.key, s]));
 /** Which sections a scope can hold at all. A shot has no canvas and no weights —
  *  the piece owns both — and only a piece has a strip. */
 export const SCOPE_SECTIONS = {
-  piece: ["look", "weights", "speed", "prompt", "loras", "refs", "strip", "style", "cast"],
+  piece: ["look", "weights", "speed", "prompt", "loras", "refs", "strip", "style", "cast", "subjects"],
   shot: ["prompt", "refs", "loras", "shot", "speed", "style"],
   // A still has a cast the way a shot has one: the same members, over the
   // pictures attached to it. See `applyToPreStage`.
-  prestage: ["look", "weights", "speed", "prompt", "loras", "refs", "style", "cast"],
+  prestage: ["look", "weights", "speed", "prompt", "loras", "refs", "style", "cast", "subjects"],
   // A style is a source and never a target: you apply one to a node, and there
   // is no node a style could be captured off. It is the one scope whose tab is a
   // catalogue rather than a shelf of your own work.
@@ -407,6 +411,11 @@ export const SCOPE_LABEL = { piece: "Piece", shot: "Shot", prestage: "Pre-stage"
  */
 export function crossable(key, from, to, { arch = null, targetArch = null,
                                            family = null, targetFamily = null } = {}) {
+  // A full roster replaces a roster, unlike the one-member library's additive
+  // Cast section. Do not implicitly convert its media across node scopes.
+  if (key === "subjects" && (from !== to || !["piece", "prestage"].includes(to))) {
+    return { ok: false, why: "Not something this node holds." };
+  }
   if (!SCOPE_SECTIONS[to]?.includes(key)) {
     if (key === "strip") return { ok: false, why: "Only a piece has a strip." };
     if (key === "shot") return { ok: false, why: "Only a card has a duration and a seam." };
@@ -514,6 +523,43 @@ function readRow(io, names) {
 const pick = (source, keys) => Object.fromEntries(
   keys.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]));
 
+// A setup is not a previous take. Keep authored card identity/seams, but never
+// re-arm holds, replay a result or restore a per-card random seed from a preset.
+const setupSegment = (segment) => {
+  const out = structuredClone(segment);
+  for (const key of ["take", "hold", "seed", "prompt_overrides"]) delete out[key];
+  return out;
+};
+
+// Whole setups retain authored missing claims too. The one-member library's
+// capture intentionally drops absent files, so it is not a roster serializer.
+function captureRoster(members, assets) {
+  const kept = new Set();
+  const wanted = new Set();
+  const mention = (value) => {
+    for (const match of JSON.stringify(value ?? "").matchAll(/@([\p{L}\p{N}_-]+)/gu)) wanted.add(match[1]);
+  };
+  for (const member of members) {
+    for (const handle of [...S.subjectFiles(member), ...S.replacesOf(member)]) wanted.add(handle);
+    mention(member);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    assets.forEach((asset, index) => {
+      if (kept.has(index) || (!wanted.has(asset.handle)
+          && !(asset.panels ?? []).some((panel) => wanted.has(panel.handle)))) return;
+      kept.add(index); changed = true; mention(asset);
+      const origin = asset.replacement_origin;
+      if (origin?.handle) wanted.add(origin.handle);
+      if (origin?.filename) assets.forEach((entry) => {
+        if (entry.filename === origin.filename && entry.kind === "video") wanted.add(entry.handle);
+      });
+    });
+  }
+  return { members: structuredClone(members), assets: structuredClone(assets.filter((_asset, index) => kept.has(index))) };
+}
+
 /**
  * A piece — a Creator or a Timeline — as a preset body.
  *
@@ -524,8 +570,8 @@ export function capturePiece(timeline, io) {
   const blob = JSON.parse(S.serializeTimeline(timeline));
   const family = S.pieceFamily(blob);
   return {
-    look: pick(blob, ["aspect", "short_edge", "upscale", "sample_edge", "refine_denoise",
-                      "refine_upscaler", "refine_steps", "face"]),
+    look: pick(blob, ["aspect", "aspect_source", "short_edge", "upscale", "sample_edge", "refine_denoise",
+                      "refine_upscaler", "refine_steps", "face", "neural", "guide_lora", "guide", "upscale_models"]),
     weights: blob.models ?? {},
     // The family rides with the row, because the row is only meaningful under
     // it: `steps` and `sampler_name` are spelled the same on both video
@@ -533,13 +579,16 @@ export function capturePiece(timeline, io) {
     // was could be applied to the other one and quietly change the render.
     // `crossable` is what reads it.
     speed: { turbo: blob.turbo ?? null, family, row: readRow(io, speedNames(family)) },
-    prompt: pick(blob, ["prompt", "soundscape", "music", "refined"]),
+    prompt: pick(blob, ["prompt", "prompt_sections", "retention_blocks", "retention_overrides", "soundscape", "music", "refined"]),
     loras: blob.loras ?? [],
     refs: blob.assets ?? [],
+    subjects: captureRoster(blob.subjects ?? [], [...(blob.assets ?? []),
+      ...((blob.segments ?? []).length === 1 ? blob.segments[0].assets ?? [] : [])]),
     strip: {
       render: blob.render,
       audio_tail_s: blob.audio_tail_s,
-      segments: blob.segments ?? [],
+      ...pick(blob, ["sound", "storyboard", "storyboard_hold", "storyboard_carries"]),
+      segments: (blob.segments ?? []).map(setupSegment),
     },
   };
 }
@@ -559,13 +608,13 @@ export function captureShot(timeline, index, io) {
   // carries is the one the whole strip runs on.
   const family = S.pieceFamily(blob);
   return {
-    prompt: pick(segment, ["prompt", "soundscape", "music", "refined"]),
+    prompt: pick(segment, ["prompt", "prompt_sections", "retention_blocks", "retention_overrides", "soundscape", "music", "refined"]),
     refs: segment.assets ?? [],
     loras: segment.loras ?? [],
-    shot: pick(segment, ["duration_s", "checkpoint", "continue", "continue_audio",
-                         "continue_from", "feather", "seam_restore", "motion_fix", "merge",
+    shot: pick(segment, ["duration_s", "auto_duration", "checkpoint", "continue", "continue_audio",
+                         "continue_from", "feather", "feather_pin", "seam_restore", "motion_fix", "merge", "face", "screens",
                          "kind", "filename",
-                         "sound", "width", "height", "trim"]),
+                         "sound", "width", "height", "trim", "crop"]),
     speed: { family, row: readRow(io, speedNames(family)) },
   };
 }
@@ -584,27 +633,37 @@ export function captureShot(timeline, index, io) {
  */
 export function capturePreStage(state, io) {
   const blob = JSON.parse(S.serializePreStage(state));
+  const still = blob.arch === S.PRESTAGE_STILL_ARCH ? blob[S.PRESTAGE_STILL_ARCH]?.request : null;
   return {
-    look: pick(blob, ["aspect", "short_edge"]),
+    look: { ...pick(blob, ["aspect", "short_edge", "neural"]),
+      ...(still ? { still: pick(still, ["aspect", "short_edge", "upscale", "sample_edge", "refine_denoise",
+        "refine_upscaler", "refine_steps", "face", "neural", "guide_lora", "guide", "upscale_models"]) } : {}) },
     weights: {
       arch: blob.arch,
       quality: blob.quality,
       models: blob.models ?? {},
       ...(blob[S.PRESTAGE_STILL_ARCH] ? {
         [S.PRESTAGE_STILL_ARCH]: {
-          ...pick(blob[S.PRESTAGE_STILL_ARCH], ["frames", "latent_index"]),
+          ...pick(blob[S.PRESTAGE_STILL_ARCH], ["frames", "latent_index", "prompt_mode"]),
           models: blob[S.PRESTAGE_STILL_ARCH].request?.models ?? {},
         },
       } : {}),
     },
     speed: { turbo: blob.turbo ?? null,
+             ...(still ? { still: pick(still, ["turbo"]) } : {}),
              row: readRow(io, stillSpeedNames(blob.arch)) },
-    prompt: pick(blob, ["prompt"]),
-    loras: blob.loras ?? [],
+    prompt: { ...pick(blob, ["prompt"]),
+      ...(still ? { still: pick(still, ["prompt", "prompt_sections", "retention_blocks", "retention_overrides",
+        "soundscape", "music", "refined"]) } : {}) },
+    loras: (still ?? blob).loras ?? [],
     refs: {
       ...(blob.init ? { init: blob.init } : {}),
       refs: blob.refs ?? [],
+      ...pick(blob, ["ref_method", "ref_lora", "edit_first", "guide", "edition", "screens"]),
+      ...(still ? { still: pick(still, ["assets", "screens"]) } : {}),
     },
+    subjects: captureRoster((still ?? blob).subjects ?? [], still?.assets
+      ?? (blob.refs ?? []).map((ref) => ({ ...ref, kind: "image", role: ref.role ?? "reference" }))),
   };
 }
 
@@ -634,11 +693,14 @@ export const SUBJECT_SLOTS = ["from", "motion", "voice", "replaces"];
 function storedFile(asset, slot, note = "", trigger = "") {
   return {
     slot,
+    ...(asset.handle ? { source_handle: asset.handle } : {}),
     filename: asset.filename,
     kind: asset.kind ?? "image",
     ...(asset.track ? { track: asset.track } : {}),
     ...(asset.ref_size ? { ref_size: asset.ref_size } : {}),
     ...(asset.takes ? { takes: asset.takes } : {}),
+    ...(asset.enabled === false ? { enabled: false } : {}),
+    ...pick(asset, ["description", "usage_rules"]),
     // What it lends them, in the user's words — the half of a picture's
     // meaning that neither its filename nor its slot can say.
     ...(note ? { note } : {}),
@@ -648,6 +710,8 @@ function storedFile(asset, slot, note = "", trigger = "") {
     ...(trigger ? { trigger } : {}),
     ...(asset.trim ? { trim: asset.trim } : {}),
     ...(asset.crop ? { crop: { ...asset.crop } } : {}),
+    ...(asset.replacement_origin ? { replacement_origin: { ...asset.replacement_origin } } : {}),
+    ...(asset.replacement_annotation ? { replacement_annotation: structuredClone(asset.replacement_annotation) } : {}),
     // The picture's saved renditions, by latent space: a member who comes
     // back out of the library comes back with the mods their pictures had.
     ...(asset.mods && Object.keys(asset.mods).length ? { mods: { ...asset.mods } } : {}),
@@ -657,12 +721,14 @@ function storedFile(asset, slot, note = "", trigger = "") {
     ...(asset.panels?.length
       ? { panels: asset.panels.map((panel) => ({
           path: panel.filename,
+          ...(panel.handle ? { source_handle: panel.handle } : {}),
           ...(panel.cut ? { cut: true } : {}),
           ...(panel.rect ? { rect: [...panel.rect] } : {}),
           ...(panel.points?.length
             ? { points: panel.points.map((point) => ({ ...point })) } : {}),
           ...(panel.takes ? { takes: panel.takes } : {}),
           ...(panel.crop ? { crop: { ...panel.crop } } : {}),
+          ...pick(panel, ["description", "usage_rules"]),
         })) }
       : {}),
   };
@@ -699,12 +765,20 @@ export function captureSubject(subject, assets) {
     const asset = byHandle.get(handle);
     if (asset?.filename) files.push(storedFile(asset, "replaces"));
   }
+  const kept = new Set(files.map((file) => file.source_handle));
+  for (const asset of byHandle.values()) {
+    if (asset?.filename && !kept.has(asset.handle)
+        && S.handleWritten([subject.usage_rules], asset.handle)) {
+      files.push(storedFile(asset, "usage")); kept.add(asset.handle);
+    }
+  }
   return {
     data: {
       cast: {
         handle: subject.handle || "subject",
         takes: subject.takes ?? "person",
         ...(subject.description ? { description: subject.description } : {}),
+        ...(subject.usage_rules ? { usage_rules: subject.usage_rules } : {}),
         // What they are, feature by feature. Kept with them, because a member
         // who comes back out of the library without the features that made them
         // that person comes back as a name and a photograph.
@@ -715,6 +789,7 @@ export function captureSubject(subject, assets) {
         // baseline they had dropped comes back as somebody else.
         ...(subject.seeded ? { seeded: true } : {}),
         ...(subject.replaces_what ? { replaces_what: subject.replaces_what } : {}),
+        ...(subject.replacement_reference_only ? { replacement_reference_only: true } : {}),
         ...(subject.relationship ? { relationship: subject.relationship } : {}),
         files,
         // What they wear and what each family is sent, by family. A LoRA is
@@ -1308,7 +1383,7 @@ function lookDefaults(family) {
   const empty = S.emptyTimeline();
   S.setFamily(empty, family);
   return pick(empty, ["aspect", "short_edge", "upscale", "sample_edge", "refine_denoise",
-                      "refine_upscaler", "refine_steps", "face"]);
+                      "refine_upscaler", "refine_steps", "face", "neural", "guide_lora", "guide", "upscale_models"]);
 }
 
 /** Re-handle a list of assets against what the target already has, so applying
@@ -1408,6 +1483,8 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
   const slots = { from: [], motion: [], replaces: [] };
   const notes = {};
   const triggers = {};
+  const renamed = new Map();
+  const arrivals = [];
   for (const file of stored.files ?? []) {
     if (!file?.filename) continue;
     const kind = file.kind ?? "image";
@@ -1440,6 +1517,8 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
             ? { takes: file.takes } : {}),
           ...(file.trim ? { trim: file.trim } : {}),
           ...(file.crop ? { crop: { ...file.crop } } : {}),
+          ...(file.replacement_origin ? { replacement_origin: { ...file.replacement_origin } } : {}),
+          ...(file.replacement_annotation ? { replacement_annotation: structuredClone(file.replacement_annotation) } : {}),
           ...(file.mods ? { mods: { ...file.mods } } : {}),
         };
       }
@@ -1451,6 +1530,9 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
       asset.ref_size = file.ref_size;
     }
     if (S.takeOptions(asset).includes(file.takes)) asset.takes = file.takes;
+    for (const key of ["description", "usage_rules", "enabled", "crop", "replacement_origin", "replacement_annotation"]) {
+      if (file[key] !== undefined) asset[key] = structuredClone(file[key]);
+    }
     // Their renditions land on the file either way — a mod the library knows
     // of a picture the piece already holds is a mod of that picture.
     if (file.mods && asset.role === "reference" && !asset.panels?.length) {
@@ -1458,6 +1540,8 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
     }
     if (file.note) notes[asset.handle] = String(file.note);
     if (file.trigger) triggers[asset.handle] = String(file.trigger);
+    if (file.source_handle) renamed.set(file.source_handle, asset.handle);
+    arrivals.push(asset);
     // Their looks, their actions and the place they take hold several files
     // each; their voice holds one. See `cast.LIST_ROLES`.
     if (Array.isArray(slots[file.slot])) slots[file.slot].push(asset.handle);
@@ -1482,8 +1566,10 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
     ...(slots.voice ? { voice: slots.voice } : {}),
     ...(slots.replaces.length ? { replaces: slots.replaces } : {}),
     ...(stored.description ? { description: String(stored.description) } : {}),
+    ...(stored.usage_rules ? { usage_rules: String(stored.usage_rules) } : {}),
     ...(S.subjectFeatures(stored).length ? { features: S.subjectFeatures(stored) } : {}),
     ...(stored.replaces_what ? { replaces_what: String(stored.replaces_what) } : {}),
+    ...(stored.replacement_reference_only ? { replacement_reference_only: true } : {}),
     ...(S.SUBJECT_MARKERS.includes(stored.relationship)
       ? { relationship: stored.relationship } : {}),
     ...(stored.seeded ? { seeded: true } : {}),
@@ -1491,11 +1577,198 @@ export function addSubjectToPiece(stored, timeline, { pool = false } = {}) {
     ...(Object.keys(triggers).length ? { triggers } : {}),
     ...(S.serializeWears(stored) ? { wears: S.serializeWears(stored) } : {}),
   };
+  if (stored.handle) renamed.set(stored.handle, subject.handle);
+  const rename = (text) => String(text ?? "").replace(/@([A-Za-z0-9_-]+)\b/g,
+    (match, handle) => renamed.has(handle) ? `@${renamed.get(handle)}` : match);
+  for (const key of ["description", "usage_rules", "replaces_what"]) {
+    if (subject[key]) subject[key] = rename(subject[key]);
+  }
+  for (const asset of arrivals) {
+    const origin = asset.replacement_origin;
+    if (!origin) continue;
+    const source = [...host.assets, ...(single ? timeline.assets : [])]
+      .find((entry) => entry.filename === origin.filename && entry.kind === "video");
+    asset.replacement_origin = { ...origin };
+    if (source) asset.replacement_origin.handle = source.handle;
+    else delete asset.replacement_origin.handle;
+  }
   // A member kept before the rows existed gets them here, on the way into a
   // piece — the same repair `parseSubjects` does for a piece written then.
   S.seedSubject(subject);
   timeline.subjects.push(subject);
   return subject;
+}
+
+/** A whole roster restores exact file variants and missing-file warning state.
+ * Reuse requires the complete canonical media settings, not merely a filename.
+ * An unrelated existing target file is never relabelled or rewritten.
+ */
+function restoreRoster(snapshot, timeline) {
+  const stored = structuredClone(snapshot);
+  const members = stored.members ?? [], incoming = stored.assets ?? [];
+  const host = (timeline.segments ?? []).length === 1 ? timeline.segments[0] : timeline;
+  if (!Array.isArray(host.assets)) host.assets = [];
+  const existing = S.castAssets(timeline);
+  const used = new Set(), names = new Map(), imports = [];
+  const taken = S.takenHandles({ assets: existing });
+  const futureCast = { assets: existing, subjects: [], segments: timeline.segments ?? [] };
+  const memberNames = new Map(members.map((member) => [member.handle, member.handle]));
+  const targetNames = new Map();
+  for (const member of members) {
+    const handle = freeSubjectHandle(member.handle, futureCast);
+    futureCast.subjects.push({ handle }); targetNames.set(handle, member.handle);
+  }
+  const reserve = (wanted) => {
+    if (wanted && !taken.has(wanted)) { taken.add(wanted); return wanted; }
+    for (let n = 1; ; n++) {
+      const handle = `ref-${n}`;
+      if (!taken.has(handle)) { taken.add(handle); return handle; }
+    }
+  };
+  const referenceTokens = (assets) => {
+    const tokens = new Map();
+    for (const entry of assets) {
+      const canonical = JSON.parse(S.serializeState({ ...S.emptyState(), assets: [entry] })).assets[0];
+      tokens.set(entry.handle, JSON.stringify(pick(canonical, ["filename", "kind", "role", "track", "crop", "ref_size", "takes"])));
+      for (const panel of canonical.panels ?? []) tokens.set(panel.handle,
+        JSON.stringify(pick(panel, ["filename", "crop", "rect", "points", "takes"])));
+    }
+    return tokens;
+  };
+  const incomingTokens = referenceTokens(incoming);
+  const signature = (asset, tokens, subjects) => {
+    const canonical = JSON.parse(S.serializeState({ ...S.emptyState(), assets: [asset] })).assets[0];
+    delete canonical.handle;
+    if (canonical.replacement_origin) delete canonical.replacement_origin.handle;
+    const rename = (text) => typeof text === "string" ? text.replace(/@([\p{L}\p{N}_-]+)/gu, (word, handle) =>
+      subjects.has(handle) ? `<member:${subjects.get(handle)}>` : tokens.has(handle) ? `<file:${tokens.get(handle)}>` : word) : text;
+    for (const key of ["description", "usage_rules"]) if (canonical[key]) canonical[key] = rename(canonical[key]);
+    for (const panel of canonical.panels ?? []) {
+      delete panel.handle;
+      for (const key of ["description", "usage_rules"]) if (panel[key]) panel[key] = rename(panel[key]);
+    }
+    return JSON.stringify(canonical);
+  };
+  for (const original of incoming) {
+    const tokens = referenceTokens(existing);
+    let asset = existing.find((candidate) => !used.has(candidate)
+      && signature(candidate, tokens, targetNames) === signature(original, incomingTokens, memberNames));
+    if (!asset) {
+      asset = structuredClone(original);
+      asset.handle = reserve(original.handle);
+      for (const panel of asset.panels ?? []) panel.handle = reserve(panel.handle);
+      host.assets.push(asset);
+    }
+    used.add(asset); imports.push({ original, asset, reused: existing.includes(asset), seen: new Set([asset]) });
+    if (original.handle) names.set(original.handle, asset.handle);
+    (original.panels ?? []).forEach((panel, index) => {
+      if (panel.handle && asset.panels?.[index]?.handle) names.set(panel.handle, asset.panels[index].handle);
+    });
+  }
+  // A missing source must not bind to a different target asset of the same
+  // handle. Keep it missing under a free name, and rebind only imported prose.
+  const missing = new Set();
+  for (const member of members) {
+    for (const handle of [...S.subjectFiles(member), ...S.replacesOf(member)]) missing.add(handle);
+  }
+  for (const value of [...members, ...incoming]) {
+    for (const token of JSON.stringify(value).matchAll(/@([\p{L}\p{N}_-]+)/gu)) {
+      if (!memberNames.has(token[1])) missing.add(token[1]);
+    }
+  }
+  for (const asset of incoming) if (asset.replacement_origin?.handle) missing.add(asset.replacement_origin.handle);
+  for (const handle of missing) {
+    if (!names.has(handle)) names.set(handle, taken.has(handle) ? reserve(null) : reserve(handle));
+  }
+  timeline.subjects = [];
+  for (const member of members) {
+    const handle = freeSubjectHandle(member.handle, timeline);
+    names.set(member.handle, handle);
+    timeline.subjects.push({ ...member, handle });
+  }
+  const rename = (text) => typeof text === "string" ? text.replace(/@([\p{L}\p{N}_-]+)/gu,
+    (token, handle) => names.has(handle) ? `@${names.get(handle)}` : token) : text;
+  // Even semantically equivalent annotations belong to the existing target.
+  // If their literal text would change after rebinding, use a new copy instead.
+  let remapped;
+  do {
+    remapped = false;
+    for (const entry of imports) {
+      if (!entry.reused) continue;
+      const { original, asset } = entry;
+      const unchanged = (candidate) => ![original, ...(original.panels ?? [])].some((row, index) => {
+        const target = index ? candidate.panels?.[index - 1] : candidate;
+        return ["description", "usage_rules"].some((key) => row[key] && rename(row[key]) !== target?.[key]);
+      }) && (!original.replacement_origin?.handle
+        || (names.get(original.replacement_origin.handle) ?? original.replacement_origin.handle) === candidate.replacement_origin?.handle);
+      if (unchanged(asset)) continue;
+      // Reapplying a roster may find its already-rebound copy after an older,
+      // equivalent target variant. Prefer the exact current binding. Each
+      // candidate is visited once per source, so dependency cycles terminate.
+      const tokens = referenceTokens(existing);
+      const equivalent = existing.find((candidate) => !used.has(candidate) && !entry.seen.has(candidate)
+        && signature(candidate, tokens, targetNames) === signature(original, incomingTokens, memberNames)
+        && unchanged(candidate));
+      let copy = equivalent;
+      if (!copy) {
+        copy = structuredClone(original);
+        copy.handle = reserve(original.handle);
+        for (const panel of copy.panels ?? []) panel.handle = reserve(panel.handle);
+        host.assets.push(copy); entry.reused = false;
+      }
+      used.delete(asset); used.add(copy); entry.seen.add(copy); entry.asset = copy;
+      if (original.handle) names.set(original.handle, copy.handle);
+      (original.panels ?? []).forEach((panel, index) => {
+        if (panel.handle) names.set(panel.handle, copy.panels[index].handle);
+      });
+      remapped = true;
+    }
+  } while (remapped);
+  for (const subject of timeline.subjects) {
+    for (const slot of ["from", "motion", "replaces"]) {
+      if (Array.isArray(subject[slot])) subject[slot] = subject[slot].map((handle) => names.get(handle) ?? handle);
+      else if (typeof subject[slot] === "string") subject[slot] = names.get(subject[slot]) ?? subject[slot];
+    }
+    if (subject.voice) subject.voice = names.get(subject.voice) ?? subject.voice;
+    for (const key of ["description", "usage_rules", "replaces_what"]) subject[key] = rename(subject[key]);
+    for (const key of ["notes", "triggers"]) {
+      if (subject[key]) subject[key] = Object.fromEntries(Object.entries(subject[key])
+        .map(([handle, text]) => [names.get(handle) ?? handle, rename(text)]));
+    }
+  }
+  for (const { original, asset } of imports) {
+    for (const key of ["description", "usage_rules"]) if (original[key]) asset[key] = rename(original[key]);
+    (original.panels ?? []).forEach((panel, index) => {
+      for (const key of ["description", "usage_rules"]) {
+        if (panel[key] && asset.panels?.[index]) asset.panels[index][key] = rename(panel[key]);
+      }
+    });
+    if (original.replacement_origin) {
+      asset.replacement_origin = { ...original.replacement_origin };
+      if (names.has(original.replacement_origin.handle)) asset.replacement_origin.handle = names.get(original.replacement_origin.handle);
+    }
+  }
+  return names;
+}
+
+// Only text imported in this apply operation is rebound. Roster-only does not
+// rewrite a user's existing prompts or another segment's authored fields.
+function rebindPresetText(host, names) {
+  const rewrite = (text) => typeof text === "string"
+    ? text.replace(/@([\p{L}\p{N}_-]+)/gu, (token, handle) => names.has(handle) ? `@${names.get(handle)}` : token)
+    : text;
+  for (const key of ["prompt", "soundscape", "music"]) {
+    if (typeof host[key] === "string") host[key] = rewrite(host[key]);
+  }
+  for (const key of Object.keys(host.prompt_sections ?? {})) host.prompt_sections[key] = rewrite(host.prompt_sections[key]);
+  for (const block of host.retention_blocks ?? []) {
+    if (block.type === "text") block.text = rewrite(block.text);
+    if (block.type === "subject" && names.has(block.handle)) block.handle = names.get(block.handle);
+  }
+  if (Array.isArray(host.retention_overrides)) host.retention_overrides = host.retention_overrides.map((name) => names.get(name) ?? name);
+  const refined = host.refined;
+  if (refined?.body) refined.body = rewrite(refined.body);
+  for (const key of Object.keys(refined?.sections ?? {})) refined.sections[key] = rewrite(refined.sections[key]);
 }
 
 /** Write the speed row through the widget accessor. Names the target does not
@@ -1514,7 +1787,9 @@ export function applyToPiece(body, keys, timeline, io, { from = "piece" } = {}) 
   const chosen = new Set(keys);
 
   if (chosen.has("look")) {
-    Object.assign(timeline, lookDefaults(S.pieceFamily(timeline)), body.look ?? {});
+    delete timeline.aspect_source;
+    Object.assign(timeline, lookDefaults(S.pieceFamily(timeline)),
+      structuredClone(from === "prestage" ? (body.look?.still ?? body.look ?? {}) : body.look ?? {}));
   }
   if (chosen.has("weights")) {
     // Through `parseModels` rather than assigned: a stored block omits every
@@ -1539,11 +1814,15 @@ export function applyToPiece(body, keys, timeline, io, { from = "piece" } = {}) 
     applyRow(body.speed?.row, io);
   }
   if (chosen.has("prompt")) {
-    const text = body.prompt ?? {};
+    const text = from === "prestage" ? (body.prompt?.still ?? body.prompt ?? {}) : body.prompt ?? {};
     timeline.prompt = text.prompt ?? "";
     timeline.soundscape = text.soundscape ?? "";
     timeline.music = text.music ?? "";
-    timeline.refined = text.refined ?? null;
+    timeline.refined = structuredClone(text.refined ?? null);
+    for (const key of ["prompt_sections", "retention_blocks", "retention_overrides"]) {
+      if (text[key] !== undefined) timeline[key] = structuredClone(text[key]);
+      else delete timeline[key];
+    }
   }
   if (chosen.has("style")) {
     timeline.prompt = leadWithStyle(timeline.prompt, body.style?.text);
@@ -1556,9 +1835,10 @@ export function applyToPiece(body, keys, timeline, io, { from = "piece" } = {}) 
     // keyframe to open, which is what a pre-stage's `init` is. Crossing from one
     // drops it rather than inventing a card to hang it on.
     const incoming = from === "prestage"
-      ? (body.refs?.refs ?? []).map((ref) => ({ ...ref, role: "reference" }))
+      ? (body.refs?.still?.assets ?? body.refs?.refs ?? []).filter((ref) => !ref.role || ref.role === "reference")
+        .map((ref) => ({ ...ref, role: "reference" }))
       : (body.refs ?? []);
-    timeline.assets = incoming.map((asset, index) => ({
+    timeline.assets = structuredClone(incoming).map((asset, index) => ({
       ...asset,
       role: "reference",
       handle: asset.handle ?? `ref-${index + 1}`,
@@ -1589,13 +1869,22 @@ export function applyToPiece(body, keys, timeline, io, { from = "piece" } = {}) 
     const strip = body.strip ?? {};
     timeline.render = strip.render === "single" ? "single" : "chained";
     if (strip.audio_tail_s !== undefined) timeline.audio_tail_s = strip.audio_tail_s;
+    for (const key of ["sound", "storyboard", "storyboard_hold", "storyboard_carries"]) {
+      if (strip[key] !== undefined) timeline[key] = structuredClone(strip[key]);
+      else delete timeline[key];
+    }
     // Parsed back through the timeline reader, so every segment arrives in the
     // shape the editor builds rather than the shape the blob stores.
     const parsed = S.parseTimeline(JSON.stringify({
       ...JSON.parse(S.serializeTimeline(timeline)),
-      segments: strip.segments ?? [],
+      segments: (strip.segments ?? []).map(setupSegment),
     }));
     timeline.segments = parsed.segments;
+  }
+  if (chosen.has("subjects") && from === "piece" && Array.isArray(body.subjects?.members)) {
+    const names = restoreRoster(body.subjects, timeline);
+    if (chosen.has("prompt")) rebindPresetText(timeline, names);
+    if (chosen.has("strip")) timeline.segments.forEach((segment) => rebindPresetText(segment, names));
   }
   return timeline;
 }
@@ -1605,11 +1894,15 @@ export function applyToShot(body, keys, segment, io, { from = "shot", piece } = 
   const chosen = new Set(keys);
 
   if (chosen.has("prompt")) {
-    const text = body.prompt ?? {};
+    const text = from === "prestage" ? (body.prompt?.still ?? body.prompt ?? {}) : body.prompt ?? {};
     segment.prompt = text.prompt ?? "";
     segment.soundscape = text.soundscape ?? "";
     segment.music = text.music ?? "";
-    segment.refined = text.refined ?? null;
+    segment.refined = structuredClone(text.refined ?? null);
+    for (const key of ["prompt_sections", "retention_blocks", "retention_overrides"]) {
+      if (text[key] !== undefined) segment[key] = structuredClone(text[key]);
+      else delete segment[key];
+    }
   }
   if (chosen.has("style")) {
     segment.prompt = leadWithStyle(segment.prompt, body.style?.text);
@@ -1621,13 +1914,12 @@ export function applyToShot(body, keys, segment, io, { from = "shot", piece } = 
     // The useful direction: a pre-stage's init becomes this card's start frame,
     // which is the whole reason the pre-stage sits to the left of the Creator.
     const incoming = from === "prestage"
-      ? [
+      ? (body.refs?.still?.assets ?? [
           ...(body.refs?.init ? [{ ...body.refs.init, role: "first_frame", kind: "image" }] : []),
           ...(body.refs?.refs ?? []).map((ref) => ({ ...ref, role: "reference", kind: "image" })),
-        ]
+        ])
       : (from === "piece" ? (body.refs ?? []) : (body.refs ?? []));
-    segment.assets = rehandle(
-      incoming.map((asset) => ({ ...asset })), { assets: [] });
+    segment.assets = rehandle(structuredClone(incoming), { assets: [] });
   }
   if (chosen.has("shot")) {
     const shot = body.shot ?? {};
@@ -1636,7 +1928,8 @@ export function applyToShot(body, keys, segment, io, { from = "shot", piece } = 
     for (const flag of ["continue", "continue_audio"]) {
       segment[flag] = shot[flag] === true;
     }
-    for (const key of ["continue_from", "feather", "seam_restore", "motion_fix", "merge"]) {
+    for (const key of ["continue_from", "feather", "feather_pin", "seam_restore", "motion_fix", "merge",
+                       "auto_duration", "face", "screens", "kind", "filename", "sound", "width", "height", "trim", "crop"]) {
       if (shot[key] === undefined) delete segment[key];
       // The blend is retargeted rather than copied: a preset is family-neutral
       // and a width is not, so the run this one names has to become the nearest
@@ -1645,7 +1938,7 @@ export function applyToShot(body, keys, segment, io, { from = "shot", piece } = 
       // the grid as the classic single frame — a seam that quietly stops being
       // feathered, which is the failure the grid exists to prevent.
       else if (key === "feather") segment.feather = S.nearestFeather(shot.feather, piece);
-      else segment[key] = shot[key];
+      else segment[key] = structuredClone(shot[key]);
     }
   }
   if (chosen.has("speed")) {
@@ -1657,20 +1950,63 @@ export function applyToShot(body, keys, segment, io, { from = "shot", piece } = 
 /** Apply to a PreStage state, in place. The caller commits. */
 export function applyToPreStage(body, keys, state, io, { from = "prestage" } = {}) {
   const chosen = new Set(keys);
+  // The saved node's active source branch is independent of the current
+  // target's architecture: Weights need not be selected when applying text or
+  // media. Never fall back to the source's hidden inactive image fields.
+  const sourceStill = from === "prestage" && body.weights?.arch === S.PRESTAGE_STILL_ARCH;
+  const targetArch = chosen.has("weights")
+    ? (from === "prestage" ? body.weights?.arch ?? state.arch : S.PRESTAGE_STILL_ARCH) : state.arch;
+  const targetStill = targetArch === S.PRESTAGE_STILL_ARCH;
+  if (sourceStill && ((chosen.has("prompt") && !Object.hasOwn(body.prompt ?? {}, "still"))
+      || (chosen.has("refs") && !Object.hasOwn(body.refs ?? {}, "still"))
+      || (chosen.has("look") && !Object.hasOwn(body.look ?? {}, "still"))
+      || (chosen.has("loras") && !Object.hasOwn(body.prompt ?? {}, "still")))) {
+    // Shipped older captures stored the inactive image fields, not these H3
+    // fields. Their absence is unknown data, never an intentional empty value.
+    // Weights and the sampler row were captured correctly and remain usable.
+    throw new Error(t("This older H3 preset did not save the active H3 prompt, references, LoRAs and look. Load only Weights or Speed, or save a new preset from the H3 branch."));
+  }
+  const sourceMedia = from === "prestage"
+    ? (sourceStill ? body.refs?.still?.assets ?? [] : body.refs?.refs ?? [])
+    : (Array.isArray(body.refs) ? body.refs : []);
+  if (targetStill && from === "prestage" && !sourceStill && chosen.has("refs")
+      && (body.refs?.init?.panels?.length || sourceMedia.some((asset) => asset.role === "guide" && asset.panels?.length))) {
+    // H3 permits a plate only in a reference slot. A framed composite used as
+    // image init/guide cannot become an H3 first-frame/guide plate unchanged.
+    throw new Error(t("This preset includes framing that cannot be transferred to the H3 branch. Apply without References, or use its original image model."));
+  }
+  if (!targetStill && from === "prestage") {
+    const incompatible = (media, roles) => media.some((asset) => (asset.kind && asset.kind !== "image")
+      || !roles.includes(asset.role));
+    if ((chosen.has("refs") && sourceStill && incompatible(sourceMedia, [undefined, "reference", "first_frame"]))
+        || (chosen.has("subjects") && incompatible(body.subjects?.assets ?? [], [undefined, "reference"]))) {
+      // Before mutating any section: unsupported media must not result in a
+      // partial apply, an mp4 disguised as a still, or old target files left on.
+      throw new Error(t("This image model cannot use every reference in this preset. Use the H3 branch, or apply without References and Cast roster."));
+    }
+  }
 
   if (chosen.has("look")) {
-    if (body.look?.aspect) state.aspect = body.look.aspect;
-    if (body.look?.short_edge) state.short_edge = body.look.short_edge;
+    const look = sourceStill ? body.look?.still ?? {} : body.look ?? {};
+    if (targetStill) {
+      Object.assign(state[S.PRESTAGE_STILL_ARCH].request,
+        lookDefaults(S.DEFAULT_VIDEO_FAMILY), { face: S.emptyFace() }, structuredClone(look));
+    } else {
+      if (look.aspect) state.aspect = look.aspect;
+      if (look.short_edge) state.short_edge = look.short_edge;
+      if (from === "prestage") state.neural = structuredClone(look.neural ?? S.emptyPreStage().neural);
+    }
   }
   if (chosen.has("weights")) {
     if (from === "prestage") {
       if (body.weights?.arch) state.arch = body.weights.arch;
       if (body.weights?.quality) state.quality = body.weights.quality;
-      state.models = { ...state.models, ...(body.weights?.models ?? {}) };
+      state.models = S.parsePreStage(JSON.stringify({ arch: state.arch, models: body.weights?.models ?? {} })).models;
       const still = body.weights?.[S.PRESTAGE_STILL_ARCH];
       if (still) {
         if (still.frames !== undefined) state[S.PRESTAGE_STILL_ARCH].frames = still.frames;
         if (still.latent_index !== undefined) state[S.PRESTAGE_STILL_ARCH].latent_index = still.latent_index;
+        if (still.prompt_mode !== undefined) state[S.PRESTAGE_STILL_ARCH].prompt_mode = still.prompt_mode;
         // The H3 branch's checkpoints, which are not in the block above — see
         // `capturePreStage`. Restored through `parseModels` like any other.
         state[S.PRESTAGE_STILL_ARCH].request.models = S.parseModels(still.models ?? {});
@@ -1686,38 +2022,86 @@ export function applyToPreStage(body, keys, state, io, { from = "prestage" } = {
     // The pre-stage's switch is per arch and the piece's is not — see
     // `parsePreStageTurbo`. A preset captured before the split carries the flat
     // block and lands on Krea 2, which is where it was made.
-    state.turbo = S.parsePreStageTurbo(body.speed?.turbo ?? null);
+    if (S.isStill(state)) {
+      if (Object.hasOwn(body.speed ?? {}, "still") || from === "piece") {
+        state[S.PRESTAGE_STILL_ARCH].request.turbo = S.parseTurbo(
+          body.speed?.still?.turbo ?? (from === "piece" ? body.speed?.turbo : null));
+      }
+    } else state.turbo = S.parsePreStageTurbo(body.speed?.turbo ?? null);
     applyRow(body.speed?.row, io);
   }
   if (chosen.has("prompt")) {
-    state.prompt = body.prompt?.prompt ?? "";
+    const text = sourceStill ? body.prompt?.still ?? {} : body.prompt ?? {};
+    if (S.isStill(state)) {
+      const request = state[S.PRESTAGE_STILL_ARCH].request;
+      for (const key of ["prompt", "soundscape", "music"]) request[key] = text[key] ?? "";
+      request.refined = structuredClone(text.refined ?? null);
+      for (const key of ["prompt_sections", "retention_blocks", "retention_overrides"]) {
+        if (text[key] !== undefined) request[key] = structuredClone(text[key]); else delete request[key];
+      }
+    } else state.prompt = text.prompt ?? "";
   }
   if (chosen.has("style")) {
-    state.prompt = leadWithStyle(state.prompt, body.style?.text);
+    const host = S.isStill(state) ? state[S.PRESTAGE_STILL_ARCH].request : state;
+    host.prompt = leadWithStyle(host.prompt, body.style?.text);
   }
   if (chosen.has("cast")) {
     // Onto the still's own lists: its pictures are the `refs`, and a member's
     // land there under the still's handles. The piece's rule otherwise — a
     // look leads the sentence, somebody from the roster is written in by
     // the `@` menu where you asked for them.
-    const piece = { assets: state.refs, subjects: state.subjects, prompt: state.prompt };
+    const host = S.isStill(state) ? state[S.PRESTAGE_STILL_ARCH].request : state;
+    const piece = host === state ? { assets: state.refs, subjects: state.subjects, prompt: state.prompt } : host;
     const cast = castIntoPiece(body.cast, piece);
-    state.refs = piece.assets;
-    state.subjects = piece.subjects;
-    if (cast?.takes === "style") state.prompt = leadWithName(piece.prompt, cast.handle);
+    if (host === state) { state.refs = piece.assets; state.subjects = piece.subjects; }
+    if (cast?.takes === "style") host.prompt = leadWithName(piece.prompt, cast.handle);
   }
   if (chosen.has("loras")) {
-    state.loras = JSON.parse(JSON.stringify(body.loras ?? []));
+    const host = S.isStill(state) ? state[S.PRESTAGE_STILL_ARCH].request : state;
+    host.loras = structuredClone(body.loras ?? []);
   }
   if (chosen.has("refs")) {
-    if (from === "prestage") {
-      state.init = body.refs?.init ? { ...body.refs.init } : null;
+    if (S.isStill(state)) {
+      const request = state[S.PRESTAGE_STILL_ARCH].request;
+      const incoming = structuredClone(sourceMedia);
+      if (from === "prestage" && !sourceStill) {
+        for (const asset of incoming) {
+          asset.kind = "image"; asset.role = asset.role ?? "reference";
+          if (asset.role === "guide" && asset.guide) { asset.op = asset.guide; delete asset.guide; }
+        }
+        if (body.refs?.init) incoming.unshift({ ...structuredClone(body.refs.init), kind: "image", role: "first_frame",
+          handle: S.nextHandle({ assets: incoming }, "image") });
+        // Image-branch framing stores panels without citable H3 handles.
+        // Allocate those while preserving the parent reference's source name.
+        const taken = S.takenHandles({ assets: incoming });
+        for (const asset of incoming) {
+          for (const row of [asset, ...(asset.panels ?? [])]) {
+            if (row.handle) continue;
+            for (let n = 1; ; n++) {
+              const handle = `img-${n}`;
+              if (!taken.has(handle)) { row.handle = handle; taken.add(handle); break; }
+            }
+          }
+        }
+      }
+      request.assets = incoming;
+      const screens = sourceStill ? body.refs?.still?.screens : body.refs?.screens;
+      if (screens !== undefined) request.screens = structuredClone(screens);
+      else delete request.screens;
+    } else if (from === "prestage" && !sourceStill) {
+      state.init = body.refs?.init ? structuredClone(body.refs.init) : null;
       state.refs = [];
       for (const ref of (body.refs?.refs ?? []).slice(0, S.preStageMaxRefs(state))) {
         // Re-issued rather than trusted even here: a body written by an older
         // build may have none, and a handle-less chip cannot be removed alone.
-        state.refs.push({ handle: ref.handle || S.nextPreStageHandle(state),
-                          filename: ref.filename });
+        state.refs.push({ ...structuredClone(ref), handle: ref.handle || S.nextPreStageHandle(state),
+          kind: ref.kind ?? "image", role: ref.role ?? "reference" });
+      }
+      for (const key of ["ref_method", "ref_lora", "edit_first", "guide", "edition", "screens"]) {
+        const defaults = S.emptyPreStage();
+        if (body.refs?.[key] !== undefined) state[key] = structuredClone(body.refs[key]);
+        else if (defaults[key] !== undefined) state[key] = structuredClone(defaults[key]);
+        else delete state[key];
       }
     } else {
       // From a piece or a card: its start frame becomes the init, its reference
@@ -1729,9 +2113,9 @@ export function applyToPreStage(body, keys, state, io, { from = "prestage" } = {
       // without one is not a cosmetic problem — the chip's remove button filters
       // on `r.handle !== ref.handle`, so one undefined handle deletes every ref
       // that shares it, which is all of them.
-      const assets = Array.isArray(body.refs) ? body.refs : [];
+      const assets = sourceMedia;
       const frame = assets.find((a) => a.role === "first_frame");
-      state.init = frame ? { filename: frame.filename, denoise: state.init?.denoise ?? 0.6 } : null;
+      state.init = frame ? { ...structuredClone(frame), denoise: state.init?.denoise ?? S.PRESTAGE_DEFAULT_DENOISE } : null;
       //
       // Capped at the arch's own slots, because a preset must not be able to
       // put a node into a state the editor could not have produced — a piece
@@ -1740,9 +2124,16 @@ export function applyToPreStage(body, keys, state, io, { from = "prestage" } = {
       for (const asset of assets) {
         if (asset.role !== "reference" || asset.kind !== "image") continue;
         if (state.refs.length >= S.preStageMaxRefs(state)) break;
-        state.refs.push({ handle: S.nextPreStageHandle(state), filename: asset.filename });
+        state.refs.push({ ...structuredClone(asset), handle: asset.handle ?? S.nextPreStageHandle(state) });
       }
     }
+  }
+  if (chosen.has("subjects") && from === "prestage" && Array.isArray(body.subjects?.members)) {
+    const host = S.isStill(state) ? state[S.PRESTAGE_STILL_ARCH].request : state;
+    const piece = host === state ? { assets: state.refs, subjects: state.subjects } : host;
+    const names = restoreRoster(body.subjects, piece);
+    if (host === state) { state.refs = piece.assets; state.subjects = piece.subjects; }
+    if (chosen.has("prompt")) rebindPresetText(host, names);
   }
   return state;
 }

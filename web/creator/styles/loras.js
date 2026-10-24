@@ -13,6 +13,9 @@ export const css = `
   background: var(--mmc-surface); border: 1px solid var(--mmc-line); color: var(--mmc-text);
   padding: 0 10px; font-size: calc(13px * var(--mmc-type)); font-family: inherit; cursor: pointer; outline: none;
 }
+.mmc-overlay .mmc-modal-bar { position: relative; z-index: 2; pointer-events: auto; }
+.mmc-overlay .mmc-modal-bar .mmc-search:focus,
+.mmc-overlay .mmc-modal-bar .mmc-folder:focus-visible { border-color: var(--mmc-blue); }
 /* Sits after the last card and spans the grid: how many are still unrendered
    while scrolling, and what the server left out when it stops. */
 .mmc-grid-note {
@@ -48,6 +51,32 @@ export const css = `
 .mmc-lora-sub {
   font-size: calc(11px * var(--mmc-type)); color: var(--mmc-dim);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Long file labels use the timeline's continuous loop, without a hover gate.
+   The repeated copy is visual only: selecting text still selects one label. */
+.mmc-lora-label-loop {
+  display: block; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.mmc-lora-label-track {
+  display: inline-block; position: relative; vertical-align: bottom; white-space: nowrap;
+}
+.mmc-lora-label-loop.scrolling { text-overflow: clip; }
+.mmc-lora-label-loop.scrolling > .mmc-lora-label-track {
+  animation: mmc-lora-label-loop var(--mmc-lora-label-duration) linear infinite;
+  animation-delay: 1s;
+}
+.mmc-lora-label-loop.scrolling > .mmc-lora-label-track::after {
+  content: attr(data-mmc-loop-label); position: absolute; left: calc(100% + 48px); top: 0;
+}
+.mmc-lora-label-loop.held > .mmc-lora-label-track { animation-play-state: paused; }
+@keyframes mmc-lora-label-loop {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(calc(-1 * var(--mmc-lora-label-distance))); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mmc-lora-label-loop.scrolling { text-overflow: ellipsis; }
+  .mmc-lora-label-loop.scrolling > .mmc-lora-label-track { animation: none; }
+  .mmc-lora-label-loop.scrolling > .mmc-lora-label-track::after { content: none; }
 }
 .mmc-lora-words {
   font-size: calc(11px * var(--mmc-type)); color: var(--mmc-accent); margin-top: 2px;
@@ -268,5 +297,134 @@ export const css = `
 }
 .mmc-stack-name:focus { border-color: var(--mmc-blue); }
 .mmc-stack .mmc-del { font-size: calc(12px * var(--mmc-type)); }
+
+/* Timeline-only manager: one full-height pane at a time. The attached editor
+   and library keep their own scroll position when switching between tabs. */
+.mmc-lora-unified .mmc-modal-head {
+  position: relative; flex: none; flex-wrap: wrap; gap: 8px 22px;
+  padding-right: calc(58px * var(--mmc-type));
+}
+.mmc-lora-unified .mmc-modal-head .mmc-close {
+  position: absolute; margin: 0; right: 24px; top: 50%; transform: translateY(-50%);
+}
+.mmc-lora-unified .mmc-modal-head .mmc-tab { max-width: 100%; }
+.mmc-lora-added {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 14px 24px 0;
+  container-type: inline-size;
+}
+.mmc-lora-section-head { display: flex; align-items: center; gap: 8px; flex: none; }
+.mmc-lora-section-head h3 {
+  margin: 0; color: var(--mmc-text); font-size: calc(13px * var(--mmc-type)); font-weight: 600;
+}
+.mmc-lora-added-count {
+  color: var(--mmc-accent); font-size: calc(11px * var(--mmc-type));
+  background: color-mix(in srgb, var(--mmc-accent) 12%, transparent);
+  padding: 1px 7px; border-radius: 8px;
+}
+.mmc-lora-section-hint {
+  flex: none; margin: 0; color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); line-height: 1.4;
+}
+.mmc-lora-added-grid {
+  flex: 1;
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0 3px 96px 0;
+  align-content: start; grid-auto-rows: max-content;
+}
+/* Match the library/picker's thin rounded native bar, overriding the pack's
+   default hidden bars only on these three Timeline LoRA tab scroll surfaces. */
+.mmc-lora-unified .mmc-lora-added-grid,
+.mmc-lora-unified .mmc-lora-grid,
+.mmc-lora-unified .mmc-stacks {
+  min-height: 0; scrollbar-gutter: stable;
+  scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+}
+.mmc-lora-unified .mmc-lora-added-grid::-webkit-scrollbar,
+.mmc-lora-unified .mmc-lora-grid::-webkit-scrollbar,
+.mmc-lora-unified .mmc-stacks::-webkit-scrollbar { display: block; width: 6px; height: 6px; }
+.mmc-lora-unified .mmc-lora-added-grid::-webkit-scrollbar-thumb,
+.mmc-lora-unified .mmc-lora-grid::-webkit-scrollbar-thumb,
+.mmc-lora-unified .mmc-stacks::-webkit-scrollbar-thumb { background: var(--mmc-line-3); border-radius: 3px; }
+.mmc-lora-unified .mmc-lora-added-grid::-webkit-scrollbar-track,
+.mmc-lora-unified .mmc-lora-grid::-webkit-scrollbar-track,
+.mmc-lora-unified .mmc-stacks::-webkit-scrollbar-track { background: transparent; }
+.mmc-lora-added-card {
+  min-width: 0; padding: 10px 11px; border-radius: 12px;
+  border: 1px solid var(--mmc-line); background: var(--mmc-surface);
+}
+.mmc-lora-added-card.muted { border-style: dashed; }
+.mmc-lora-added-thumb {
+  position: relative; display: block; width: 100%; min-height: 224px; aspect-ratio: 4 / 3;
+  margin-top: 8px; padding: 0; box-sizing: border-box; border: 1px solid var(--mmc-line); border-radius: 12px;
+  overflow: hidden; background: var(--mmc-float); color: var(--mmc-dim); cursor: pointer;
+}
+.mmc-lora-added-thumb > img, .mmc-lora-added-thumb > video,
+.mmc-lora-added-thumb > .mmc-cell-fallback {
+  position: absolute; inset: 0; width: 100%; height: 100%; box-sizing: border-box;
+}
+.mmc-lora-added-thumb > img, .mmc-lora-added-thumb > video { object-fit: contain; display: block; }
+.mmc-lora-added-thumb:hover { border-color: var(--mmc-edge-2); }
+.mmc-lora-added-thumb:focus-visible { outline: 2px solid var(--mmc-blue); outline-offset: 2px; }
+/* An unloaded image still needs a visible box for lazy showcase loading. */
+.mmc-sheet-media > img, .mmc-sheet-media > video { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+.mmc-lora-added-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+.mmc-lora-added-name {
+  flex: 1 1 150px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--mmc-text); font-size: calc(13px * var(--mmc-type)); font-weight: 500;
+}
+.mmc-lora-added-card > .mmc-lora-sub { margin-top: 4px; }
+.mmc-lora-added-actions { display: flex; align-items: center; gap: 5px; flex: none; }
+.mmc-lora-added-action {
+  display: inline-flex; justify-content: center; align-items: center; flex: none;
+  width: calc(23px * var(--mmc-type)); height: calc(23px * var(--mmc-type));
+  padding: 0; border: 1px solid transparent; border-radius: 7px; background: none;
+  color: var(--mmc-off); font-family: inherit; font-size: calc(12px * var(--mmc-type)); cursor: pointer;
+}
+.mmc-lora-added-action:hover, .mmc-lora-added-action:focus-visible {
+  color: var(--mmc-text); background: var(--mmc-float); border-color: var(--mmc-line);
+}
+.mmc-lora-added-action.on { color: var(--mmc-accent); }
+.mmc-lora-added-actions .mmc-asset-x { opacity: 1; }
+.mmc-lora-added-card .mmc-lora-row { flex-wrap: wrap; gap: 4px; }
+.mmc-lora-added-status { color: var(--mmc-warn); font-size: calc(10px * var(--mmc-type)); line-height: 1.4; margin-top: 5px; }
+.mmc-lora-added-empty { grid-column: 1/-1; color: var(--mmc-dim); font-size: calc(12px * var(--mmc-type)); line-height: 1.5; padding: 7px 0; }
+.mmc-lora-unified .mmc-modal-bar { flex: none; flex-wrap: wrap; padding-top: 10px; padding-bottom: 10px; }
+.mmc-lora-unified .mmc-search { min-width: 0; flex: 1 1 180px; box-sizing: border-box; }
+.mmc-lora-unified .mmc-folder { min-width: 0; max-width: 100%; box-sizing: border-box; flex: 0 1 260px; }
+.mmc-lora-unified .mmc-lora-grid { grid-template-columns: repeat(auto-fill, minmax(min(230px, 100%), 1fr)); }
+.mmc-lora-library-state { color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); margin-top: 4px; }
+.mmc-lora-library-state.on { color: var(--mmc-accent); }
+.mmc-lora-pin-notice {
+  position: absolute; z-index: 2; left: 24px; bottom: 110px;
+  width: max-content; max-width: calc(100% - 48px); box-sizing: border-box;
+  padding: 8px 12px; border-radius: 12px; pointer-events: none;
+  background: var(--mmc-surface); border: 1px solid color-mix(in srgb, var(--mmc-warn) 45%, transparent);
+  color: var(--mmc-warn); font-size: calc(12px * var(--mmc-type)); line-height: 1.4;
+  box-shadow: 0 8px 24px var(--mmc-shadow-soft);
+}
+@container (max-width: 980px) {
+  .mmc-lora-added-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (max-width: 650px) {
+  .mmc-lora-added-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .mmc-lora-unified .mmc-modal-head { gap: 8px 14px; padding: 12px; padding-right: calc(54px * var(--mmc-type)); }
+  .mmc-lora-unified .mmc-modal-head .mmc-close { right: 12px; }
+  .mmc-lora-unified .mmc-modal-head .mmc-tab { font-size: calc(14px * var(--mmc-type)); }
+  .mmc-lora-added { padding: 10px 12px 0; }
+  .mmc-lora-unified .mmc-modal-bar { gap: 8px; padding: 8px 12px; }
+  .mmc-lora-unified .mmc-grid { padding-left: 12px; padding-right: 12px; }
+  .mmc-lora-unified .mmc-folder { flex-basis: 100%; }
+  .mmc-lora-unified .mmc-stacks { padding-left: 12px; padding-right: 12px; }
+  .mmc-lora-unified .mmc-stack, .mmc-lora-unified .mmc-stack-save { flex-wrap: wrap; gap: 8px; padding: 10px; }
+  .mmc-lora-unified .mmc-stack-save-what, .mmc-lora-unified .mmc-stack-what { flex-basis: 100%; }
+  .mmc-lora-unified .mmc-stack-name { width: 100%; min-width: 0; box-sizing: border-box; }
+  .mmc-lora-unified .mmc-modal-foot { left: 12px; right: 12px; gap: 8px; padding: 10px; max-width: calc(100% - 24px); box-sizing: border-box; }
+  .mmc-lora-unified .mmc-modal-foot .mmc-slots { flex: 1; min-width: 0; }
+  .mmc-lora-unified .mmc-modal-foot .mmc-add { flex: none; white-space: nowrap; }
+  .mmc-lora-pin-notice { left: 12px; max-width: calc(100% - 24px); bottom: 116px; }
+}
 
 `;

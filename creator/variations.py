@@ -286,11 +286,39 @@ def vary_mapping(mapping, seed, card, keys=("prompt", "soundscape", "music")):
         if chosen is not refined:
             out = out if out is not None else dict(mapping)
             out["refined"] = chosen
+    sections = mapping.get("prompt_sections")
+    if isinstance(sections, dict):
+        chosen = vary_mapping(sections, seed, card, keys=tuple(sections))
+        if chosen is not sections:
+            out = out if out is not None else dict(mapping)
+            out["prompt_sections"] = chosen
+    blocks = mapping.get("retention_blocks")
+    if isinstance(blocks, list):
+        chosen = [vary_mapping(block, seed, card, keys=("text",))
+                  if isinstance(block, dict) and block.get("type") == "text" else block
+                  for block in blocks]
+        if any(before is not after for before, after in zip(blocks, chosen)):
+            out = out if out is not None else dict(mapping)
+            out["retention_blocks"] = chosen
+    cast = mapping.get("subjects")
+    if isinstance(cast, list):
+        chosen = [vary_mapping(subject, seed, card, keys=("usage_rules",)) for subject in cast]
+        if any(before is not after for before, after in zip(cast, chosen)):
+            out = out if out is not None else dict(mapping)
+            out["subjects"] = chosen
     return out if out is not None else mapping
 
 
 def _texts(mapping, keys):
     out = [str(mapping.get(key) or "") for key in keys]
+    sections = mapping.get("prompt_sections")
+    if isinstance(sections, dict):
+        out.extend(str(text or "") for name, text in sections.items()
+                   if name != "retention_analysis" or not isinstance(mapping.get("retention_blocks"), list))
+    blocks = mapping.get("retention_blocks")
+    if isinstance(blocks, list):
+        out.extend(str(block.get("text") or "") for block in blocks
+                   if isinstance(block, dict) and block.get("type") == "text")
     refined = mapping.get("refined")
     if isinstance(refined, dict):
         out.append(str(refined.get("body") or ""))

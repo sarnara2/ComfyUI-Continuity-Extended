@@ -10,6 +10,7 @@ const dom = read('dom.js');
 const helper = name => dom.match(new RegExp(`export function ${name}\\([^]*?^\\}`, 'm'))[0].replace('export ', '');
 const code = read('reference-preview.js').replace(/^import .*;\r?\n/gm, '').replace(/^export /gm, '');
 const renderAssets = read('editor.js').match(/^  renderAssets\(\) \{[^]*?^  \}/m)[0];
+const sortByHandle = read('state.js').match(/^export function sortByHandle\([^]*?^\}/m)[0].replace('export ', '');
 const css = ['base', 'picker', 'editor', 'overlays'].map(name => read(`styles/${name}.js`).match(/export const css = `([^]*)`;\s*$/)[1]).join('\n');
 const results = [];
 let browser;
@@ -59,8 +60,9 @@ const test = async (name, run) => { await run(); results.push(name); console.log
     window.rowClicks = 0;
     document.body.addEventListener('click', () => rowClicks++);
     previewable(document.querySelector('#thumb'), {title:'Preview',open: returnFocus => {previewOpens++; window.closePreview = openReferencePreview(assets,{returnFocus});}});
-    Object.assign(S, {passedOver:()=>new Set(),asleepHere:()=>new Set(),citedCast:()=>[],
-      isPlate:()=>false,croppable:()=>false,tagIndex:()=>0,muted:()=>false,citedPool:s=>s.pool,
+    ${sortByHandle}
+    Object.assign(S, {sortByHandle,passedOver:()=>new Set(),asleepHere:()=>new Set(),citedCast:()=>[],
+      isPlate:()=>false,croppable:()=>false,sizeable:()=>false,tagIndex:()=>0,muted:()=>false,citedPool:s=>s.pool,
       roleLabel:role=>role});
     const referenceSummary=()=>'';
     const keepScroll=x=>x;
@@ -184,8 +186,8 @@ const test = async (name, run) => { await run(); results.push(name); console.log
   await page.setViewportSize({width:1100,height:850});
   await test('owned chips swap on single click and preview on double click; pooled chips only preview', async () => {
     await page.evaluate(() => { swaps=0; mountAssetFixture(true); });
-    for (const [index,file,tag,owned] of [[0,'portrait.png','img',true],[1,'motion.webm','video',true],[3,'pooled.png','img',false],[4,'pooled.webm','video',false]]) {
-      const thumb=page.locator('#fixture .mmc-asset-thumb').nth(index);
+    for (const [handle,file,tag,owned] of [['ref-1','portrait.png','img',true],['ref-2','motion.webm','video',true],['ref-4','pooled.png','img',false],['ref-5','pooled.webm','video',false]]) {
+      const thumb=page.locator('#fixture .mmc-asset').filter({has:page.locator('.mmc-asset-handle',{hasText:new RegExp('^@'+handle+'$')})}).locator('.mmc-asset-thumb');
       const before=await page.evaluate(() => swaps);
       await thumb.click();
       await page.waitForTimeout(400);
@@ -204,7 +206,7 @@ const test = async (name, run) => { await run(); results.push(name); console.log
   });
   await test('real nonvisual audio chip keeps single-click replacement', async () => {
     await page.evaluate(() => { swaps=0; });
-    await page.locator('#fixture .mmc-asset-thumb').nth(2).click();
+    await page.locator('#fixture .mmc-asset').filter({hasText:'@aud-1'}).locator('.mmc-asset-thumb').click();
     assert.equal(await page.evaluate(() => swaps),1);
     assert.equal(await page.locator('.mmc-reference-preview').count(),0);
   });

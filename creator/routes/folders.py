@@ -93,7 +93,21 @@ async def remove_folder(request):
 @same_origin
 async def folder_assets(request):
     body = await request.json()
-    return await _json_work(folders.listing, _registry(request), body.get("folder"), body.get("kind"))
+    if not isinstance(body, dict):
+        return web.json_response({"error": "send the selected folder as an object"}, status=400)
+    if "directory" in body and not isinstance(body["directory"], str):
+        return web.json_response({"error": "send a relative directory"}, status=400)
+    return await _json_work(folders.listing, _registry(request), body.get("folder"), body.get("kind"),
+                            body.get("directory"))
+
+
+@PromptServer.instance.routes.post("/continuity/folders/metadata")
+@same_origin
+async def folder_metadata(request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        return web.json_response({"error": "send the registered file paths as an object"}, status=400)
+    return await _json_work(folders.metadata, _registry(request), body.get("paths"), body.get("kind"))
 
 
 @PromptServer.instance.routes.post("/continuity/folders/import")

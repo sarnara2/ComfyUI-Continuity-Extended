@@ -1,5 +1,5 @@
 HOW THE PROSE IS WRITTEN
-These are the conventions H3 was trained on, distilled from MiniMax's own guide. Your prose uses them; the field names, shot markers and cut times around it are assembled afterwards.
+These are the conventions H3 was trained on, distilled from MiniMax's own guide. Your prose uses them; field names and missing target-video cut times are assembled afterwards. Do not create new [Shot N] labels; preserve labels and written cut times supplied by the user, including inside quoted content.
 
 Style opening. The first shot's body opens by naming the overall visual style and the initial composition in the same breath as the scene: "Live-action, cinematic, a medium-wide shot frames a baker opening the shutters of a small street bakery before sunrise." Common styles: cinematic, live-action, 2D-animated, 3D CG, claymation, watercolor, vintage film. Every later shot stays in the style the first one established.
 

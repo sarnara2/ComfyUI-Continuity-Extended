@@ -30,7 +30,8 @@ Object.assign(S, {
   takenHandles:state=>new Set((state.assets||[]).flatMap(asset=>[asset.handle,...(asset.panels||[]).map(p=>p.handle)])),
   nextHandle:state=>'ref-'+((state.assets?.length||0)+1), nextPoolHandle:state=>'ref-'+((state.assets?.length||0)+1),
   nextPreStageHandle:state=>'ref-'+((state.refs?.length||0)+1),
-  capacity:()=>({used:0,max:8,filesLeft:8}), refCaps:()=>({files:8}), isRefMod:asset=>asset.filename.startsWith('refmod:'),
+  capacity:()=>({used:0,max:8,filesLeft:8}), refCaps:()=>({files:8}),
+  isRefMod:new Function(`${constant('isRefMod')};return isRefMod;`)(),
   dropMods:asset=>delete asset.mods, sizeable:asset=>asset.role==='reference'&&['image','video'].includes(asset.kind)&&!S.isRefMod(asset),
   refSize:asset=>asset.ref_size||'max', subjectNotes:subject=>subject.notes||{}, subjectTriggers:subject=>subject.triggers||{},
   subjectFeatures:subject=>subject.features||[], serializeWears:()=>null, seedSubject:()=>{},
@@ -50,14 +51,18 @@ const Library = new Function('openPicker','CAST_REFERENCE_TAKES','referenceRole'
   ${method('presetlib','addFile')}
   async flushSave(){this.saved++;} renderSheet(){}
 };`)(openPicker,CAST_REFERENCE_TAKES,referenceRole);
-const P = new Function('S',`${fn('presets','storedFile')}\n${fn('presets','captureSubject')}\n${fn('presets','freeSubjectHandle')}
+const P = new Function('S',`${source.presets.match(/^const pick = [^]*?;\r?$/m)[0]}
+  ${fn('presets','storedFile')}\n${fn('presets','captureSubject')}\n${fn('presets','freeSubjectHandle')}
   const SUBJECT_SLOTS=['from','motion','voice','replaces'];
   ${fn('presets','addSubjectToPiece')}\nreturn {captureSubject,addSubjectToPiece};`)(S);
 const Shelf = new Function('S','ROLES','referenceRole','openMenu','el','icon','assetThumb','t',`
   ${source.cast.match(/^const inRole = [^]*?;\r?$/m)[0]}
+  const ROLE=Object.fromEntries(ROLES.map(role=>[role.key,role]));
   const LIST_ROLES=new Set(['from','motion','replaces']);
   return class {
-  ${['pickReference','addRole'].map(name=>method('cast',name)).join('\n')}
+  constructor(){this.referenceRequests=new WeakMap();}
+  renderSoon(){throw new Error(this.note?.text||'Unexpected cast action failure');}
+  ${['pickReference','referenceRequest','referenceActionGuard','attachReference','addRole'].map(name=>method('cast',name)).join('\n')}
 };`)(S,ROLES,referenceRole,(_anchor,options)=>{menu=options;},()=>({}),()=>({}),()=>({}),text=>text);
 // Both the live timeline window and the node body call this method.
 const Timeline = new Function('S','openPicker','CAST_REFERENCE_TAKES',`return class {
@@ -102,7 +107,9 @@ async function test(name, body){await body();passed++;process.stdout.write(`ok $
     assert.equal(referenceRole({kind:'video',takes:'edit'}),'replaces');
     assert.equal(referenceRole({kind:'video',takes:'continue'}),'replaces');
     assert.equal(referenceRole({kind:'video',takes:'edit',track:'sound'}),'voice');
-    assert.equal(referenceRole({kind:'image',takes:'edit'}),'from');
+    // Marked stills now identify a replacement target as well as edit videos.
+    // Preserve the current role contract rather than the old video-only rule.
+    assert.equal(referenceRole({kind:'image',takes:'edit'}),'replaces');
     assert.deepEqual(CAST_REFERENCE_TAKES.audio,['voice']);assert.ok(!CAST_REFERENCE_TAKES.video.includes('camera'));
   });
   await test('cast plus keeps every selected file and binds each matching role',async()=>{

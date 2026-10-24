@@ -42,6 +42,15 @@ function fixture(version) {
   const jsPath = path.join(sourceRoot, 'web/creator/presetlib.js');
   const source = read(jsPath);
   sourceHashes[`${sourceLabel}/web/creator/presetlib.js`] = hash(jsPath);
+  const viewPath = path.join(sourceRoot, 'web/creator/viewprefs.js');
+  const viewHelpers = fs.existsSync(viewPath) ? `
+    const {readViewPrefs,patchViewPrefs,clearViewPrefs,pickerViewContext,pickerViewKind}=(()=>{
+      ${read(viewPath).replace(/^export /gm, '')}
+      return {readViewPrefs,patchViewPrefs,clearViewPrefs,pickerViewContext,pickerViewKind};
+    })();
+    clearViewPrefs();
+  ` : '';
+  if (fs.existsSync(viewPath)) sourceHashes[`${sourceLabel}/web/creator/viewprefs.js`] = hash(viewPath);
   const names = ['mount', 'pool', 'folders', 'renderShelves', 'visible'];
   const methods = [...names.map((name) => method(source, name)), ...['scrollShelves', 'keyShelves'].map((name) => method(source, name, true))].join('\n');
   const css = ['base', 'picker', 'presets'].map((name) => {
@@ -54,6 +63,7 @@ function fixture(version) {
   return { css, code: `
     ${helper('el')}
     ${helper('mountOverlay')}
+    ${viewHelpers}
     const t = (text) => text;
     const P = { SCOPES: ['style'], SCOPE_LABEL: { style: 'Style' } };
     const SHELF_ALL = 'all', SHELF_FAV = 'fav';
@@ -73,7 +83,10 @@ function fixture(version) {
       }
     }
     window.subject = Object.assign(new Subject(), {
-      scope: 'style', query: '', shelf: 'all', gridRenders: 0, rows: [],
+      scope: 'style', query: '', viewQuery: '', shelf: 'all', gridRenders: 0, rows: [],
+      // This fixture supplies a fully arrived catalogue rather than calling
+      // readAtlas/load. Match that readiness so missing-shelf checks stay real.
+      rowsReady: true, atlasReady: true,
       styles: ${JSON.stringify(categories.map((folder, index) => ({ scope: 'style', folder, name: `Style ${index}`, starred: index === 0 })))}
     });
     window.wheelLog = [];

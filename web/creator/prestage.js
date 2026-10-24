@@ -54,6 +54,7 @@ import { loadCatalog, refreshCatalog, catalogByFolder, rememberedWeights,
 import { viewUrl, primeSettings } from "./api.js";
 import { editPicture, asPick, applyPick, cropLabel } from "./picture.js";
 import { t } from "./i18n.js";
+import { st } from "./sheet-locales.js";
 import * as S from "./state.js";
 
 const QUALITY_TITLE = {
@@ -111,10 +112,11 @@ export class PreStageEditor {
    * @param {() => string|number} options.nodeId
    */
   constructor({ state, onCommit, samplingWidgets, onWidgetChange, nodeId,
-                stage = null, archPill = null, presetTarget = null, clearTool = null }) {
+                stage = null, archPill = null, presetTarget = null, clearTool = null, sheetTool = null }) {
     // The body's, like the preset target: what Clear empties is the pre-stage
     // on both branches, and only the body knows both.
     this.clearTool = clearTool;
+    this.sheetTool = sheetTool;
     // Supplied by `PreStageBody` for the same reason the arch pill is: a preset
     // can change the architecture, and remounting the body is not something the
     // body being remounted can do.
@@ -433,6 +435,8 @@ export class PreStageEditor {
     if (blocked) { this.notice = blocked; this.render(); return null; }
     const room = S.preStageMaxRefs(this.state) - S.preStageCountedRefs(this.state).length;
     const chosen = await openPicker({
+      selectionPurpose: "prestage-cast-reference",
+      rememberSelection: false,
       kinds: ["image", "renders", "refmods"], kind: "image",
       aspect: this.pickerAspect(),
       plate: this.plateSpec(),
@@ -457,6 +461,7 @@ export class PreStageEditor {
     let pick = null;
     if (fromVideo) {
       const clip = await openPicker({
+        selectionPurpose: "prestage-init-video-frame",
         kinds: ["video", "renders"], kind: "video", single: true,
         aspect: this.pickerAspect(),
         plate: this.plateSpec(),
@@ -468,6 +473,7 @@ export class PreStageEditor {
       pick = { path: grabbed.path };
     } else {
       const chosen = await openPicker({
+        selectionPurpose: "prestage-init-image",
         kinds: ["image", "renders"], kind: "image", single: true,
         aspect: this.pickerAspect(),
         plate: this.plateSpec(),
@@ -494,6 +500,7 @@ export class PreStageEditor {
    */
   async contactSheet() {
     const chosen = await openPicker({
+      selectionPurpose: "prestage-contact-sheet",
       kinds: ["video", "image", "renders"], kind: "video", single: true,
       aspect: this.pickerAspect(),
       plate: this.plateSpec(),
@@ -522,6 +529,7 @@ export class PreStageEditor {
   /** A file for a screen to show — see `CreatorEditor.pickScreenContent`. */
   async pickScreenContent(kind = null) {
     const chosen = await openPicker({
+      selectionPurpose: "prestage-screen-content",
       kinds: ["image", "video", "renders"],
       kind: kind ?? "image",
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
@@ -539,6 +547,7 @@ export class PreStageEditor {
     const room = S.preStageMaxRefs(this.state) - S.preStageCountedRefs(this.state).length;
     if (fromVideo) {
       const clip = await openPicker({
+        selectionPurpose: "prestage-reference-video-frame",
         kinds: ["video", "renders"], kind: "video", single: true,
         aspect: this.pickerAspect(),
         plate: this.plateSpec(),
@@ -551,6 +560,7 @@ export class PreStageEditor {
       return this.commit();
     }
     const chosen = await openPicker({
+      selectionPurpose: "prestage-references",
       kinds: ["image", "renders"], kind: "image",
       aspect: this.pickerAspect(),
       plate: this.plateSpec(),
@@ -646,6 +656,7 @@ export class PreStageEditor {
    *  drawing, and a traced clip would be a question this render cannot ask. */
   async pickGuide() {
     const chosen = await openPicker({
+      selectionPurpose: "prestage-guide",
       kinds: ["guides", "image"], kind: "guides", only: "image", single: true,
       aspect: this.pickerAspect(),
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
@@ -659,6 +670,7 @@ export class PreStageEditor {
    *  a tracing arrives by one path whichever way the errand started. */
   async traceGuide() {
     const chosen = await openPicker({
+      selectionPurpose: "prestage-trace-guide",
       kinds: ["image", "renders"], kind: "image", only: "image", single: true,
       aspect: this.pickerAspect(),
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
@@ -728,6 +740,7 @@ export class PreStageEditor {
    *  prompt cites it by handle, and a re-add would renumber. */
   async replaceRef(ref) {
     const chosen = await openPicker({
+      selectionPurpose: "prestage-replace-reference",
       kinds: ["image", "renders"], kind: "image", only: "image", single: true,
       aspect: this.pickerAspect(),
       plate: this.plateSpec(),
@@ -1070,6 +1083,7 @@ export class PreStageEditor {
     // sibling of the next, which says nothing about which is which.
     return el("div", { class: "mmc-rail" }, [
       el("div", { class: "mmc-rail-group" }, [
+        ...(this.sheetTool?.() ?? []),
         tool(t("Init image"), "frameIn",
              t("Start from an image instead of noise — img2img. The strength pill says how much of it survives."),
              () => this.setInit(false)),
@@ -1911,13 +1925,15 @@ export class PreStageRow {
  * being switched.
  */
 export class PreStageBody {
-  constructor({ state, onCommit, samplingWidgets, onWidgetChange, nodeId, peer = null }) {
+  constructor({ state, onCommit, samplingWidgets, onWidgetChange, nodeId, peer = null, node = null }) {
     this.state = state;
     this.onCommit = onCommit;
     this.samplingWidgets = samplingWidgets;
     this.onWidgetChange = onWidgetChange;
     this.nodeId = nodeId;
     this.peer = peer;
+    this.node = node;
+    this.destroyed = false;
 
     this.stage = new Stage({
       nodeId: this.nodeId,
@@ -1930,6 +1946,8 @@ export class PreStageBody {
   }
 
   destroy() {
+    this.destroyed = true;
+    this.sheetRoom?.close();
     this.editor?.destroy();
     this.stage?.destroy();
   }
@@ -1978,6 +1996,7 @@ export class PreStageBody {
       archPill: () => this.renderArchPill(),
       presetTarget: () => this.presetTarget(),
       clearTool: () => [this.clearTool()],
+      sheetTool: () => [this.renderSheetTool()],
     });
   }
 
@@ -2016,6 +2035,9 @@ export class PreStageBody {
       // shot face. Forwarding to the node alone left the rail's Clear stale
       // until something else redrew it.
       onCommit: () => this.commit(),
+      // Prompt-only apply/Revert must not settle LoRA pins by redrawing the
+      // whole editor. The node still serializes, and the shell may resize.
+      onPromptCommit: () => { this.onCommit?.(); this.onRender?.(); },
       // A still on H3 is H3's: what the family always wears, it wears here.
       pinFamily: () => S.preStageFamilyId(S.PRESTAGE_STILL_ARCH),
       samplingWidgets: this.samplingWidgets,
@@ -2035,7 +2057,7 @@ export class PreStageBody {
       // stay where a video's duration would be, because that is what they say.
       modelPill: () => [this.renderArchPill()],
       extraPills: () => this.renderStillPills(),
-      extraTools: () => [this.renderFrameGrabTool()],
+      extraTools: () => [this.renderSheetTool(), this.renderFrameGrabTool()],
       clearTool: () => [this.clearTool()],
       // The `@` menu's roster, exactly as the video face wires it — a still on
       // this branch is a video generation, and the request is the piece a
@@ -2233,6 +2255,20 @@ export class PreStageBody {
 
   // ---- the rest of the rail --------------------------------------------------
 
+  renderSheetTool() {
+    return el("button", {
+      class: "mmc-tool", title: st("Character sheets use separate settings and do not change PreStage."),
+      onclick: async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          const { openSheet } = await import("./sheet.js");
+          if (!this.destroyed && this.node?.graph) this.sheetRoom = openSheet({ node: this.node, peer: this.peer });
+        } finally { button.disabled = false; }
+      },
+    }, [el("span", { class: "mmc-tool-icon" }, [icon("gallery")]), el("span", { text: st("Character sheets") })]);
+  }
+
   /** Not on the Creator's rail, because the Creator has this node. Here it is
    *  the only way to turn a moment of a clip into a keyframe. */
   renderFrameGrabTool() {
@@ -2249,6 +2285,7 @@ export class PreStageBody {
     const blocked = S.blockedReason(request, "first_frame");
     if (blocked) return;
     const clip = await openPicker({
+      selectionPurpose: "prestage-still-video-frame",
       kinds: ["video", "renders"], kind: "video", single: true,
       aspect: this.pickerAspect(),
       plate: this.plateSpec(),

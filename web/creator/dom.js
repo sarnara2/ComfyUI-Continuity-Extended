@@ -388,12 +388,15 @@ export function closeOwnedPopovers(root) {
   for (const node of [...closing].reverse()) popoverClosers.get(node)?.();
 }
 
-/** Close-on-outside-click / Escape, shared by every popover. */
-export function dismissable(node, onClose) {
+/** Close-on-outside-click / Escape, shared by every popover. A caller may
+ *  suspend user dismissal while its own nested viewer owns those gestures;
+ *  explicit cleanup still works, and ordinary callers keep the same behavior. */
+export function dismissable(node, onClose, { suspended = () => false } = {}) {
   floatAbove(node);
   let closed = false;
   let pending;
   const away = (event) => {
+    if (suspended()) return;
     if (node.contains(event.target)) return;
     // A popover opened from this one — a choice list under a row of the gear
     // or the weights popover — is mounted on <body> after it, not inside it.
@@ -407,7 +410,7 @@ export function dismissable(node, onClose) {
   const key = (event) => {
     // A popover with something to clear first — a find line holding a query —
     // says so on itself, and Escape is its to answer this once.
-    if (event.key === "Escape" && node.dataset.holdEscape !== "1") { event.stopPropagation(); close(); }
+    if (event.key === "Escape" && !suspended() && node.dataset.holdEscape !== "1") { event.stopPropagation(); close(); }
   };
   function close() {
     if (closed) return;

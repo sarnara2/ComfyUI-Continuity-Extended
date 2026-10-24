@@ -99,6 +99,15 @@ check("a null autoplay setting is the default",
       settings.clean({"autoplay_previews": None})["autoplay_previews"], True)
 refuses("an autoplay setting that is not a boolean", {"autoplay_previews": "yes"}, "true or false")
 
+check("preview audio is muted by default", settings.clean({})["preview_audio"], "muted")
+check("null preview audio keeps the default",
+      settings.clean({"preview_audio": None})["preview_audio"], "muted")
+for value in ("muted", "hover"):
+    check(f"preview audio preserves {value}",
+          settings.clean({"preview_audio": value})["preview_audio"], value)
+for value in (True, False, 0, 1, "always", "", [], {}):
+    refuses(f"invalid preview audio {value!r}", {"preview_audio": value}, "must be one of")
+
 # Card labels retain the model metadata unless the user explicitly opts out.
 check("LoRA cards use model metadata by default", settings.clean({})["lora_skip_metadata"], False)
 check("a null LoRA metadata setting keeps the default",
@@ -326,6 +335,13 @@ REFINER = {"backend": "remote", "model": "qwen3vl_4b.safetensors",
            "skillModes": {"noir": "add"}, "templates": {"h3": "REF2VA"}}
 check("an empty refiner block is the default", settings.clean({})["refiner"], {})
 check("a refiner block is stored whole", settings.clean({"refiner": REFINER})["refiner"], REFINER)
+for value in (True, False):
+    check(f"reference image analysis preserves {value}",
+          settings.clean({"refiner": {**REFINER, "reference_images": value}})["refiner"],
+          {**REFINER, "reference_images": value})
+for value in (0, 1, "true", "false", [], {}):
+    refuses(f"reference image analysis rejects {value!r}",
+            {"refiner": {"reference_images": value}}, "true or false")
 check("a key this build has never heard of is dropped",
       settings.clean({"refiner": {**REFINER, "url": "http://x"}})["refiner"], REFINER)
 refuses("a backend that is neither", {"refiner": {"backend": "cloud"}}, "one of local, remote")
@@ -336,6 +352,29 @@ refuses("a template table that is not names", {"refiner": {"templates": {"h3": 1
 refuses("a refiner that is not an object", {"refiner": "local"}, "must be an object")
 
 # ---- the file -----------------------------------------------------------------
+
+with tempfile.TemporaryDirectory() as directory:
+    settings.path = lambda: os.path.join(directory, settings.FILE)
+    settings.save({"preview_audio": "hover", "autoplay_previews": False})
+    check("hover audio persists across reload", settings.load()["preview_audio"], "hover")
+    check("audio choice leaves autoplay independent", settings.load()["autoplay_previews"], False)
+    settings.save({"video_crf": 18})
+    check("unrelated setting preserves audio mode", settings.load()["preview_audio"], "hover")
+    settings.save({"preview_audio": "muted"})
+    check("muted audio persists across reload", settings.load()["preview_audio"], "muted")
+    check("changing audio still leaves autoplay alone", settings.load()["autoplay_previews"], False)
+
+with tempfile.TemporaryDirectory() as directory:
+    settings.path = lambda: os.path.join(directory, settings.FILE)
+    settings.save({"refiner": {**REFINER, "reference_images": False}})
+    check("disabled image analysis survives settings reload", settings.load()["refiner"],
+          {**REFINER, "reference_images": False})
+    settings.save({"video_crf": 18})
+    check("unrelated changes keep image analysis disabled",
+          settings.load()["refiner"]["reference_images"], False)
+    settings.save({"refiner": {**REFINER, "reference_images": True}})
+    check("re-enabled image analysis survives settings reload",
+          settings.load()["refiner"]["reference_images"], True)
 
 with tempfile.TemporaryDirectory() as directory:
     settings.path = lambda: os.path.join(directory, settings.FILE)

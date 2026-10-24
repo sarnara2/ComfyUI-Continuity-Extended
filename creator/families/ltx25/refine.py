@@ -290,8 +290,7 @@ def system_prompt(mode, language="English", shape=None, extra=""):
     it must take is the strongest anti-chat pairing the prompt has.
     """
     parts = [_RULES]
-    if language and language != "English":
-        parts.append(_LANGUAGE_RULE.format(language=language))
+    parts.append(_LANGUAGE_RULE.format(language=language or "English"))
     parts.append(f"MODE\nThis request is {mode}. {MODE_NOTES[mode]}")
     parts.append(CRAFT)
     parts.append(MULTISHOT)

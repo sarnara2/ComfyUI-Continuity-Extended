@@ -453,6 +453,7 @@ class Lift {
 
   async browse(side) {
     const chosen = await openPicker({
+      selectionPurpose: side === "back" ? "lift-back" : "lift-front",
       kinds: ["image", "renders", "meshes"], kind: "image", single: true,
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
     });
@@ -833,7 +834,7 @@ class Lift {
   /** The shelf, in the picker, on its Meshes tab. */
   async openShelf() {
     if (this.running) return;
-    const chosen = await openPicker({ kinds: ["meshes"], kind: "meshes", single: true });
+    const chosen = await openPicker({ selectionPurpose: "lift-mesh-shelf", kinds: ["meshes"], kind: "meshes", single: true });
     const row = chosen?.[0];
     if (row && this.overlay.isConnected) this.openMesh(row);
   }

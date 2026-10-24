@@ -65,12 +65,15 @@ MEDIA_KINDS = {
     ".mp4": "video", ".webm": "video", ".mov": "video", ".mkv": "video",
 }
 
-# Which media wins when a file has several. Video first: an H3 LoRA showcases
-# clips, and a card that can play one should, rather than settle for whichever
-# still happened to sort first. Within each kind, the smaller formats lead.
+# Which media wins when a file has several. Prefer motion-capable companions so
+# a card keeps its moving preview when a still cover was also saved beside the
+# LoRA. GIF and WebP are served as images (and animate natively); video files
+# are served as muted, looping videos by the browser. Only after those do still
+# covers win, with PNG/JPEG ahead of the less common image formats.
 PREVIEW_ORDER = [
     ".mp4", ".webm", ".mov", ".mkv",
-    ".webp", ".png", ".jpg", ".jpeg", ".gif", ".avif", ".jxl", ".bmp",
+    ".gif", ".webp",
+    ".png", ".jpg", ".jpeg", ".avif", ".jxl", ".bmp",
 ]
 
 # Every tool in this file writes a stub or a zero-length file at some point —
@@ -271,15 +274,26 @@ class Probe:
 
         The model's own stat plus every companion's, so adding a sidecar, or
         editing one the scan has since re-read, invalidates the row. Companion
-        mtimes come from the scan and cost nothing extra here.
+        mtimes come from the scan and cost nothing extra here. CiviMeta's cover
+        can also change inside its media folders without changing the sidecar
+        folder itself; use those cached scans, not media reads, for that part.
         """
         try:
             stat = os.stat(self.path)
             own = (stat.st_mtime, stat.st_size)
         except OSError:
             own = None
+        covers = []
+        sidecar = self.folder(self.ext + CIVIMETA_SUFFIX)
+        if sidecar:
+            for name in CIVIMETA_PREVIEW_DIRS:
+                scan = _scan(os.path.join(sidecar, name))
+                covers.append((name, None if scan is None else (
+                    scan.mtime, tuple((key, scan.entries[key].mtime,
+                                       scan.entries[key].size, scan.entries[key].is_dir)
+                                      for key in scan.keys))))
         return (own, tuple(sorted((key, entry.mtime, entry.size)
-                                  for key, entry in self.rest.items())))
+                                  for key, entry in self.rest.items())), tuple(covers))
 
     def header(self, deep=False):
         """The safetensors header, read at most once per probe.
@@ -648,6 +662,45 @@ def _from_civimeta(probe, deep):
     # The directory existing is itself the claim that CiviMeta identified this
     # file, so an empty record still counts as this provider having spoken.
     return record or {}
+
+
+def _civimeta_animated_original(sidecar, name):
+    """Keep this cover's motion when its generated thumbnail is a still."""
+    directory = os.path.join(sidecar, "media")
+    scan = _scan(directory)
+    if scan is None:
+        return None
+    stem = os.path.splitext(name)[0]
+    root = os.path.realpath(sidecar)
+    for extension in PREVIEW_ORDER:
+        if MEDIA_KINDS[extension] != "video" and extension not in (".gif", ".webp"):
+            continue
+        candidate = scan.get(stem + extension)
+        if candidate is None or candidate.is_dir:
+            continue
+        path = os.path.join(directory, candidate.name)
+        try:
+            if os.path.commonpath([root, os.path.realpath(path)]) != root:
+                continue
+        except ValueError:
+            continue
+        entry = _media(path, candidate.size)
+        if entry is None:
+            continue
+        if entry["kind"] == "video":
+            return entry
+        try:
+            with open(path, "rb") as handle:
+                header = handle.read(30)
+        except OSError:
+            continue
+        if extension == ".gif" and header[:6] in (b"GIF87a", b"GIF89a"):
+            return entry
+        if (extension == ".webp" and len(header) == 30
+                and header[:4] == b"RIFF" and header[8:16] == b"WEBPVP8X"
+                and header[16:20] == b"\x0a\x00\x00\x00" and header[20] & 0x02):
+            return entry
+    return None
 
 
 def _civimeta_preview(sidecar):
@@ -1360,7 +1413,12 @@ def _card_preview(probe, record=None):
             return found
     if record is None:
         record = describe(probe)
-    return record.get("preview")
+    preview = record.get("preview")
+    sidecar = probe.folder(probe.ext + CIVIMETA_SUFFIX)
+    if sidecar and preview and preview.get("path") and os.path.normcase(
+            os.path.dirname(preview["path"])) == os.path.normcase(os.path.join(sidecar, "thumbnails")):
+        return _civimeta_animated_original(sidecar, os.path.basename(preview["path"])) or preview
+    return preview
 
 
 def row(name, path):

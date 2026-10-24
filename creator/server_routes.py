@@ -27,6 +27,7 @@ it runs the real compiler to do it — see the route.
 import asyncio
 import json
 import os
+import re
 
 from aiohttp import web
 
@@ -36,6 +37,7 @@ from server import PromptServer
 from . import (assets, compile as compiler, crop as framing, latents, lift, lorameta, media,
                models, refmod, preview, settings, vdn)
 from .guard import same_origin
+from .families import registry
 from .screens import spec as screen_spec
 
 # The picker builds its grid lazily and paginates, so the cap only bounds the
@@ -784,6 +786,101 @@ async def clear_latent_cache(request):
 COMPILE_FAILURES = (compiler.CompileError, ValueError, KeyError, TypeError, IndexError)
 
 
+def compiled_tag_bindings(compiled, bindings, prompt=None):
+    """Display-only model labels and the exact sources this pass carries."""
+    attached = [*compiled.ref_images, *compiled.ref_videos, *compiled.ref_audios,
+                *[a for a in (compiled.first_frame, compiled.last_frame) if a is not None]]
+    by_handle = {part.handle: part for asset in attached for part in (asset, *asset.panels)}
+    panel_owners = {panel.handle: asset.handle for asset in attached for panel in asset.panels}
+    original_assets = bindings.get("assets", {})
+    original_subjects = bindings.get("subjects", {})
+    tags = {}
+
+    def files(handle, soundtrack=False):
+        asset = by_handle.get(handle)
+        if asset is None or not asset.filename:
+            return []
+        originals = original_assets.get(handle) or [asset]
+        out = []
+        for original in originals:
+            row = compiler._asset_dict(asset)
+            row["handle"] = original.handle
+            for key in ("description", "usage_rules"):
+                row.pop(key, None)
+            if original.panels:
+                row["panels"] = [compiler._panel_dict(panel) for panel in original.panels]
+            if original.replacement_origin:
+                row["replacement_origin"] = dict(original.replacement_origin)
+            if handle in panel_owners:
+                owner = panel_owners[handle]
+                parents = original_assets.get(owner) or [by_handle[owner]]
+                parent = next((a for a in parents if any(p.handle == original.handle and
+                              p.filename == original.filename for p in a.panels)), None)
+                if parent is not None:
+                    row["parent_handle"] = parent.handle
+            if soundtrack:
+                row["track"] = "sound"
+            out.append(row)
+        return out
+
+    for handle, label in compiled.labels.items():
+        soundtrack = handle.endswith(":audio")
+        source_handle = handle[:-6] if soundtrack else handle
+        sources = files(source_handle, soundtrack)
+        row = tags.setdefault(label, {"label": label, "handles": [], "assets": []})
+        for source in sources:
+            if source["handle"] not in row["handles"]:
+                row["handles"].append(source["handle"])
+            if source not in row["assets"]:
+                row["assets"].append(source)
+        if not sources:
+            row["reason"] = "generated" if source_handle == compiler.STORYBOARD_HANDLE else "unbound"
+
+    for subject in compiled.cast:
+        label = compiled.subject_labels[subject.handle]
+        row = {"label": label, "handles": list(original_subjects.get(subject.handle) or [subject.handle]),
+               "assets": []}
+        claims = [(handle, "appearance") for handle in subject.sources]
+        claims += [(handle, "motion") for handle in subject.motion]
+        claims += [(subject.voice, "voice")] if subject.voice else []
+        claims += [(handle, "replacement") for handle in subject.replaces]
+        for handle, purpose in claims:
+            for source in files(handle):
+                existing = next((old for old in row["assets"]
+                                 if {key: value for key, value in old.items() if key != "purposes"} == source), None)
+                if existing is None:
+                    row["assets"].append({**source, "purposes": [purpose]})
+                elif purpose not in existing["purposes"]:
+                    existing["purposes"].append(purpose)
+        if not row["assets"]:
+            row["reason"] = "no_media"
+        tags[label] = row
+
+    text = compiled.prompt if prompt is None else prompt
+    reference_mode = bool(compiled.plan)
+    generated = set()
+    if not reference_mode:
+        head = bool(compiled.first_frame) or (compiled.continues and
+                                             (compiled.feather == 1 or compiled.feather_pin))
+        if compiled.continues and (compiled.feather == 1 or compiled.feather_pin):
+            generated.add("<Picture 1>")
+        if compiled.ends_on and (compiled.ends_feather == 1 or compiled.ends_feather_pin):
+            generated.add("<Picture 2>" if head else "<Picture 1>")
+        if compiled.continues_audio and compiled.feather == 1:
+            generated.add("<Audio 1>")
+    for label in re.findall(r"<(?:Picture|Image|Video|Audio|Sound|Subject)\s+\d+>", text):
+        if label not in tags:
+            tags[label] = {"label": label, "handles": [], "assets": [],
+                           "reason": "generated" if label in generated else "unbound"}
+    # FL2VA's automatic alignment sentence uses bare Picture N labels.
+    for label, row in list(tags.items()):
+        if label.startswith("<Picture ") and label.endswith(">"):
+            bare = label[1:-1]
+            if re.search(r"(?<![<\w])" + re.escape(bare) + r"(?![>\w])", text):
+                tags[bare] = {**row, "label": bare}
+    return list(tags.values())
+
+
 def compiled_passes(blob, seed=None):
     """The prompt each pass of `blob` will read: `{"passes": [...], "cards": {...}}`.
 
@@ -809,12 +906,19 @@ def compiled_passes(blob, seed=None):
     # The screens' trackers as this machine draws them, which is what the node
     # will stamp on before it compiles (`creator_node._render`).
     blob = screen_spec.stamp_piece(compiler.as_piece(blob), settings.screen_tracker())
-    payloads = compiler.timeline_payloads(blob, media.image_size)
+    reference_bindings = []
+    payloads = compiler._timeline_payloads(blob, media.image_size, reference_bindings)
     # Which pass each card ended up in. A run of merged cards is one
     # generation with one prompt, so the box has to be able to ask "the pass
     # holding card 4" rather than "pass 4" — they are only the same number
     # on a strip nothing merged.
     piece = compiler.as_piece(blob)
+    # Match emit's standing route before compiling: it overrides per-card pins
+    # and inferred modes, including the LoRA filter and its trigger words. No
+    # models are loaded here; only the shared Weights routing policy is used.
+    weights = models.Weights.from_blob(piece, {},
+                                      routes=registry.ROUTED.get(compiler.piece_family(piece), ()))
+    payloads = [weights.routed(payload) for payload in payloads]
     segments = compiler.timeline_segments(piece)
     runs = compiler.timeline_runs(piece, segments)
     card_pass = {}
@@ -828,9 +932,11 @@ def compiled_passes(blob, seed=None):
             # Supplied footage. There is nothing to compile and nothing the
             # model reads, and saying so is better than showing an empty box.
             passes.append({"index": index, "clip": True, "prompt": "",
-                           "mode": "", "checkpoint": ""})
+                           "mode": "", "checkpoint": "", "tags": []})
             continue
-        compiled = compiler.compile_segment(payload, media.image_size)
+        compiled = compiler.compile_segment(payload, media.image_size,
+                                            family=compiler.piece_family(blob))
+        prompt = payload.get("prompt_override") or compiled.prompt
         passes.append({
             "index": index,
             "clip": False,
@@ -840,8 +946,14 @@ def compiled_passes(blob, seed=None):
             # and `timeline.py` swaps it in after compiling. What the model
             # reads is the override where there is one, so that is what the
             # box has to show.
-            "prompt": payload.get("prompt_override") or compiled.prompt,
+            "prompt": prompt,
+            "base_prompt": compiled.prompt,
+            "prompt_binding": compiler.prompt_binding(compiled),
+            "loras": compiler.active_loras(payload["request"].get("loras"), compiled.checkpoint,
+                                           compiler.piece_family(blob)),
+            "tags": compiled_tag_bindings(compiled, reference_bindings[index], prompt),
             "overridden": bool(payload.get("prompt_override")),
+            **({"warnings": list(compiled.warnings)} if getattr(compiled, "warnings", None) else {}),
         })
     return {"passes": passes, "cards": card_pass}
 

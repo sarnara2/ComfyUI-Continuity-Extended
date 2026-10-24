@@ -16,6 +16,7 @@ compiler = layout.load("canvas", "contextir", "subjects", "compile").compile
 
 SCRIPT = r'''
 const S = await import('./web/creator/state.js');
+const { t } = await import('./web/creator/i18n.js');
 const { WearsPanel } = await import('./web/creator/wears.js');
 const { castFamilies } = await import('./web/creator/refmod.js');
 const family = castFamilies('h3', '')[0];
@@ -33,8 +34,9 @@ function choose(state, who, label) {
   panel.sendMenu(document.createElement('button'), member, family,
     S.castAssets(state).filter(a=>member.from.includes(a.handle)));
   const button = [...document.querySelectorAll('.mmc-opt')].find(b =>
-    b.querySelector('.mmc-cast-menu-text')?.children[0]?.textContent===label);
-  if (!button) throw new Error('Menu choice missing: '+label);
+    b.querySelector('.mmc-cast-menu-text')?.children[0]?.textContent===t(label));
+  if (!button) throw new Error('Menu choice missing: '+label+'; options: '+JSON.stringify(
+    [...document.querySelectorAll('.mmc-opt')].map(b => b.querySelector('.mmc-cast-menu-text')?.children[0]?.textContent)));
   button.listeners.click[0]();
 }
 const out = {};

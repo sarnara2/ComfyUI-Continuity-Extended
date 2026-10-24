@@ -179,14 +179,56 @@ class LTX25Grammar(grammar.Grammar):
         refined still sends. The alternative is what the family did before —
         a caption naming `panel 1` with nothing anywhere saying what panel 1 is.
 
-        Empty where there is no sheet, which is what keeps a card with no
-        references composing exactly the caption it did before this existed.
+        Cast labels are defined separately as ordinary caption prose, including
+        words-only members. Their sources name the actual panels above; a bare
+        `<Subject N>` cannot tell this encoder which pictured person is meant.
+        Empty where there is neither a sheet nor a cast, keeping ordinary
+        captions unchanged.
         """
-        if not plan:
-            return {}
-        from . import sheet
-
-        return {"reference_sheet": sheet.describe(plan, cast)}
+        sections = {}
+        if plan:
+            from . import sheet
+            sections["reference_sheet"] = sheet.describe(plan, cast)
+        definitions = []
+        subject_labels = rest.get("subject_labels") or compiler.subjects.labels(cast)
+        nouns = {"person": "the person", "object": "the object",
+                 "scene": "the environment", "style": "the visual style"}
+        for index, subject in enumerate(cast):
+            label = subject_labels.get(subject.handle, f"<Subject {index + 1}>")
+            description = subject.description.rstrip(".") or nouns[subject.takes]
+            sources = [labels[handle] for handle in subject.sources if handle in labels]
+            if sources:
+                description += " shown in " + ", ".join(sources)
+            features = [feature.text for feature in subject.features if feature.text]
+            if features:
+                description += ", with " + ", ".join(features)
+            if not subject.description and not sources and not features and subject.lora_words:
+                description += ", " + ", ".join(subject.lora_words)
+            definitions.append(f"{label} is {description}.")
+        if definitions:
+            sections["subject_definitions"] = "\n\n".join(definitions)
+        annotations = rest.get("reference_annotations") or ()
+        descriptions, usage = [], []
+        for row in annotations:
+            reference = row.get("label") or labels.get(row["handle"])
+            if not reference:
+                continue
+            scope = compiler.contextir.target_scope(row.get("intervals"))
+            if row.get("description"):
+                descriptions.append((scope + ":\n" if scope else "") +
+                                    f"{reference}: {row['description']}")
+            if row.get("usage_rules"):
+                usage.append((scope + ":\n" if scope else "") +
+                             f"For {reference}:\n{row['usage_rules']}")
+        if descriptions:
+            sections["reference_sheet"] = compiler.contextir.join_paragraphs(
+                sections.get("reference_sheet"), *descriptions)
+        if usage:
+            sections["subject_definitions"] = compiler.contextir.join_paragraphs(
+                sections.get("subject_definitions"), *usage)
+        bindings = {**labels, **subject_labels}
+        return {name: compiler.subjects.bound_text(text, bindings)
+                for name, text in sections.items()}
 
     def compose(self, *, body, soundscape, music, sections, **rest):
         """The caption. Two-part where there is a sheet, plain where there is not.
@@ -201,7 +243,9 @@ class LTX25Grammar(grammar.Grammar):
         refined one wins — `compile_request` merges the rewrite over what
         `sections` above derived, and this composes whichever survived.
         """
-        video = compiler.plain_prompt(body, soundscape, music)
+        definitions = str((sections or {}).get("subject_definitions") or "").strip()
+        video = compiler.plain_prompt(
+            "\n\n".join(part for part in (definitions, body) if part), soundscape, music)
         panels = str((sections or {}).get("reference_sheet") or "").strip()
         if not panels:
             return video

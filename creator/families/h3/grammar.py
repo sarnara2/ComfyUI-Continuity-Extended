@@ -12,11 +12,11 @@ family when they were written. They are H3's:
   twice, so this is a real routing rule and not a naming one; `compile.py`
   still honours a pin against it, which is the thing the *user* may know that
   this cannot.
-- **Context-IR.** H3-Base was trained on H3-Context-IR's output rather than on
-  sentences, so the field names, the ordering, the `[Shot 1]` marker and the
-  `S.SS` alignment line are the difference between in- and out-of-distribution.
-  `contextir.compose` only ever *adds* what is absent, so a hand-written or
-  refined prompt carrying its own sections comes through untouched.
+- **Context-IR.** H3-Base was trained on H3-Context-IR's structured output.
+  This editor retains its field ordering, reference bindings and real cut
+  times without automatically inserting Shot labels. User-written Shot
+  labels remain prose. Independently owned rules are composed once with
+  their paragraph boundaries and applicability preserved.
 """
 
 from ... import canvas
@@ -72,41 +72,67 @@ class H3Grammar(grammar.Grammar):
         entry.
         """
         claimed = subjects.claimed(cast)
+        annotations = rest.get("reference_annotations") or ()
+        owners = {handle: subject_labels[subject.handle]
+                  for subject in cast for handle in subject.files}
+        descriptions = contextir.annotation_lines(annotations, labels, "description", owners)
+        usage = contextir.annotation_lines(annotations, labels, "usage_rules")
         # Which clip's occupant each cast member stands in for. The clip is not
         # among the subject's own files — its content is kept, so it holds its
         # `<Video N>` line — and that line is where the swap has to be scoped,
         # or the generic edit line claims the occupant stays.
         replaced = {}
+        identification_handles = set()
+        assets = {step["asset"].handle: step["asset"] for step in (plan or ())}
         for subject in cast:
             for handle in subject.replaces:
+                asset = assets.get(handle)
+                identification = bool(asset and (asset.kind == "image" or
+                    (subject.replacement_reference_only and asset.takes != "edit")))
+                if identification:
+                    identification_handles.add(handle)
                 replaced.setdefault(handle, []).append(
-                    (subject_labels[subject.handle], subject.replaces_what))
+                    (subject_labels[subject.handle], subject.replaces_what, identification,
+                     (rest.get("subject_scopes") or {}).get(subject.handle),
+                     (rest.get("target_scopes") or {}).get(subject.handle)))
         derived = {}
         if cast:
             derived["subject_definitions"] = subjects.definitions(
                 cast, labels,
                 contextir.reference_lines(plan, skip=claimed,
-                                          replaced=replaced) if plan else (),
+                                          replaced=replaced, annotations=annotations) + descriptions
+                if plan else descriptions,
                 # The compiler allocated these off the prose before it
                 # substituted them away — see `subjects.speakers`. The voice
                 # line here and the `(Sx)` in the body have to be the same
                 # number, and by now the body no longer says which.
-                ids=speaker_ids)
-            derived["retention_analysis"] = "\n".join(
-                [subjects.retention(cast, labels, body)]
+                ids=speaker_ids, reference_annotations=annotations)
+            derived["retention_analysis"] = "\n\n".join(
+                [subjects.retention(cast, labels, body, identification_handles,
+                                    rest.get("subject_scopes"),
+                                    explicit_rules=rest.get("explicit_rules"),
+                                    target_scopes=rest.get("target_scopes"),
+                                    reference_annotations=annotations)]
                 + contextir.retention_lines(plan, skip=claimed, body=body,
-                                            replaced=replaced)).strip()
+                                            replaced=replaced,
+                                            scopes=rest.get("reference_scopes"),
+                                            target_scopes=rest.get("target_scopes"),
+                                            annotations=annotations) + usage).strip()
         elif plan:
-            derived["subject_definitions"] = "\n".join(
-                contextir.reference_lines(plan))
-            derived["retention_analysis"] = "\n".join(
-                contextir.retention_lines(plan, body=body))
+            derived["subject_definitions"] = "\n\n".join(
+                contextir.reference_lines(plan, annotations=annotations) + descriptions)
+            derived["retention_analysis"] = "\n\n".join(
+                contextir.retention_lines(plan, body=body,
+                                         scopes=rest.get("reference_scopes"),
+                                         target_scopes=rest.get("target_scopes"),
+                                         annotations=annotations) + usage)
         if derived:
             derived["summary"] = contextir.summary(
                 plan, cast, subject_labels, labels,
                 shots=max(int(shots or 1), contextir.count_shots(body)),
-                has_frames=framed)
-        return derived
+                has_frames=framed, target_scopes=rest.get("target_scopes"))
+        bindings = {**labels, **subject_labels}
+        return {name: subjects.bound_text(text, bindings) for name, text in derived.items()}
 
     def count_shots(self, body, cards):
         """Counted off the text: `[Shot N]` markers are in it, and a card may
@@ -134,7 +160,13 @@ class H3Grammar(grammar.Grammar):
             preamble=self._preamble(encode_mode, labels, first_frame,
                                     last_frame, seconds, shots, audio_seam),
             shots=max(int(shots or 1), contextir.count_shots(body)),
-            sections=sections)
+            sections=sections,
+            audio_reuse=bool(any(row.get("usage_rules") for row in
+                                rest.get("reference_annotations") or ())
+                             and "audio reuse" in contextir.task_types(rest.get("plan") or (),
+                                 edited={handle for subject in rest.get("cast") or ()
+                                         if not subject.replacement_reference_only
+                                         for handle in subject.replaces})))
 
     def _preamble(self, encode_mode, labels, first_frame, last_frame, seconds,
                   shots, audio_seam):

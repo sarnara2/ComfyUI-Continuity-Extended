@@ -171,10 +171,13 @@ check("the request text closes the message", message.endswith("the door opens"),
 check("no attachments is said outright",
       "No images, videos or audio are attached." in skill.user_message({"text": "hi"}), True)
 check("a language other than English is asked for",
-      "Write the prose and any dialogue in German." in
+      "Write descriptive prose in German, translating the request where needed." in
       skill.user_message({"text": "hi"}, language="German"), True)
-check("English is the default and goes unsaid",
-      "Write the prose" in skill.user_message({"text": "hi"}, language="English"), False)
+check("English is explicit for a translated request",
+      "Write descriptive prose in English, translating the request where needed." in
+      skill.user_message({"text": "고양이가 잠든다."}, language="English"), True)
+check("an absent language still explicitly defaults to English",
+      "Write descriptive prose in English" in skill.user_message({"text": "고양이가 잠든다."}), True)
 
 # ---- the reply --------------------------------------------------------------
 

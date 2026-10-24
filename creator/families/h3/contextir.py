@@ -9,7 +9,8 @@ fixed:
 
     <mode instruction line>
 
-    integrated_multimodal_description: [Shot 1] ...
+    integrated_multimodal_description:
+    ...
 
     overall_soundscape: ...
 
@@ -277,7 +278,7 @@ def storyboard_becomes(asset):
     return asset.carries or STORYBOARD_BECOMES[storyboard_hold(asset)]
 
 
-def reference_lines(plan, skip=(), replaced=None):
+def reference_lines(plan, skip=(), replaced=None, annotations=()):
     """`compile.plan_references`'s walk -> the lines that define its labels.
 
     One line per label, in the order the tokenizer is shown them, so the prose
@@ -295,6 +296,9 @@ def reference_lines(plan, skip=(), replaced=None):
     # so the clip's own label is looked up rather than carried forward.
     video_label = {step["asset"].handle: step["label"]
                    for step in plan if step["op"] == "video"}
+    ruled = {row["handle"] for row in annotations if row.get("usage_rules")}
+    ruled.update(step["asset"].handle for step in plan
+                 if any(panel.handle in ruled for panel in step["asset"].panels))
     lines = []
     for step in plan:
         asset, label = step["asset"], step["label"]
@@ -307,11 +311,23 @@ def reference_lines(plan, skip=(), replaced=None):
             continue
         if asset.handle in skip:
             continue
+        swaps = (replaced or {}).get(asset.handle)
+        if swaps and _identification_only(asset, swaps):
+            lines.append(f"{label} is a replacement-target identification reference. "
+                         "It locates the person or object to change in the source video; "
+                         "its scene, camera, pose, motion and colored annotations are not "
+                         "content to reproduce in the target video.")
+            continue
         # A clip somebody is replaced in is an edit source whatever its chip
         # says — `retention_lines` and `summary` treat it as one, and a
         # definition calling it "a reference video" would be the odd voice out.
-        if asset.kind == "video" and asset.handle in (replaced or {}):
+        if (asset.kind == "video" and asset.handle in (replaced or {})
+                and not _identification_only(asset, replaced[asset.handle])):
             lines.append(_DEFINE[("video", "edit")] % label)
+            continue
+        if asset.handle in ruled and asset.role == "reference":
+            noun = {"image": "picture", "video": "video", "audio": "audio clip"}[_kind(asset)]
+            lines.append(f"{label} is a reference {noun}.")
             continue
         line = _define(asset, label)
         if line:
@@ -438,7 +454,75 @@ def _kind(asset):
     return "audio" if (asset.kind == "audio" or asset.track == "sound") else asset.kind
 
 
-def retention_lines(plan, skip=(), body="", replaced=None):
+def _identification_only(asset, swaps):
+    return asset.kind == "image" or (asset.takes != "edit" and swaps
+        and all(len(swap) > 2 and swap[2] for swap in swaps))
+
+
+def replacement_target(text):
+    value = re.sub(r"[.!?]+(?=\s*,)", "", str(text or "").strip())
+    return value.rstrip(".,;:!? ") or "the corresponding subject"
+
+
+def target_scope(intervals):
+    """A target-video window, never an editor shot label or capture timestamp."""
+    windows = []
+    for start, end in sorted((float(start), float(end)) for start, end in intervals or ()):
+        if windows and start <= windows[-1][1]:
+            windows[-1][1] = max(windows[-1][1], end)
+        else:
+            windows.append([start, end])
+    ranges = [f"{start:g}–{end:g}" for start, end in windows]
+    return "During " + _english(ranges) + " seconds of the target video only" if ranges else ""
+
+
+def _swap_window(swap):
+    scope = target_scope(swap[4]) if len(swap) > 4 else ""
+    return ", " + scope[0].lower() + scope[1:] if scope else ""
+
+
+def _without_windows(windows, used):
+    remaining = []
+    for start, end in windows:
+        parts = [(start, end)]
+        for low, high in used:
+            pieces = []
+            for first, last in parts:
+                if high <= first or low >= last:
+                    pieces.append((first, last))
+                else:
+                    if first < low:
+                        pieces.append((first, low))
+                    if high < last:
+                        pieces.append((high, last))
+            parts = pieces
+        remaining.extend(parts)
+    return remaining
+
+
+def annotation_lines(annotations, labels, field, owners=None):
+    """User prose, scoped with the same bound labels as its presented media."""
+    lines = []
+    for row in annotations:
+        text = row.get(field)
+        label = row.get("label") or labels.get(row["handle"])
+        if not text or not label:
+            continue
+        literal = bool(split_sections(text)[1])
+        if literal:
+            fence = "`" * max(3, max((len(match[0]) + 1 for match in
+                                      re.finditer(r"`{3,}", text)), default=3))
+            text = fence + "\n" + text + "\n" + fence
+        scope = target_scope(row.get("intervals"))
+        owner = (owners or {}).get(row["handle"])
+        head = f"{owner} (reference {label})" if owner and field == "description" else label
+        separator = " " if field == "description" and not literal else "\n"
+        lines.append((scope + ":\n" if scope else "") + f"{head}:" + separator + text)
+    return lines
+
+
+def retention_lines(plan, skip=(), body="", replaced=None, scopes=None, target_scopes=None,
+                    annotations=()):
     """`plan` -> the `retention_analysis` lines for the labels no subject claimed.
 
     The mirror of `reference_lines`: whatever that defined, this scopes, so the
@@ -461,32 +545,75 @@ def retention_lines(plan, skip=(), body="", replaced=None):
     """
     video_label = {step["asset"].handle: step["label"]
                    for step in plan if step["op"] == "video"}
+    videos = {step["asset"].handle: step["asset"]
+              for step in plan if step["op"] == "video"}
     lines = []
+    explicit = {}
+    for row in annotations:
+        if row.get("usage_rules"):
+            intervals = row.get("intervals")
+            handles = {row["handle"]}
+            handles.update(step["asset"].handle for step in plan
+                           if any(panel.handle == row["handle"] for panel in step["asset"].panels))
+            for handle in handles:
+                if not intervals:
+                    explicit[handle] = True
+                elif explicit.get(handle) is not True:
+                    explicit.setdefault(handle, []).extend(intervals)
     for step in plan:
         asset, label = step["asset"], step["label"]
+        windows = (target_scopes or {}).get(asset.handle)
+        rules = explicit.get(asset.handle)
+        remaining = _without_windows(windows or (), rules) if rules and rules is not True else []
+        rule_scope = target_scope(windows if rules is True else rules)
+        scope = target_scope(windows)
+        prefix = scope + ":\n" if scope else ""
         if step["op"] == "soundtrack":
             if f"{asset.handle}:audio" in skip:
                 continue
+            if rules:
+                if not remaining:
+                    continue
+                prefix = target_scope(remaining) + ":\n"
             # A soundtrack has no audio `takes` of its own — the chip it rides on
             # is scoped with the video vocabulary. Riding along with an edit is
             # the one case the guide settles outright ("When editing a source
             # video, use audio reuse as well if its original audio remains
             # audible"), and everything else is a reference rather than a copy.
-            if asset.takes == "edit" or asset.handle in (replaced or {}):
+            swaps = (replaced or {}).get(asset.handle)
+            if asset.takes == "edit" or (swaps and not _identification_only(asset, swaps)):
                 marker, becomes = "fully_copy", (
                     f"the original audio of {video_label.get(asset.handle, 'the source video')} "
                     f"remains audible in the target video")
             else:
                 marker, becomes = "reference", (
                     "it guides the target video's sound without being copied")
-            lines.append(f"{label}: {marker} - {becomes}.")
+            lines.append(prefix + f"{label}: {marker} - {becomes}.")
             continue
         if asset.handle in skip:
             continue
         if asset.role != "reference":
             continue
         kind = _kind(asset)
-        swaps = (replaced or {}).get(asset.handle) if kind == "video" else None
+        swaps = (replaced or {}).get(asset.handle) if kind in ("image", "video") else None
+        if swaps and _identification_only(asset, swaps):
+            target = "; ".join(
+                f"{replacement_target(swap[1])} is identified for replacement "
+                f"by {swap[0]}{_swap_window(swap)}" for swap in swaps)
+            origin = asset.replacement_origin
+            source = videos.get(origin.get("handle"))
+            captured_time = origin.get("time_s")
+            in_view = (source is not None and (not source.trim or
+                isinstance(captured_time, (int, float)) and not isinstance(captured_time, bool)
+                and source.trim[0] <= captured_time <= source.trim[1]))
+            linked = (f" from {video_label[source.handle]}"
+                      if in_view and origin.get("filename") == source.filename else "")
+            marker = "fully_preserved" if kind in ("image", "video") else "reference"
+            lines.append(prefix + f"{label} (replacement identification{linked}): {marker} - {target}; "
+                         "use this reference only to identify the target in the source video, "
+                         "not as a new scene, camera, pose or motion source; colored locator "
+                         "marks are identification annotations, not target-video elements.")
+            continue
         if swaps:
             # Somebody stands in for someone in this clip, so its line says both
             # halves in one sentence: everything around the vacancy is kept, and
@@ -495,14 +622,24 @@ def retention_lines(plan, skip=(), body="", replaced=None):
             # would claim, `fully_preserved`, that its occupant is carried in,
             # which is the one thing this generation is for.
             marker = "partially_preserved"
-            becomes = "; ".join(
-                f"{who or 'the corresponding subject'} is replaced by {stands}"
-                for stands, who in swaps)
-            becomes = (f"the framing, camera work, timing, environment and "
+            swap_text = "; ".join(
+                f"{replacement_target(swap[1])} is replaced by {swap[0]}{_swap_window(swap)}" for swap in swaps)
+            baseline = (f"the framing, camera work, timing, environment and "
                        f"everyone else are kept as they are in the source "
-                       f"video, while {becomes}")
-            lines.append(f"{label} (source video): {marker} - {becomes}.")
+                       f"video, while {swap_text}")
+            if rules:
+                if remaining:
+                    lines.append(target_scope(remaining) + ":\n"
+                                 + f"{label} (source video): {marker} - {baseline}.")
+                lines.append((rule_scope + ":\n" if rule_scope else "")
+                             + f"{label} (source video): {marker} - {swap_text}.")
+            else:
+                lines.append(prefix + f"{label} (source video): {marker} - {baseline}.")
             continue
+        if rules:
+            if not remaining:
+                continue
+            prefix = target_scope(remaining) + ":\n"
         if asset.takes == "storyboard":
             marker, becomes = storyboard_hold(asset), storyboard_becomes(asset)
         else:
@@ -511,11 +648,8 @@ def retention_lines(plan, skip=(), body="", replaced=None):
         if not marker or not becomes:
             continue
         note = _SCOPE_NOTE.get((kind, asset.takes))
-        if not note and kind != "audio":
-            where = appears_in(label, body)
-            note = f"appears in {where}" if where else None
         head = f"{label} ({note})" if note else label
-        lines.append(f"{head}: {marker} - {becomes}.")
+        lines.append(prefix + f"{head}: {marker} - {becomes}.")
     return lines
 
 
@@ -569,16 +703,7 @@ def task_types(plan, has_frames=False, edited=()):
     return [name for name in TASK_ORDER if name in found]
 
 
-def _count(n, noun):
-    """`2, "shot"` -> `"two shots"`. Small numbers as words, the way the guide
-    writes them ("The three-shot exchange")."""
-    words = ("no", "one", "two", "three", "four", "five", "six", "seven",
-             "eight", "nine", "ten")
-    count = words[n] if n < len(words) else str(n)
-    return f"{count} {noun}" if n == 1 else f"{count} {noun}s"
-
-
-def summary(plan, cast, subject_labels, asset_labels, shots=1, has_frames=False):
+def summary(plan, cast, subject_labels, asset_labels, shots=1, has_frames=False, target_scopes=None):
     """The `summary` section, derived rather than written.
 
     Section 3 wants one short paragraph: the task type, the target video, and
@@ -594,7 +719,10 @@ def summary(plan, cast, subject_labels, asset_labels, shots=1, has_frames=False)
     """
     # A clip somebody is replaced in is an edit source whether or not its chip
     # was narrowed to `edit` — the replacement is a direct modification of it.
-    replaced_in = {h for s in cast for h in s.replaces}
+    edit_handles = {step["asset"].handle for step in plan
+                    if step["asset"].kind == "video" and step["asset"].takes == "edit"}
+    replaced_in = {h for s in cast for h in s.replaces
+                   if not s.replacement_reference_only or h in edit_handles}
     types = task_types(plan, has_frames, edited=replaced_in)
     prefix = f"[{' + '.join(types)}]" if types else ""
 
@@ -616,24 +744,81 @@ def summary(plan, cast, subject_labels, asset_labels, shots=1, has_frames=False)
         sentences.append(f"The target video is the next shot of the piece "
                          f"storyboarded in {_english(boards)}.")
 
-    opener = "It runs" if sentences else "The target video runs"
-    body = f"{opener} {_count(max(1, int(shots)), 'shot')}"
     named = [subject_labels[s.handle] for s in cast if s.handle in subject_labels]
     if named:
-        body += f" and features {_english(named)}"
-    sentences.append(body + ".")
+        sentences.append(f"The target video features {_english(named)}.")
 
     # The one relationship worth restating up here, because it is the whole job
     # wherever somebody has it set: who stands in for whom.
+    assets = {step["asset"].handle: step["asset"] for step in plan}
     for subject in cast:
         if not subject.replaces or subject.handle not in subject_labels:
             continue
-        who = subject.replaces_what or "the corresponding subject"
-        where = _english([asset_labels.get(h, f"@{h}") for h in subject.replaces])
-        sentences.append(
-            f"{subject_labels[subject.handle]} takes the place of {who} in {where}.")
+        who = replacement_target(subject.replaces_what)
+        scope = target_scope((target_scopes or {}).get(subject.handle))
+        window = ", " + scope[0].lower() + scope[1:] if scope else ""
+        identified, sources = [], []
+        for handle in subject.replaces:
+            asset = assets.get(handle)
+            locator = asset and (asset.kind == "image" or
+                subject.replacement_reference_only and asset.takes != "edit")
+            (identified if locator else sources).append(asset_labels.get(handle, f"@{handle}"))
+        if identified:
+            sentences.append(f"{subject_labels[subject.handle]} replaces {who}, "
+                             f"identified by {_english(identified)}, in the described source video{window}.")
+        if sources:
+            sentences.append(
+                f"{subject_labels[subject.handle]} takes the place of {who} in {_english(sources)}{window}.")
 
     return f"{prefix} {' '.join(sentences)}".strip()
+
+
+_TASK_PREFIX = re.compile(r"\[([^\]\r\n]+)\][ \t]*")
+_SUMMARY_FEATURES = re.compile(
+    r"(?:^|(?<=\.))[ \t]*The target video features "
+    r"<Subject \d+>(?:(?:, |, and | and )<Subject \d+>)*\.(?=\s|$)")
+
+
+def _summary_parts(text):
+    tasks, lines = set(), []
+    def task(match):
+        names = [name.strip().lower() for name in match[1].split("+")]
+        if not names or any(name not in TASK_ORDER for name in names):
+            return match[0]
+        tasks.update(names)
+        return ""
+    for line, literal in _protocol_lines(str(text or "").strip()):
+        if not literal:
+            parts, _ = _quoted_parts(line)
+            line = "".join(part if quoted else _TASK_PREFIX.sub(task, part)
+                           for part, quoted in parts)
+        lines.append(line)
+    return tasks, "".join(lines).strip()
+
+
+def normalize_summary(text, tasks=()):
+    """One canonical task prefix; quoted text and other bracket tags stay prose."""
+    found, body = _summary_parts(text)
+    found.update(name for name in tasks if name in TASK_ORDER)
+    prefix = "[" + " + ".join(name for name in TASK_ORDER if name in found) + "]" if found else ""
+    return (prefix + (" " if prefix and body else "") + body).strip()
+
+
+def merge_summary(generated, supplied):
+    """The supplied story replaces generic scaffolding, keeping source facts."""
+    auto, facts = _summary_parts(generated)
+    written, body = _summary_parts(supplied)
+    if not body:
+        return normalize_summary(generated, written)
+    facts = _SUMMARY_FEATURES.sub("", facts).strip()
+    additions = []
+    # This side is compiler-owned: each sentence states a source/edit/swap
+    # relationship. Supplied prose is never searched for meaning or rewritten.
+    for fact in re.split(r"(?<=\.)[ \t]+", facts):
+        if fact and fact not in body:
+            additions.append(fact)
+    text = " ".join([*additions, body])
+    return normalize_summary(text, auto | written)
 
 
 def _english(items):
@@ -688,6 +873,44 @@ def has_field(text, name):
     return re.search(rf"^[ \t]*{re.escape(name)}[ \t]*:", text or "", re.MULTILINE) is not None
 
 
+def join_paragraphs(*texts):
+    """Independent contributions stay independent in the actual model prompt."""
+    return "\n\n".join(str(text).strip() for text in texts if str(text or "").strip())
+
+
+def split_sections(text):
+    """Read explicit Context-IR fields without interpreting dialogue or code.
+
+    The unsectioned text and description fields are returned as the body.
+    Unknown fields remain verbatim in their paragraph; no prose is discarded.
+    """
+    names = (*REF_SECTIONS, *BODY_FIELDS, SOUNDSCAPE_FIELD, MUSIC_FIELD)
+    heading = re.compile(r"^[ \t]*(" + "|".join(map(re.escape, names)) + r")[ \t]*:[ \t]*(.*)$")
+    body, sections, lines = [], {}, []
+    current = None
+
+    def flush():
+        value = "\n".join(lines).strip()
+        if value:
+            if current is None or current in BODY_FIELDS:
+                body.append(value)
+            else:
+                sections[current] = join_paragraphs(sections.get(current), value)
+        lines.clear()
+
+    for line, literal in _protocol_lines(text):
+        line = line.rstrip("\r\n")
+        match = heading.match(line) if not literal else None
+        if match:
+            flush()
+            current = match.group(1)
+            lines.append(match.group(2))
+        else:
+            lines.append(line)
+    flush()
+    return join_paragraphs(*body), sections
+
+
 def _has_instruction(text):
     """Whether `text` already opens with a keyframe-alignment instruction.
 
@@ -716,23 +939,11 @@ CUT_TIME_RE = re.compile(r"^\s*At\s+\d{1,3}:\d{2}\.\d{3}\s*,")
 
 
 def shot_body(shots):
-    """`[(at_seconds, text), ...]` -> one `[Shot n]`-marked description.
+    """Join descriptions with real card cut times, but no generated shot labels.
 
-    The guide's section 4.2 in one function: shot 1 carries no timestamp, every
-    later shot opens with its cut time, and the prose after the comma is the
-    user's own — including which of `the camera cuts to` / `the shot transitions
-    to` they wanted. Inventing a transition verb here would be writing a line of
-    their description for them, and the guide lists five to choose between.
-
-    A card that already carries its own markers is passed through verbatim and
-    counts for as many shots as it numbers, so writing two shots into one card
-    does not knock the rest of the timeline out of step. Its numbers are checked
-    against the position it actually occupies and refused if they disagree —
-    refusing is not rewriting, and the alternative is a description with two
-    `[Shot 2]`s in it that nothing would have complained about.
+    Explicit user markers and cut times remain user text, whatever their labels.
     """
     out = []
-    number = 1
     for position, (at, text) in enumerate(shots, start=1):
         text = (text or "").strip()
         if not text:
@@ -742,56 +953,36 @@ def shot_body(shots):
                 f"a cut with nothing on the far side of it"
             )
 
-        own = [re.sub(r"\s+", " ", m) for m in SHOT_RE.findall(text)]
-        if own:
-            want = [f"[Shot {n}]" for n in range(number, number + len(own))]
-            if own != want:
-                raise ValueError(
-                    f"shot {position} numbers its own shots {' '.join(own)}, but in this "
-                    f"timeline it is {' '.join(want)} — renumber it, or drop the markers "
-                    f"and let the timeline number the shots"
-                )
-            out.append(text)
-            number += len(own)
-            continue
-
-        head = f"[Shot {number}]"
-        if number > 1 and not CUT_TIME_RE.match(text):
-            head += f" At {shot_time(at)},"
-        out.append(f"{head} {text}")
-        number += 1
-    return " ".join(out)
+        if position > 1 and not CUT_TIME_RE.match(text):
+            marker = re.match(r"^\[Shot\s+\d+\][ \t]*", text)
+            if marker:
+                if not CUT_TIME_RE.match(text[marker.end():]):
+                    text = text[:marker.end()] + f"At {shot_time(at)}, " + text[marker.end():]
+            else:
+                text = f"At {shot_time(at)}, {text}"
+        out.append(text)
+    return "\n\n".join(out)
 
 
 def instruction(mode, seconds, shots=1):
     """The first line of the prompt for a keyframe mode, or None.
 
-    Quoted from the official guide rather than paraphrased — including FL2VA's
-    unbracketed `Picture 1`, which differs from the other two lines and is not a
-    typo on this end. `S.SS` is the effective duration to exactly two decimals,
-    so it must be the real frame-count-derived duration and never the pill's
-    whole number.
-
-    `shots` is how many shots the description holds. The end frame is reached by
-    the *last* one — the guide writes `(from Shot N)` — which only differs from
-    `Shot 1` in a one-pass render of several shots. The start frame is always
-    Shot 1's, whatever follows it.
+    Frame alignment retains the real duration; editor shot labels are omitted.
 
     T2VA has no instruction (there is no picture to align), and REF2VA states its
     alignment inside `retention_analysis` instead.
     """
     end = f"{float(seconds):.2f}"
-    last = max(1, int(shots))
     if mode == "I2VA":
         return ("For the target video, at 0.00 seconds into the target video, "
-                "<Picture 1> (from [Shot 1]) is fully referenced.")
+                "<Picture 1> is fully referenced.")
     if mode == "FL2VA":
         return ("How the reference pictures align with the target video — Picture 1 "
-                "(from Shot 1) aligns with the 0.00-second mark of the target video; "
-                f"Picture 2 (from Shot {last}) aligns with the {end}-second mark of the target video.")
+                "aligns with the 0.00-second mark of the target video; "
+                f"Picture 2 aligns with the {end}-second mark of the target video.")
     if mode == "L2VA":
         return ("How the reference pictures align with the target video — <Picture 1> "
-                f"(from [Shot {last}]) aligns with the {end}-second mark of the target video.")
+                f"aligns with the {end}-second mark of the target video.")
     return None
 
 
@@ -808,13 +999,12 @@ def ref_frame_alignment(first_label, last_label, seconds, shots=1):
     this line is about the pinned frames alone and coexists with it.
     """
     end = f"{float(seconds):.2f}"
-    last_shot = max(1, int(shots))
     parts = []
     if first_label:
-        parts.append(f"{first_label} (from [Shot 1]) aligns with the 0.00-second "
+        parts.append(f"{first_label} aligns with the 0.00-second "
                      f"mark of the target video")
     if last_label:
-        parts.append(f"{last_label} (from [Shot {last_shot}]) aligns with the "
+        parts.append(f"{last_label} aligns with the "
                      f"{end}-second mark of the target video")
     if not parts:
         return ""
@@ -822,8 +1012,162 @@ def ref_frame_alignment(first_label, last_label, seconds, shots=1):
             + "; ".join(parts) + ".")
 
 
+_REFERENCE_HEADER = re.compile(
+    r"^(<(?:Picture|Image|Video|Audio|Sound|Subject)\s+\d+>)"
+    r"(?:[ \t]+(\([^\n()]*\)))?[ \t]*:[ \t]*"
+    r"(?:([a-z][a-z_]*)[ \t]+-[ \t]*)?")
+
+
+def _quoted_parts(text, quote=""):
+    parts, start, index = [], 0, 0
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if quote:
+            if text.startswith(quote, index):
+                if quote == "'" and index and index + 1 < len(text) and text[index - 1].isalnum() and text[index + 1].isalnum():
+                    index += 1
+                    continue
+                index += len(quote)
+                parts.append((text[start:index], True))
+                start, quote = index, ""
+                continue
+        else:
+            opening = next((token for token in ('"""', "'''", '<d>', '"', "“", "‘", "'")
+                            if text.startswith(token, index)), None)
+            if opening == "'" and index and text[index - 1].isalnum():
+                opening = None
+            if opening:
+                if index > start:
+                    parts.append((text[start:index], False))
+                start, quote = index, {"“": "”", "‘": "’", "<d>": "</d>"}.get(opening, opening)
+                index += len(opening)
+                continue
+        index += 1
+    if start < len(text):
+        parts.append((text[start:], bool(quote)))
+    return parts, quote
+
+
+def _protocol_lines(text):
+    fence, quote = None, ""
+    for line in str(text or "").splitlines(keepends=True):
+        marker = re.match(r"[ \t]*(`{3,}|~{3,})(.*)", line.rstrip("\r\n"))
+        if marker and not quote:
+            token, tail = marker.groups()
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence) and not tail.strip():
+                fence = None
+            yield line, True
+            continue
+        literal = fence is not None or bool(quote)
+        yield line, literal
+        if fence is None:
+            _, quote = _quoted_parts(line, quote)
+
+
+def model_prose(text):
+    """Keep supplied prose intact; automatic metadata is omitted at its source."""
+    return str(text or "").strip()
+
+
+def consolidate_references(text):
+    """Merge equal headers only within one opaque structural scope region."""
+    text = str(text or "")
+    boundaries, offset, region = [], 0, 0
+    for line, literal in _protocol_lines(text):
+        match = _REFERENCE_HEADER.match(line) if not literal else None
+        if match:
+            key = (re.sub(r"\s+", " ", match[1]), match[2] or "", match[3] or "")
+            boundaries.append((offset, offset + match.end(), key, region))
+        elif not literal and line.rstrip().endswith(":"):
+            parts, _ = _quoted_parts(line.rstrip())
+            if parts and not parts[-1][1]:
+                # Do not interpret arbitrary user scope wording. Any heading
+                # is a boundary, including bound-reference and target windows.
+                region += 1
+                boundaries.append((offset, offset + len(line), None, region))
+        offset += len(line)
+    headers = [entry for entry in boundaries if entry[2] is not None]
+    markers = {}
+    for _, _, key, region in headers:
+        if key[2]:
+            markers.setdefault((region, *key[:2]), set()).add(key[2])
+    def resolved(key, region):
+        choices = markers.get((region, *key[:2]), set())
+        marker = next(iter(choices)) if not key[2] and len(choices) == 1 else key[2]
+        return region, *key[:2], marker
+    if len({resolved(key, region) for _, _, key, region in headers}) == len(headers):
+        return text
+    groups, order = {}, []
+    for index, (start, end, key, region) in enumerate(boundaries):
+        stop = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(text)
+        if key is None:
+            order.append((None, text[start:stop].strip()))
+            continue
+        group = resolved(key, region)
+        if group not in groups:
+            groups[group] = [text[start:end].rstrip(), [], key[2]]
+            order.append((group, None))
+        elif key[2] and not groups[group][2]:
+            groups[group][0] = text[start:end].rstrip()
+            groups[group][2] = key[2]
+        body = text[end:stop].strip()
+        if body and body not in groups[group][1]:
+            groups[group][1].append(body)
+    return join_paragraphs(text[:boundaries[0][0]], *(
+        value if key is None else groups[key][0] + "\n" + join_paragraphs(*groups[key][1])
+        for key, value in order))
+
+
+def normalize_model_prompt(text):
+    """Format an existing model prompt without inventing sections or bindings.
+
+    Overrides bypass composition, but not the common outgoing text contract.
+    Only known outer headings outside literal dialogue/code are recognized;
+    their first occurrence determines order and unknown prose remains text.
+    """
+    names = (*REF_SECTIONS, *BODY_FIELDS, SOUNDSCAPE_FIELD, MUSIC_FIELD)
+    heading = re.compile(r"^[ \t]*(" + "|".join(map(re.escape, names)) + r")[ \t]*:[ \t]*(.*)$")
+    groups, order, lines = {}, [], []
+    current = None
+
+    def flush():
+        value = "".join(lines).strip()
+        if current is None:
+            if value:
+                order.append((None, value))
+        else:
+            if current not in groups:
+                groups[current] = []
+                order.append((current, None))
+            if value:
+                groups[current].append(value)
+        lines.clear()
+
+    for line, literal in _protocol_lines(text):
+        match = heading.match(line.rstrip("\r\n")) if not literal else None
+        if match:
+            flush()
+            current = match[1]
+            lines.append(match[2] + "\n")
+        else:
+            lines.append(line)
+    flush()
+    out = []
+    for name, value in order:
+        text = value if name is None else join_paragraphs(*groups[name])
+        if name == "summary":
+            text = normalize_summary(text)
+        text = consolidate_references(model_prose(text))
+        out.append(text if name is None else name + ":\n" + text)
+    return join_paragraphs(*out)
+
+
 def compose(mode, body, soundscape="", music="", seconds=0.0, preamble="", shots=1,
-            sections=None):
+            sections=None, audio_reuse=False):
     """The user's prose -> the sectioned prompt the DiT was trained to read.
 
     `body` is what the user wrote, with `@handles` already substituted and any
@@ -831,10 +1175,10 @@ def compose(mode, body, soundscape="", music="", seconds=0.0, preamble="", shots
     description, not above the instruction line, because the instruction has to
     be the prompt's first line.
 
-    A blank `soundscape` or `music` emits nothing at all. `N/A` is the guide's
-    value for "there is deliberately none of this", which is a real thing to say
-    and a very different one from leaving the box empty, so it stays something
-    the user types rather than something inferred from an empty string.
+    A blank `soundscape` emits nothing. Blank `music` defaults to `N/A` unless
+    referenced audio is copied: that recording may already contain music and
+    an automatic no-music claim would contradict its reuse. Explicit music
+    instructions, including `N/A`, always remain the user's choice.
 
     `sections` is `REF_SECTIONS -> prose`. It used to come only from the refiner,
     and a REF2VA prompt without one was emitted as a bare sentence with
@@ -850,10 +1194,22 @@ def compose(mode, body, soundscape="", music="", seconds=0.0, preamble="", shots
     This builds the document; the prose inside it is still the user's sentence
     until a refiner writes a better one.
     """
-    body = (body or "").strip()
+    body, explicit = split_sections(body)
     soundscape = (soundscape or "").strip()
     music = (music or "").strip()
-    sections = sections or {}
+    sections = {name: join_paragraphs(value, explicit.get(name))
+                for name, value in (sections or {}).items()}
+    for name, value in explicit.items():
+        if name not in sections:
+            sections[name] = value
+    soundscape = sections.pop(SOUNDSCAPE_FIELD, "") or soundscape
+    music = sections.pop(MUSIC_FIELD, "") or music
+    copied_audio = audio_reuse
+    for rule, literal in _protocol_lines(sections.get("retention_analysis", "")):
+        match = _REFERENCE_HEADER.match(rule) if not literal else None
+        if match and match[1].startswith(("<Audio ", "<Sound ")) and match[3] in ("fully_copy", "partially_copy"):
+            copied_audio = True
+            break
 
     out = []
 
@@ -890,34 +1246,28 @@ def compose(mode, body, soundscape="", music="", seconds=0.0, preamble="", shots
     # already has.
     for name in (REF_SECTIONS if reference_form else ()):
         value = str(sections.get(name) or "").strip()
-        if value and not has_field(body, name):
-            out.append(f"{name}: {value}")
+        if name == "summary":
+            value = normalize_summary(value)
+        if value:
+            out.append(f"{name}:\n{consolidate_references(model_prose(value))}")
 
     if body:
         # Only wrapped when the body is plain prose. Anything already sectioned —
         # either form — is its own rewrite already.
         field = REF_BODY_FIELD if reference_form else BODY_FIELD
-        if not any(has_field(body, f) for f in BODY_FIELDS):
-            # The description is written shot by shot and every example opens on
-            # a marker. A segment is one shot, so `[Shot 1]` is the whole of it —
-            # unless the body already numbers its own, which is someone writing
-            # several shots into one generation and knowing that they are.
-            if not SHOT_RE.search(body):
-                body = f"[Shot 1] {body}"
-            body = f"{field}: {body}"
+        body = f"{field}:\n{consolidate_references(model_prose(body))}"
         out.append(body)
 
-    if soundscape and not has_field(body, SOUNDSCAPE_FIELD):
-        out.append(f"{SOUNDSCAPE_FIELD}: {soundscape}")
-    # `NO_MUSIC` where the user named none: a missing field is a free hand and
-    # this field is the one the model most reliably fills on its own. The
+    if soundscape:
+        out.append(f"{SOUNDSCAPE_FIELD}:\n{consolidate_references(model_prose(soundscape))}")
+    # `NO_MUSIC` where the user named none and no recording is copied. The
     # soundscape above has no such default — `N/A` there is a claim of total
     # silence, which is a real thing to mean and not one to infer from an empty
     # box, so a blank one still emits nothing.
-    if (music or body) and not has_field(body, MUSIC_FIELD):
+    if music or (body and not copied_audio):
         # `body` guards the default and not the value: an empty request composes
         # to nothing, as it always has, and a piece that is only a music line is
         # still that line.
-        out.append(f"{MUSIC_FIELD}: {music or NO_MUSIC}")
+        out.append(f"{MUSIC_FIELD}:\n{consolidate_references(model_prose(music or NO_MUSIC))}")
 
     return "\n\n".join(out)

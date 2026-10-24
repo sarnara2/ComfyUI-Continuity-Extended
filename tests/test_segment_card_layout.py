@@ -80,10 +80,20 @@ const read = () => ({
 });
 const refs = card().querySelector(".mmc-tl-card-refs");
 const meta = card().querySelector(".mmc-tl-card-meta");
+// The duration now shares this row. Read only reference children, rather than
+// asking the shim (which does not aggregate descendant text) for wrapper text.
+const referenceNodes = (index) => card(index).querySelector(".mmc-tl-card-refs")
+  .children.filter((node) => !node.classList.contains("mmc-tl-dur"));
 const out = {
-  refs: { text: refs.textContent, direct: refs.parent === card(),
+  refs: { text: referenceNodes(0).map((node) => node.textContent).join(""), direct: refs.parent === card(),
           afterPrompt: card().children.indexOf(refs) === card().children.indexOf(card().querySelector(".mmc-tl-card-prompt")) + 1,
-          outsideMeta: !meta.contains(refs), absentWhenEmpty: !card(1).querySelector(".mmc-tl-card-refs") },
+          outsideMeta: !meta.contains(refs), absentWhenEmpty: referenceNodes(1).length === 0 },
+  durations: cards().map((node) => {
+    const row = node.querySelector(".mmc-tl-card-refs"), duration = node.querySelector(".mmc-tl-dur");
+    return { count: node.querySelectorAll(".mmc-tl-dur").length, direct: row.parent === node,
+      afterPrompt: node.children.indexOf(row) === node.children.indexOf(node.querySelector(".mmc-tl-card-prompt")) + 1,
+      last: row.children.at(-1) === duration };
+  }),
   metadata: meta.children.map((node) => ({ tag: node.tagName, text: node.text })),
   seedLocation: { count: card().querySelectorAll(".mmc-tl-card-seed").length,
     beforeFoot: card().children.indexOf(card().querySelector(".mmc-tl-card-seed")) + 1
@@ -91,7 +101,7 @@ const out = {
   inherited: read(),
   takenHint: input().attrs.title.includes("Its take was made on 123."),
   clip: { inputs: card(2).querySelectorAll(".mmc-seed-input").length,
-          refs: card(2).querySelectorAll(".mmc-tl-card-refs").length },
+          refs: referenceNodes(2).length },
 };
 fire(input(), "change", "42");
 out.manual = { ...read(), committedSeed: snapshots.at(-1).segments[0].seed,
@@ -130,6 +140,10 @@ out.propagated = { ...propagated };
 out.openedFromSeed = opened;
 fire(card().querySelector(".mmc-tl-card-prompt"), "dblclick");
 out.openedFromPrompt = opened;
+fire(card(), "dblclick");
+out.openedFromBlank = opened;
+fire(card().querySelector(".mmc-tl-edit"), "click");
+out.openedFromEdit = opened;
 modal.edit = realEdit;
 
 modal.edit(0);
@@ -167,8 +181,10 @@ console.log(JSON.stringify(out));
 with layout.pack(skip=("atlas",)) as target:
     got = layout.in_pack(SCRIPT, target)
 
-check("references get their own row immediately below the prompt", got["refs"],
+check("reference counts share the duration row immediately below the prompt", got["refs"],
       {"text": "2 refs", "direct": True, "afterPrompt": True, "outsideMeta": True, "absentWhenEmpty": True})
+check("generated and imported cards retain one duration, last in the row after their prompt", got["durations"],
+      [{"count": 1, "direct": True, "afterPrompt": True, "last": True}] * 3)
 check("LoRA and refinement metadata remain individual spans", got["metadata"][:2],
       [{"tag": "SPAN", "text": "1 LoRA"}, {"tag": "SPAN", "text": "refined"}])
 check("each generated card has one seed row before its footer", got["seedLocation"],
@@ -190,13 +206,15 @@ check("each seed action commits exactly once", got["commits"], 5)
 check("an inherited seed follows the node on the next redraw", got["changedPieceSeed"],
       {"shown": "777", "otherShown": "777", "own": None})
 check("editing seeds retains the existing take and hold", [got["takeRetained"], got["holdRetained"]], [True, True])
-check("imported clips acquire neither reference nor seed rows", got["clip"], {"inputs": 0, "refs": 0})
+check("imported clips acquire neither reference counts nor seed rows", got["clip"], {"inputs": 0, "refs": 0})
 check("seed actions leave the imported clip unchanged", got["clipUnchanged"], True)
 check("random and reset clicks stop at the seed row", [got["randomStopped"], got["resetStopped"]], [True, True])
 check("pointer and double-click events stop for every seed control", got["stops"], [True] * 10)
 check("seed events never reach the outer overlay", got["propagated"], {"pointerdown": 0, "click": 0, "dblclick": 0})
 check("seed interaction does not open the card editor", got["openedFromSeed"], 0)
-check("the prompt still opens its editor on double-click", got["openedFromPrompt"], 1)
+check("prompt double-click does not open the editor", got["openedFromPrompt"], 0)
+check("blank card double-click does not open the editor", got["openedFromBlank"], 0)
+check("the explicit Edit button opens its editor once", got["openedFromEdit"], 1)
 check("Timeline editor does not duplicate strip seed controls", [got["editorSeedCount"], got["stripSeedCount"]], [0, 2])
 check("the generic editor still supports inherited seeds", got["genericBefore"], "81")
 check("the generic editor still edits its requested seed target", got["genericAfter"], {"seed": 99, "shown": "99", "commits": 1})

@@ -9,7 +9,7 @@ module only through the `PROMPTING` singleton at the bottom.
 H3 is two models. The hosted half rewrites what the user typed into a labelled,
 sectioned intermediate representation, and the open weights were only ever
 trained on that output. `contextir.py` puts the *skeleton* back — the field
-names, the instruction line, the `[Shot N]` markers, the cut times — because all
+names, the instruction line and the cut times — because all
 of that is mechanical. What it cannot do is write the prose, and the prose is
 most of what makes a Context-IR prompt work.
 
@@ -20,11 +20,13 @@ back.
 
 Three things shape the whole design.
 
-**It writes prose, nothing else.** The instruction line, the shot markers, the
+**It writes prose, nothing else.** The instruction line, the
 `S.SS` alignment figure and the formatting of cut timestamps are all
 `contextir.py`'s, computed off the real frame-derived duration. So the reply is
 JSON — one body per shot, plus the audio fields — and `contextir.compose`
-assembles it exactly as it assembles a hand-written prompt. The model never sees
+assembles it exactly as it assembles a hand-written prompt. Automatic assembly
+does not create `[Shot N]` labels; markers and cut times supplied in the request
+remain its content. The model never sees
 a format it could break. The one field in that object that is not part of the
 prompt is `SEEN_FIELD`, which exists to make the model look at the pictures
 before it writes; see there.
@@ -140,10 +142,14 @@ WHAT YOU RETURN
 Return one JSON object and nothing else. Every field holds plain prose.
 
 The surrounding format is assembled for you. Field names, the reference-\
-alignment instruction line, `[Shot N]` markers, the written form of every cut \
-time and the video's exact duration figure are all added around your prose \
-afterwards, computed from the real frame count. Begin each shot's body with the \
-scene itself — the style, the framing, what is there, what happens.
+alignment instruction line, missing target cut times and the video's exact \
+duration figure are added around your prose afterwards, computed from the real \
+frame count. Do not create new `[Shot N]` labels. Preserve any `[Shot N]` labels \
+and explicit written cut times already supplied in the request, with their \
+original numbering and text. This includes quoted dialogue, on-screen text \
+and copied examples: their literal words are content, not editor metadata to \
+remove. Otherwise begin each shot's body with the scene itself — the style, \
+the framing, what is there, what happens.
 
 FIDELITY TO THE REQUEST
 The request is the specification. Your job is to say the same thing in far more \
@@ -250,11 +256,13 @@ to finish inside its own shot.
 
 _LANGUAGE_RULE = """\
 LANGUAGE
-Write all descriptive prose, dialogue and lyrics in {language}, translating the \
-request where needed. Keep the structural syntax in English exactly as these \
-instructions specify: reference labels, speaker IDs, the `<d>`, `<scenetrans>` \
-and `<cutoff>` tags, the `retention_analysis` markers, and the camera-motion \
-vocabulary. Inside a `<d>` tag the language tag is `[{language}]`.
+Write descriptive prose in {language}, translating the request where needed. \
+Preserve every user-authored `<d>[Language] ...</d>` block verbatim, including \
+its language, words, punctuation, line breaks and inline vocal cues. Preserve \
+the speaker's `(S@handle)` binding. These spoken words are not translated by \
+the prose language setting. For new speech without an explicit language, use \
+{language}. Keep reference labels, speaker IDs, structural tags, retention \
+markers and camera-motion vocabulary in the required syntax.
 """
 
 # What each mode's shots are, said in the mode's own terms. The instruction line
@@ -268,7 +276,7 @@ MODE_NOTES = {
     "L2VA": "The attached end frame is the video's final frame. Open on a state that "
             "could plausibly lead there and arrive at exactly that image at the end.",
     # No shot-count advice here. FL2VA is a path, not a length, and
-    # `contextir.instruction` writes the end frame against `Shot N` — so a
+    # `contextir.instruction` writes the end frame against the real duration — so a
     # request with several beats in it may be cut like any other, and saying
     # "a single shot usually serves this best" only ever pushed against that.
     "FL2VA": "The attached start and end frames are the video's first and last "
@@ -343,25 +351,20 @@ CAST_SECTIONS = ("subject_definitions", "retention_analysis")
 
 
 def join_shots(bodies, cuts, seconds):
-    """The model's shots -> the one `[Shot n]`-marked description they make.
+    """The model's bodies -> one description with real target cut times.
 
-    The markers and the written cut times are `contextir.shot_body`'s, exactly as
-    they are for a one-pass timeline — the only difference is where the times
-    came from. Anything the model wrote in that format itself is taken back out
-    first: it was asked not to, and a stray `[Shot 2]` inside a body would either
-    be passed through as authoritative or refused outright by `shot_body`, and
-    neither is what a model ignoring a formatting rule should cost.
+    A returned marker or timestamp may be copied from the request, so it is
+    kept, including inside quotations. `contextir.shot_body` supplements missing
+    target cut times without creating labels or rewriting supplied ones.
     """
     clean, times = [], []
     for index, body in enumerate(bodies):
-        body = contextir.SHOT_RE.sub("", body)
-        body = contextir.CUT_TIME_RE.sub("", body)
-        body = re.sub(r"^[\s,]+", "", body).strip()
+        body = body.strip()
         if body:
             clean.append(body)
             times.append(cuts[index] if index < len(cuts) else None)
     if not clean:
-        raise RefineError("the model returned shot markers with no prose in them")
+        raise RefineError("the model returned no shot prose")
     return contextir.shot_body(plan_cuts(clean, times, seconds))
 
 
@@ -495,8 +498,7 @@ def system_prompt(mode, language="English", shape=None, cuts=0, extra="", cast=(
     parts = [_RULES]
     if int(cuts) >= 2:
         parts.append(_CUTS_RULE.format(limit=int(cuts), floor=MIN_SHOT_S))
-    if language and language != "English":
-        parts.append(_LANGUAGE_RULE.format(language=language))
+    parts.append(_LANGUAGE_RULE.format(language=language or "English"))
     with_cast = bool(cast) and mode == "REF2VA"
     note = CAST_MODE_NOTE if with_cast else MODE_NOTES[mode]
     parts.append(f"MODE\nThis request is {mode}. {note}")

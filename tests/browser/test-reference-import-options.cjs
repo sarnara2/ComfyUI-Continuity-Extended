@@ -10,6 +10,15 @@ const css = ['base', 'picker', 'overlays'].map(name =>
   read(`styles/${name}.js`).match(/export const css = `([^]*)`;\s*$/)[1]).join('\n');
 const picker = read('picker.js').replace(/^import [^]*?;\r?\n/gm, '').replace(/^export /gm, '');
 const dom = read('dom.js').replace(/^export /gm, '');
+// The current picker imports two pure UI-memory modules. Use their real
+// helpers in separate module scopes; each import-options case starts fresh.
+const memory = `
+const {readViewPrefs,patchViewPrefs,pickerViewContext,pickerViewKind,clearViewPrefs}=(()=>{
+  ${read('viewprefs.js').replace(/^export /gm,'')}
+  return {readViewPrefs,patchViewPrefs,pickerViewContext,pickerViewKind,clearViewPrefs};})();
+const {pickerSelectionContext,readPickedPaths,writePickedPaths}=(()=>{
+  ${read('picker-checks.js').replace(/^export /gm,'')}
+  return {pickerSelectionContext,readPickedPaths,writePickedPaths};})();`;
 let passed = 0;
 let testBrowser;
 async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok ${passed} - ${name}\n`); }
@@ -34,8 +43,8 @@ async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok $
   let requests = 0;
   await page.route('**/*', route => { requests++; route.abort(); });
   await page.setContent(`<style>:root {--comfy-menu-bg:#191919;--fg-color:#ddd;--input-text:#ddd;--descrip-text:#999;--bg-color:#111;--warning-background:#f0a930;--primary-background:#467cb8;}body {background:#111;} ${css}</style><body></body>`);
-  await page.evaluate(({dom,picker,takes,takeWords,takeOptions,scopeKind,takeWord}) => {
-    const code = `${dom}\n${picker}\nwindow.Picker=Picker;`;
+  await page.evaluate(({dom,picker,memory,takes,takeWords,takeOptions,scopeKind,takeWord}) => {
+    const code = `${dom}\n${memory}\n${picker}\nwindow.Picker=Picker;window.clearFixtureViews=clearViewPrefs;`;
     const preview = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180"><rect width="180" height="180" fill="%23445366"/></svg>';
     const fixture = {
       rows:[{kind:'video',path:'v1.mp4',name:'Video one',subfolder:''},
@@ -60,17 +69,19 @@ async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok $
       const listingTruncated=()=>false,listedFolders=()=>[],savePickerPrefs=()=>{};
       const viewUrl=()=>${JSON.stringify(preview)},stillUrl=asset=>asset.kind==='audio'?null:viewUrl();
       const greyField=()=> '#222', cropLabel=()=>'', trimLabel=()=>'',dropQueued=()=>{};
+      const queueState=()=>({remaining:0}),watchQueue=()=>()=>{};
       const openTrim=async()=>window.trimAnswer;
     `;
     eval(seams + code);
     window.makePicker = options => {
       if (window.subject) window.subject.close(null);
+      window.clearFixtureViews();
       window.result = undefined;
       window.subject = new Picker({kinds:['video','image','audio','renders','refmods'],kind:'video',...options},
         result => {window.result=result;});
       window.subject.mount();
     };
-  }, {dom,picker,takes:S.TAKES,takeWords:S.TAKE_WORD,
+  }, {dom,picker,memory,takes:S.TAKES,takeWords:S.TAKE_WORD,
       takeOptions:S.takeOptions.toString(),scopeKind:S.scopeKind.toString(),takeWord:S.takeWord.toString()});
   const open = async (options={referenceOptions:{}}) => {
     await page.evaluate(options => makePicker(options),options);

@@ -11,6 +11,28 @@ export const css = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .mmc-cast-new { display: inline-flex; gap: 5px; align-items: center; flex: none; }
+.mmc-cast-clear { flex: none; }
+
+/* Count-only header content: separate read-only pills, never clipped as the
+   former explanatory sentence was. Other shelf and disclosure hints stay as-is. */
+.mmc-media-counts {
+  display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px;
+  min-width: 0; max-width: 100%; vertical-align: middle;
+}
+.mmc-media-count {
+  display: inline-flex; align-items: center; flex: 0 1 auto; min-width: 0; max-width: 100%;
+  box-sizing: border-box; border: 1px solid var(--mmc-line); border-radius: 999px;
+  padding: 3px 8px; background: var(--mmc-surface-2); color: var(--mmc-dim);
+  font-family: inherit; font-size: calc(11px * var(--mmc-type)); line-height: 1.2;
+  white-space: normal; overflow-wrap: anywhere; pointer-events: none;
+}
+.mmc-tl-section-hint:has(> .mmc-media-counts),
+.mmc-cast-head > .mmc-cast-hint:has(> .mmc-media-counts) {
+  min-width: 0; overflow: visible; text-overflow: clip; white-space: normal;
+}
+.mmc-cast-head:has(> .mmc-cast-hint > .mmc-media-counts) { flex-wrap: wrap; align-items: baseline; }
+.mmc-cast-head > .mmc-cast-hint:has(> .mmc-media-counts) { flex: 1 1 150px; }
+.mmc-cast-head:has(> .mmc-cast-hint > .mmc-media-counts) > .mmc-cast-new { max-width: 100%; white-space: normal; }
 
 /* Nobody cast yet. A card-shaped invitation rather than a line of grey text,
    because the shelf is only ever drawn when somebody went looking for it, and
@@ -48,6 +70,7 @@ export const css = `
    one card rather than as more rows of the list. */
 .mmc-cast-card.open {
   gap: 8px; padding: 10px 12px 11px 10px; background: var(--mmc-surface-2);
+  container-type: inline-size; container-name: mmc-cast-editor;
 }
 /* Cast but never written into a prompt: they are in no shot, which is a state
    worth seeing at a glance and not worth shouting about. */
@@ -68,6 +91,7 @@ export const css = `
 .mmc-cast-grip:hover { background: var(--mmc-surface-2); }
 .mmc-cast-grip:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: -2px; }
 .mmc-cast-row > .mmc-cast-face { width: 30px; height: 30px; border-radius: 8px; margin-left: 9px; }
+.mmc-cast-row > .mmc-cast-face > .mmc-cast-size { font-size: min(calc(7px * var(--mmc-type)), 8px); }
 .mmc-cast-row > .mmc-cast-face-blank svg { width: 16px; height: 16px; }
 
 .mmc-cast-line-ident { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
@@ -119,6 +143,23 @@ export const css = `
 .mmc-cast-card.idle .mmc-cast-line-state { color: var(--mmc-off); }
 .mmc-cast-line-state.bad { color: var(--mmc-bad); }
 .mmc-cast-chev { display: flex; color: var(--mmc-off); flex: none; }
+
+/* Separate the collapsed readouts without changing the expanded editor. */
+.mmc-cast-row .mmc-cast-grip { flex-wrap: wrap; gap: 6px 10px; }
+.mmc-cast-row > .mmc-cast-face { align-self: flex-start; margin-top: 7px; }
+.mmc-cast-row > .mmc-asset-x { align-self: flex-start; margin-top: 7px; }
+.mmc-cast-row .mmc-cast-line-group {
+  display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 8px;
+  flex: 0 1 auto; min-width: 0; max-width: 100%; box-sizing: border-box;
+  padding-left: 10px; border-left: 1px solid var(--mmc-line);
+}
+.mmc-cast-row .mmc-cast-line-kind > .mmc-cast-line-takes {
+  border: 1px solid var(--mmc-line); border-radius: 999px; padding: 3px 7px;
+  background: var(--mmc-surface-2); color: var(--mmc-dim); line-height: 1.2;
+}
+.mmc-cast-row .mmc-cast-line-references > .mmc-cast-minis { flex: 0 1 auto; flex-wrap: wrap; min-width: 0; }
+.mmc-cast-row .mmc-cast-line-status { margin-left: auto; flex: 1 1 120px; justify-content: flex-end; flex-wrap: nowrap; }
+.mmc-cast-row .mmc-cast-line-status > .mmc-cast-line-state { margin-left: 0; min-width: 0; max-width: calc(100% - 22px); flex: 0 1 auto; }
 
 /* --- open: the way back out ----------------------------------------------- */
 
@@ -261,22 +302,38 @@ export const css = `
 .mmc-cast-foot-act.on svg { fill: currentColor; }
 
 .mmc-cast-top { display: flex; gap: 12px; align-items: flex-start; min-width: 0; }
+/* The shelf also lives inside narrow graph nodes. Respond to the card's own
+   available width, not just the browser: face/actions form a compact first
+   row and the complete identity fields receive the second row's full width. */
+@container mmc-cast-editor (max-width: 520px) {
+  .mmc-cast-top { display: grid; grid-template-columns: 46px minmax(0, 1fr); gap: 8px 12px; }
+  .mmc-cast-top > .mmc-cast-face { grid-column: 1; grid-row: 1; }
+  .mmc-cast-top > .mmc-cast-side { grid-column: 2; grid-row: 1; min-width: 0; max-width: 100%; flex-wrap: wrap; justify-content: flex-end; }
+  .mmc-cast-top > .mmc-cast-ident { grid-column: 1 / -1; grid-row: 2; width: 100%; }
+  .mmc-cast-top > .mmc-cast-side > .mmc-cast-where {
+    min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere;
+  }
+}
 
-/* Their face: the first still they are built out of, at a size you can recognise
+/* Their face: the first appearance reference, at a size you can recognise
    somebody at. Square, because every other thumbnail in the pack is. */
 .mmc-cast-face {
-  width: 46px; height: 46px; border-radius: 10px; object-fit: cover; flex: none;
+  position: relative; display: block; width: 46px; height: 46px; border-radius: 10px; flex: none;
   background: var(--mmc-surface-3); box-shadow: 0 0 0 2px var(--tag, transparent);
 }
+.mmc-cast-face-image { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+.mmc-cast-face.off .mmc-cast-face-image { filter: grayscale(1) brightness(.55); }
+.mmc-cast-face.off:hover .mmc-cast-face-image,
+.mmc-cast-face.off:focus-visible .mmc-cast-face-image { filter: grayscale(1) brightness(.7); }
 /* Only a real representative image opens the read-only preview. */
-img.mmc-cast-face { cursor: zoom-in; }
+.mmc-cast-face:not(.mmc-cast-face-blank) { cursor: zoom-in; }
 .mmc-cast-face-blank {
   display: flex; align-items: center; justify-content: center; color: var(--mmc-off);
   box-shadow: inset 0 0 0 1px var(--mmc-line);
 }
 
 .mmc-cast-ident { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 0; }
-.mmc-cast-namerow { display: flex; gap: 8px; align-items: center; min-width: 0; }
+.mmc-cast-namerow { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; min-width: 0; }
 /* The @ belongs to the name, not to the row: it is one token with a gap in it
    otherwise. */
 .mmc-cast-namerow .mmc-asset-handle { font-size: calc(13px * var(--mmc-type)); margin-right: -6px; }
@@ -292,10 +349,14 @@ img.mmc-cast-face { cursor: zoom-in; }
 .mmc-cast-name:hover { border-bottom-color: var(--mmc-line); }
 .mmc-cast-name:focus { border-bottom-color: var(--tag, var(--mmc-accent)); }
 .mmc-cast-name::placeholder { color: var(--mmc-off); font-weight: 400; }
+/* Keep the name readable at the chosen type size. The following pills wrap as
+   whole controls rather than squeezing this input or separating its @ prefix. */
+.mmc-cast-namerow > .mmc-cast-name {
+  flex: 0 1 12ch; max-width: calc(100% - 2ch - 8px);
+}
 
-/* What they are. A word, not a pill: it sits inside the name line as the rest of
-   the sentence "@anna is a person", and a bordered chip there would read as a
-   second control of the same weight as the name itself. */
+/* Base type styling. The open identity's name row gives this and preservation
+   the matching bordered pill skin below. */
 .mmc-cast-takes {
   background: none; border: 0; padding: 2px 4px; border-radius: 6px;
   color: var(--mmc-dim); font-family: inherit; font-size: calc(11.5px * var(--mmc-type)); cursor: pointer;
@@ -310,6 +371,142 @@ img.mmc-cast-face { cursor: zoom-in; }
 }
 .mmc-cast-desc:focus { border-color: var(--mmc-line); }
 .mmc-cast-desc::placeholder { color: var(--mmc-off); }
+/* Description and replacement read down the name's own lane.
+   The permanent description title stays outside the editable text, and long
+   labels may wrap rather than reducing the user's selected text size. */
+.mmc-cast-description {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 8px; min-width: 0;
+}
+.mmc-cast-description-label {
+  display: inline-flex; align-items: center; gap: 4px;
+  flex: 0 0 calc(38px + 74px * var(--mmc-type)); min-width: 0; max-width: 100%; color: var(--mmc-dim);
+  font-size: calc(11px * var(--mmc-type)); line-height: 1.45; overflow-wrap: anywhere;
+}
+.mmc-cast-preset-label {
+  flex: 1; min-width: 0; padding: 4px 3px; border: 1px solid var(--mmc-line-2); border-radius: 999px;
+  color: var(--mmc-dim); background: var(--mmc-surface-2); font: inherit; cursor: pointer; white-space: nowrap;
+}
+.mmc-cast-preset-label:hover, .mmc-cast-preset-label:focus-visible { color: var(--mmc-accent); border-color: var(--mmc-accent); }
+.mmc-cast-field-colon { flex: none; width: 4px; text-align: center; }
+.mmc-cast-description > .mmc-cast-desc {
+  flex: 1 1 10em; min-width: 0; width: auto;
+}
+.mmc-cast-field-destination {
+  flex: 1 0 100%; min-width: 0; font-size: calc(10px * var(--mmc-type));
+  color: var(--mmc-off); line-height: 1.4; overflow-wrap: anywhere;
+}
+.mmc-cast-description textarea.mmc-cast-desc {
+  resize: vertical; min-height: calc(30px * var(--mmc-type)); line-height: 1.5; border-color: var(--mmc-line);
+}
+.mmc-cast-help {
+  flex: none; width: 18px; height: 18px; padding: 0; border: 1px solid var(--mmc-line-2);
+  border-radius: 999px; color: var(--mmc-dim); background: none; font: inherit;
+  font-size: calc(11px * var(--mmc-type)); line-height: 1; cursor: pointer;
+}
+.mmc-cast-help:hover, .mmc-cast-help:focus-visible { color: var(--mmc-accent); border-color: var(--mmc-accent); }
+.mmc-cast-help-overlay { padding: 24px; }
+.mmc-modal.mmc-cast-help-dialog { width: min(calc(1380px * var(--mmc-type)), 100%); height: auto; max-height: none; }
+.mmc-cast-help-dialog .mmc-modal-head { flex-shrink: 0; padding: 18px 24px; }
+.mmc-cast-help-content {
+  padding: 18px 24px 22px; min-height: 0; overflow: visible;
+  font-size: calc(13px * var(--mmc-type)); line-height: 1.65; user-select: text;
+}
+.mmc-cast-help-content p { margin: 0 0 14px; color: var(--mmc-dim); }
+.mmc-cast-help-content table { display: block; width: 100%; }
+.mmc-cast-help-content thead { display: none; }
+.mmc-cast-help-content tbody { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr)); gap: 10px; }
+.mmc-cast-help-content tr {
+  display: flex; flex-direction: column; gap: 6px; padding: 10px 12px;
+  border: 1px solid var(--mmc-line); border-radius: 12px; background: var(--mmc-surface-2); min-width: 0;
+}
+.mmc-cast-help-content th, .mmc-cast-help-content td {
+  display: block; padding: 0; border: 0; text-align: left; overflow-wrap: anywhere;
+}
+.mmc-cast-help-content td:first-child { font-weight: 500; color: var(--mmc-text); }
+.mmc-cast-help-content td:nth-child(2) { color: var(--mmc-dim); font-size: .9em; }
+.mmc-cast-help-content td:last-child { margin-top: auto; padding-top: 4px; color: var(--mmc-off); }
+.mmc-cast-help-content th { color: var(--mmc-dim); font-weight: 600; }
+.mmc-cast-help-content code { font-size: .85em; white-space: normal; overflow-wrap: anywhere; }
+.mmc-cast-help-pages { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 10px; padding-top: 12px; }
+.mmc-cast-help-pages[hidden] { display: none; }
+.mmc-cast-help-pages .mmc-btn { border-radius: 999px; padding: 5px 12px; font: inherit; font-size: .9em; }
+.mmc-cast-field-group {
+  display: flex; flex-direction: column; gap: 10px; padding: 10px; margin-top: 2px;
+  border: 1px solid var(--mmc-line); border-radius: 14px; background: var(--mmc-surface);
+  min-width: 0; box-sizing: border-box;
+}
+.mmc-cast-replacement-group .mmc-cast-place { opacity: 1; }
+.mmc-cast-replacement-group .mmc-cast-place > .mmc-cast-desc { border-color: var(--mmc-line); }
+.mmc-cast-replacement-group .mmc-cast-place-controls { flex-wrap: wrap; gap: 8px 8px; }
+.mmc-cast-place-controls > .mmc-cast-description-label { padding-top: 0; }
+.mmc-cast-replacement-group .mmc-cast-place-clip { border-radius: 999px; white-space: normal; overflow-wrap: anywhere; max-width: 100%; }
+.mmc-cast-replacement-thumbs { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.mmc-cast-replacement-thumbs:empty { display: none; }
+.mmc-cast-menu-actions { display: flex; gap: 6px; padding: 0 8px 10px 58px; }
+.mmc-cast-menu-actions .mmc-btn {
+  font: inherit; font-size: calc(11px * var(--mmc-type)); white-space: normal; cursor: pointer;
+  border: 1px solid var(--mmc-line); border-radius: 999px; padding: 5px 9px;
+  background: var(--mmc-surface-2); color: var(--mmc-dim);
+}
+
+.mmc-replacement-card {
+  display: flex; flex-direction: column; gap: 12px; width: min(1100px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px); overflow: auto; padding: 20px; box-sizing: border-box;
+  color: var(--mmc-text); background: var(--mmc-surface); border: 1px solid var(--mmc-line);
+  border-radius: 18px; font: inherit;
+}
+.mmc-replacement-card .mmc-btn {
+  font: inherit; font-size: calc(12px * var(--mmc-type)); line-height: 1.3;
+  padding: 7px 12px; border: 1px solid var(--mmc-line-2); border-radius: 999px;
+  background: var(--mmc-surface-2); color: var(--mmc-text); cursor: pointer;
+}
+.mmc-replacement-card .mmc-btn:hover:not(:disabled) { border-color: var(--mmc-line-3); background: var(--mmc-surface-3); }
+.mmc-replacement-card .mmc-btn-primary { background: var(--mmc-accent); border-color: var(--mmc-accent); color: var(--mmc-on-accent); font-weight: 600; }
+.mmc-replacement-card .mmc-btn:disabled { opacity: .45; cursor: default; }
+.mmc-replacement-head { display: flex; align-items: center; gap: 9px; font-weight: 600; min-width: 0; }
+.mmc-replacement-file { margin-left: auto; color: var(--mmc-dim); font-weight: normal; font-size: calc(11px * var(--mmc-type)); overflow-wrap: anywhere; }
+.mmc-replacement-note { margin: 0; color: var(--mmc-dim); font-size: calc(12px * var(--mmc-type)); line-height: 1.5; }
+.mmc-replacement-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding-bottom: 12px; border-bottom: 1px solid var(--mmc-line); }
+.mmc-replacement-tools label { display: inline-flex; align-items: center; gap: 7px; font-size: calc(12px * var(--mmc-type)); }
+.mmc-replacement-tools input[type=color] { width: 30px; height: 28px; padding: 2px; border: 1px solid var(--mmc-line); border-radius: 6px; background: var(--mmc-surface-2); }
+.mmc-replacement-tools input[type=range] { width: 100px; }
+.mmc-replacement-tools button[aria-pressed=true] { color: var(--mmc-accent); border-color: var(--mmc-accent); background: color-mix(in srgb, var(--mmc-accent) 10%, transparent); }
+.mmc-replacement-viewport { display: flex; justify-content: center; align-items: center; min-height: 100px; min-width: 0; }
+.mmc-replacement-stage { display: block; width: auto; height: auto; max-width: 100%; max-height: 55vh; touch-action: none; cursor: crosshair; border-radius: 8px; }
+.mmc-replacement-transport { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.mmc-replacement-transport input { flex: 1; min-width: 40px; }
+.mmc-replacement-time { font-size: calc(12px * var(--mmc-type)); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mmc-replacement-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--mmc-line); }
+.mmc-replacement-status { flex: 1 1 180px; color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .mmc-cast-help-overlay { padding: 12px; }
+  .mmc-cast-help-dialog .mmc-modal-head { padding: 12px; }
+  .mmc-cast-help-content { padding: 14px 12px; }
+  .mmc-replacement-card { width: calc(100vw - 24px); max-height: calc(100vh - 24px); padding: 12px; }
+  .mmc-replacement-head { flex-wrap: wrap; }
+  .mmc-replacement-file { width: 100%; margin-left: 0; }
+  .mmc-replacement-transport { flex-wrap: wrap; }
+  .mmc-replacement-transport input { order: -1; flex-basis: 100%; }
+}
+/* Only the grouped identity fields keep their existing focus skin at rest;
+   notes, feature editors, names and other input surfaces are not changed. */
+.mmc-cast-field-group .mmc-cast-desc {
+  border-color: var(--mmc-line); background: var(--mmc-surface-2);
+}
+.mmc-cast-field-group .mmc-cast-desc:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 1px;
+}
+.mmc-cast-place-controls {
+  display: flex; align-items: center; flex-wrap: nowrap; gap: 6px;
+  min-width: 0; max-width: 100%;
+}
+.mmc-cast-place-controls > .mmc-cast-place-kind {
+  min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere;
+}
+.mmc-cast-place-controls > .mmc-cast-place-clip {
+  border-radius: 999px; flex: 0 1 auto;
+  min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere;
+}
 
 .mmc-cast-side { display: flex; gap: 4px; align-items: center; flex: none; }
 .mmc-cast-where { font-size: calc(11px * var(--mmc-type)); color: var(--mmc-dim); white-space: nowrap; }
@@ -335,6 +532,7 @@ img.mmc-cast-face { cursor: zoom-in; }
   display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
   padding-left: 58px; min-width: 0;
 }
+.mmc-cast-ident > .mmc-cast-refs { padding-left: 0; }
 .mmc-cast-ref {
   position: relative; padding: 0; border: 0; background: none; cursor: pointer;
   border-radius: 9px; line-height: 0; flex: none;
@@ -372,14 +570,14 @@ img.mmc-cast-face { cursor: zoom-in; }
 }
 /* Bottom-left leaves the role badge and both note/size corners readable. */
 .mmc-cast-muted { left: -3px; right: auto; color: var(--mmc-off); }
-/* The other two corners. Top-left: the file is encoded at full detail, in the
+/* The other two corners. Top-left: the file's actual encoding mode, in the
    marker's monospace — it is what the model is handed, and it is the setting
    that costs. Top-right: words are attached to this file; the tooltip and the
    tile's menu carry them. Both shared with the library sheet's tiles, which say
    the same two things about the same files. */
 .mmc-cast-size {
   position: absolute; left: -3px; top: -3px; padding: 0 3px; border-radius: 4px;
-  line-height: 12px; font-size: calc(8.5px * var(--mmc-type)); letter-spacing: .04em;
+  line-height: 12px; font-size: min(calc(8.5px * var(--mmc-type)), 10px); letter-spacing: .04em;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   background: var(--mmc-surface-3); color: var(--mmc-dim);
   box-shadow: 0 0 0 2px var(--mmc-surface);
@@ -388,6 +586,8 @@ img.mmc-cast-face { cursor: zoom-in; }
   position: absolute; right: -2px; top: -2px; width: 7px; height: 7px; border-radius: 999px;
   background: var(--mmc-accent); box-shadow: 0 0 0 2px var(--mmc-surface);
 }
+.mmc-cast-ref:has(> .mmc-cast-size) > .mmc-cast-noted,
+.mmc-cast-face:has(> .mmc-cast-size) > .mmc-cast-noted { top: 14px; }
 /* ...and hollow where the file has words to wake on: a rule rather than a
    caption. The same ring the card's chip draws in front of the words. */
 .mmc-cast-noted.wake {
@@ -400,6 +600,23 @@ img.mmc-cast-face { cursor: zoom-in; }
    wears the hollow ring inside its left edge — filled in, the two fields are
    two lines of words, and the ring is what says which line is the rule. */
 .mmc-cast-menu-words { display: flex; flex-direction: column; }
+/* Popovers can sit above the next overlay in ComfyUI's stack. Keep this menu's
+   layout/typed inputs mounted, but invisible and inert while its viewer is up. */
+.mmc-cast-preview-menu[data-previewing="1"],
+.mmc-cast-clip-menu[data-previewing="1"] { visibility: hidden; pointer-events: none; }
+.mmc-cast-role-preview {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  width: calc(100% - 16px); height: clamp(96px, 28vh, 220px); min-width: 0;
+  box-sizing: border-box; margin: 0 8px 8px; padding: 8px;
+  overflow: hidden; border: 1px solid var(--mmc-line); border-radius: 12px;
+  background: var(--mmc-surface); cursor: zoom-in;
+}
+.mmc-cast-role-preview > img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
+.mmc-cast-role-preview:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: -2px; }
+.mmc-cast-preview-error { flex: none; max-width: 100%; color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); overflow-wrap: anywhere; }
+.mmc-cast-preview-error[hidden] { display: none; }
+.mmc-cast-preview-audio { display: flex; flex-direction: column; align-items: center; gap: 8px; max-width: 100%; color: var(--mmc-dim); overflow-wrap: anywhere; font-size: calc(12px * var(--mmc-type)); }
+.mmc-cast-preview-audio svg { flex: none; }
 .mmc-cast-menu-words .mmc-cast-menu-lead + .mmc-cast-menu-lead { padding-top: 0; }
 .mmc-cast-menu-wake { position: relative; }
 .mmc-cast-menu-wake::before {
@@ -517,18 +734,48 @@ img.mmc-cast-face { cursor: zoom-in; }
    the same face the compiled prompt sets its field names in: across both
    surfaces that face means "this is the word the model is handed". */
 .mmc-cast-marker {
-  display: flex; align-items: baseline; gap: 8px; align-self: flex-start;
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; align-self: flex-start;
+  min-width: 0; max-width: 100%; box-sizing: border-box;
   appearance: none; border: 0; background: none; cursor: pointer;
-  padding: 3px 6px; margin: 6px 0 0 -6px; border-radius: 6px;
+  padding: 3px 6px; margin: 0 0 0 -6px; border-radius: 6px;
   font: inherit; text-align: left;
 }
 .mmc-cast-marker:hover { background: var(--mmc-surface-2); }
 .mmc-cast-marker-value {
+  min-width: 0; max-width: 100%; overflow-wrap: anywhere;
   color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); letter-spacing: .04em;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
-.mmc-cast-marker-say, .mmc-cast-marker-forced { color: var(--mmc-off); font-size: calc(10.5px * var(--mmc-type)); }
+.mmc-cast-marker-say, .mmc-cast-marker-forced {
+  min-width: 0; max-width: 100%; overflow-wrap: anywhere;
+  color: var(--mmc-off); font-size: calc(10.5px * var(--mmc-type));
+}
 .mmc-cast-marker.forced .mmc-cast-marker-value { color: var(--mmc-accent); }
+/* Type and preservation are neighbouring controls in the open name row. Keep
+   their pill skins identical while preserving the marker's meaningful colours
+   and full vocabulary. Long markers wrap inside their own bounded pill. */
+.mmc-cast-namerow > .mmc-cast-takes,
+.mmc-cast-namerow > .mmc-cast-primary-size,
+.mmc-cast-namerow > .mmc-cast-marker {
+  display: inline-flex; align-items: center; align-self: center; flex: 0 1 auto;
+  min-width: 0; max-width: 100%; min-height: calc(26px * var(--mmc-type));
+  box-sizing: border-box; border: 1px solid var(--mmc-line-2); border-radius: 999px;
+  padding: 3px 9px; margin: 0; background: none;
+}
+.mmc-cast-namerow > .mmc-cast-takes,
+.mmc-cast-namerow > .mmc-cast-primary-size { flex: none; }
+.mmc-cast-primary-size {
+  color: var(--mmc-dim); font-family: inherit; font-size: calc(11px * var(--mmc-type));
+  line-height: 1.3; cursor: pointer;
+}
+.mmc-cast-namerow > .mmc-cast-takes:hover,
+.mmc-cast-namerow > .mmc-cast-primary-size:hover,
+.mmc-cast-namerow > .mmc-cast-marker:hover { background: var(--mmc-surface-2); }
+.mmc-cast-namerow > .mmc-cast-takes:focus-visible,
+.mmc-cast-namerow > .mmc-cast-primary-size:focus-visible,
+.mmc-cast-namerow > .mmc-cast-marker:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 1px;
+}
 
 .mmc-cast-line { display: flex; gap: 8px; align-items: center; padding-left: 58px; min-width: 0; }
 /* The place they take, offered rather than hidden behind a thumbnail's menu:
@@ -595,10 +842,16 @@ img.mmc-cast-face { cursor: zoom-in; }
 
 /* --- the menus ------------------------------------------------------------- */
 
-/* Two lines and a picture per row, where a sampler's menu is one word. Wider
-   than a choice popover for the same reason: "Their looks come from this" and the
-   sentence under it are what make the four roles tellable apart. */
-.mmc-cast-menu { min-width: 290px; max-width: 340px; }
+/* A picture and two readable lines distinguish these file choices from the
+   sampler's single-word options. Cast menu widths are fitted below. */
+.mmc-cast-clip-option {
+  display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; border-radius: 10px;
+}
+.mmc-cast-clip-option:hover { background: var(--mmc-surface-2); }
+.mmc-cast-clip-option > .mmc-cast-menu-thumb { width: 38px; height: 38px; cursor: pointer; }
+.mmc-cast-menu .mmc-cast-clip-option > .mmc-opt {
+  flex: 1; min-width: 0; align-self: stretch; padding: 0; background: none;
+}
 .mmc-cast-menu .mmc-opt { align-items: flex-start; padding: 8px 10px; }
 .mmc-cast-menu .mmc-opt-label { align-items: flex-start; gap: 9px; min-width: 0; }
 .mmc-cast-menu-head {
@@ -622,5 +875,87 @@ img.mmc-cast-face { cursor: zoom-in; }
    to one line the way an option's usually is. */
 .mmc-cast-menu .mmc-opt-label > .mmc-cast-menu-text > span:first-child {
   font-size: calc(13px * var(--mmc-type)); line-height: 1.35;
+}
+/* Cast menus size themselves from their complete content. The menu fitter
+   widens/reflows choices, and pages long file lists, instead of clipping them
+   behind the short-popover scroll cap. Other picker/dialog surfaces are not
+   changed by this layout. */
+.mmc-pop.mmc-cast-fit-menu {
+  width: min(420px, calc(100vw - 16px)); min-width: 0; max-width: calc(100vw - 16px);
+  height: auto; max-height: none; overflow: visible; box-sizing: border-box;
+}
+.mmc-cast-menu-top {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
+  padding: 6px 8px 10px; margin-bottom: 8px; border-bottom: 1px solid var(--mmc-line);
+  min-width: 0;
+}
+.mmc-cast-menu-top > .mmc-pop-title {
+  flex: 0 1 auto; min-width: 0; max-width: 100%; padding: 0;
+  line-height: 1.4; overflow-wrap: anywhere;
+}
+.mmc-cast-menu-sizes {
+  display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  max-width: 100%; padding-left: 10px; border-left: 1px solid var(--mmc-line);
+}
+.mmc-cast-size-pill {
+  padding: 4px 10px; border: 1px solid var(--mmc-line); border-radius: 999px;
+  background: var(--mmc-surface); color: var(--mmc-dim); font-family: inherit;
+  font-size: calc(11px * var(--mmc-type)); line-height: 1.3; cursor: pointer;
+}
+.mmc-cast-size-pill:hover, .mmc-cast-size-pill:focus-visible { color: var(--mmc-text); border-color: var(--mmc-line-3); }
+.mmc-cast-size-pill[aria-pressed="true"] {
+  color: var(--mmc-accent); border-color: color-mix(in srgb, var(--mmc-accent) 45%, transparent);
+  background: color-mix(in srgb, var(--mmc-accent) 10%, transparent);
+}
+.mmc-cast-menu-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
+.mmc-cast-fit-menu.wide .mmc-cast-menu-layout:has(> .mmc-cast-menu-context) {
+  grid-template-columns: minmax(220px, .85fr) minmax(0, 1.55fr); gap: 12px;
+}
+.mmc-cast-menu-context, .mmc-cast-menu-sections, .mmc-cast-menu-section { min-width: 0; }
+.mmc-cast-fit-menu.wide .mmc-cast-menu-context { padding-right: 12px; border-right: 1px solid var(--mmc-line); }
+.mmc-cast-fit-menu .mmc-cast-menu-field { min-width: 0; }
+.mmc-cast-fit-menu .mmc-cast-role-preview { margin: 0 0 8px; width: 100%; }
+.mmc-cast-fit-menu .mmc-cast-menu-lead { padding-left: 0; padding-right: 0; }
+.mmc-cast-fit-menu .mmc-cast-menu-wake::before { left: 9px; }
+.mmc-cast-fit-menu .mmc-cast-menu-wear > svg { left: 8px; }
+.mmc-cast-menu-section + .mmc-cast-menu-section { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--mmc-line); }
+.mmc-cast-fit-menu .mmc-cast-menu-head { padding: 4px 8px 6px; overflow-wrap: anywhere; }
+.mmc-cast-menu-rows {
+  display: grid; grid-template-columns: repeat(var(--mmc-cast-menu-cols, 1), minmax(0, 1fr));
+  gap: 4px 6px; min-width: 0; align-items: start;
+}
+.mmc-cast-menu-item { min-width: 0; }
+.mmc-cast-menu-item[hidden], .mmc-cast-menu-pages[hidden] { display: none; }
+.mmc-cast-fit-menu .mmc-opt { min-width: 0; max-width: 100%; box-sizing: border-box; gap: 8px; padding: 7px 8px; }
+.mmc-cast-fit-menu .mmc-opt-label { flex: 1; min-width: 0; }
+.mmc-cast-fit-menu .mmc-cast-menu-text { max-width: 100%; overflow-wrap: anywhere; }
+.mmc-cast-fit-menu .mmc-cast-menu-text > span { white-space: normal; }
+.mmc-cast-fit-menu .mmc-radio { margin-top: 2px; }
+.mmc-cast-fit-menu .mmc-cast-clip-option { padding: 7px 8px; gap: 10px; }
+.mmc-cast-fit-menu .mmc-cast-menu-actions { padding: 0 8px 7px; flex-wrap: wrap; }
+.mmc-cast-menu-pages {
+  display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px;
+  padding: 10px 8px 2px; margin-top: 8px; border-top: 1px solid var(--mmc-line);
+  color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); line-height: 1.4;
+}
+.mmc-cast-menu-pages .mmc-btn {
+  max-width: 100%; padding: 5px 10px; border: 1px solid var(--mmc-line); border-radius: 999px;
+  background: var(--mmc-surface); color: var(--mmc-dim); font: inherit; white-space: normal; cursor: pointer;
+}
+.mmc-cast-menu-pages .mmc-btn:hover:not(:disabled) { color: var(--mmc-text); border-color: var(--mmc-line-3); }
+.mmc-cast-menu-pages .mmc-btn:disabled { opacity: .45; cursor: default; }
+.mmc-cast-fit-menu.compact .mmc-cast-role-preview { height: clamp(80px, 18vh, 144px); }
+.mmc-cast-fit-menu.compact .mmc-cast-menu-item > .mmc-opt,
+.mmc-cast-fit-menu.compact .mmc-cast-clip-option { padding-top: 6px; padding-bottom: 6px; }
+/* Only raw file-path metadata gets a two-line summary. Its full text remains
+   in the DOM/title; role explanations and editing instructions always wrap. */
+.mmc-cast-fit-menu .mmc-cast-menu-path {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  max-width: 100%; overflow: hidden; overflow-wrap: anywhere;
+}
+/* Audio labels are text, not a fixed-height image. Let the icon and both path
+   lines occupy their real height, including in compact menus. */
+.mmc-cast-fit-menu .mmc-cast-role-preview:has(> .mmc-cast-preview-audio) {
+  height: auto; min-height: 100px; overflow: visible;
 }
 `;

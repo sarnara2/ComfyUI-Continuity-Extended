@@ -689,6 +689,13 @@ function project(cam, point, width, height) {
   return { x: width / 2 + (fl * x1) / z2, y: height / 2 - (fl * y2) / z2, z: z2 };
 }
 
+// These sentences are generation inputs, not interface labels. Interpolate
+// handles and values without applying the viewer's locale to model prose.
+function modelText(text, params = {}) {
+  return text.replace(/\{(\w+)\}/g, (slot, name) =>
+    Object.hasOwn(params, name) ? String(params[name]) : slot);
+}
+
 /** Where a piece sits in this frame, as words — or null when it is out of shot.
  *  Thirds across, three depth bands away: the vocabulary a shot list uses, and
  *  coarse on purpose — "at frame left in the midground" survives the model's
@@ -696,10 +703,10 @@ function project(cam, point, width, height) {
 function placeOf(piece, cam, width, height) {
   const at = project(cam, centreOf(piece), width, height);
   if (!at || at.x < 0 || at.x > width || at.y < -0.2 * height || at.y > 1.2 * height) return null;
-  const third = at.x < width * 0.36 ? t("at frame left")
-    : at.x > width * 0.64 ? t("at frame right") : t("at centre");
-  const band = at.z < 3.2 ? t("in the foreground")
-    : at.z < 9 ? t("in the midground") : t("in the distance");
+  const third = at.x < width * 0.36 ? modelText("at frame left")
+    : at.x > width * 0.64 ? modelText("at frame right") : modelText("at centre");
+  const band = at.z < 3.2 ? modelText("in the foreground")
+    : at.z < 9 ? modelText("in the midground") : modelText("in the distance");
   return { words: `${third} ${band}`, depth: at.z };
 }
 
@@ -707,7 +714,7 @@ function placeOf(piece, cam, width, height) {
 function articled(word) {
   const said = String(word).trim();
   if (/^(a|an|the|some|its|his|her|their|two|three|four)\b/i.test(said)) return said;
-  return `${/^[aeiou]/i.test(said) ? t("an") : t("a")} ${said}`;
+  return `${/^[aeiou]/i.test(said) ? modelText("an") : modelText("a")} ${said}`;
 }
 
 /** The cast member the move ends on, or null: the piece playing somebody whose
@@ -755,11 +762,11 @@ export function stagingSentence(objects, marks, duration, cam, size = { w: 16, h
     || (p.here.depth - q.here.depth));
   for (const { piece, here } of placed) {
     clauses.push(piece.plays
-      ? t("@{who} stands {place}", { who: piece.plays, place: here.words })
-      : t("{what} {place}", { what: articled(piece.word), place: here.words }));
+      ? modelText("@{who} stands {place}", { who: piece.plays, place: here.words })
+      : modelText("{what} {place}", { what: articled(piece.word), place: here.words }));
   }
   for (const piece of entering) {
-    clauses.push(t("@{who} comes into frame as the camera moves", { who: piece.plays }));
+    clauses.push(modelText("@{who} comes into frame as the camera moves", { who: piece.plays }));
   }
   const move = moveSentence(marks, duration, moveTarget(objects, marks, cam, size.w, size.h));
   if (!clauses.length) return move;
@@ -779,7 +786,7 @@ export function stagingSentence(objects, marks, duration, cam, size = { w: 16, h
 // moves as prose without labels, which this already is.
 
 export function moveSentence(marks, duration, target = null) {
-  if (!marks || marks.length < 2) return t("The camera holds a static shot.");
+  if (!marks || marks.length < 2) return modelText("The camera holds a static shot.");
   const a = marks[0], b = marks[marks.length - 1];
   const right = rightOf(a), ahead = flatForwardOf(a);
   const dx = (b.x - a.x) * right[0] + (b.z - a.z) * right[2];
@@ -792,35 +799,35 @@ export function moveSentence(marks, duration, target = null) {
   if (Math.abs(dx) > 0.6 && Math.abs(dyaw * DEG) > 8 && Math.sign(dyaw) !== Math.sign(dx)) {
     // Around whom is geometry's answer where there is one: the cast member the
     // last frame holds at its centre. "The subject" is the honest fallback.
-    const around = target ? `@${target}` : t("the subject");
+    const around = target ? `@${target}` : modelText("the subject");
     moves.push({ mag: Math.abs(dx) / 1.5,
-                 words: dx > 0 ? t("arcs right around {who}", { who: around })
-                               : t("arcs left around {who}", { who: around }) });
+                 words: dx > 0 ? modelText("arcs right around {who}", { who: around })
+                               : modelText("arcs left around {who}", { who: around }) });
   } else {
-    if (Math.abs(dx) > 0.25) moves.push({ mag: Math.abs(dx) / 1.5, words: dx > 0 ? t("trucks right") : t("trucks left") });
-    if (Math.abs(dyaw * DEG) > 5) moves.push({ mag: Math.abs(dyaw * DEG) / 25, words: dyaw > 0 ? t("pans right") : t("pans left") });
+    if (Math.abs(dx) > 0.25) moves.push({ mag: Math.abs(dx) / 1.5, words: dx > 0 ? modelText("trucks right") : modelText("trucks left") });
+    if (Math.abs(dyaw * DEG) > 5) moves.push({ mag: Math.abs(dyaw * DEG) / 25, words: dyaw > 0 ? modelText("pans right") : modelText("pans left") });
   }
   if (Math.abs(dz) > 0.3) {
     moves.push({ mag: Math.abs(dz) / 2,
                  words: dz > 0
-                   ? (target ? t("pushes in toward @{who}", { who: target }) : t("pushes in"))
-                   : t("pulls out") });
+                   ? (target ? modelText("pushes in toward @{who}", { who: target }) : modelText("pushes in"))
+                   : modelText("pulls out") });
   }
-  if (Math.abs(dy) > 0.25) moves.push({ mag: Math.abs(dy), words: dy > 0 ? t("pedestals up") : t("pedestals down") });
-  if (Math.abs(dpitch * DEG) > 5) moves.push({ mag: Math.abs(dpitch * DEG) / 25, words: dpitch > 0 ? t("tilts up") : t("tilts down") });
-  if (Math.abs(dmm) > 6) moves.push({ mag: Math.abs(dmm) / 30, words: dmm > 0 ? t("zooms in") : t("zooms out") });
-  if (!moves.length) return t("The camera holds a static shot.");
+  if (Math.abs(dy) > 0.25) moves.push({ mag: Math.abs(dy), words: dy > 0 ? modelText("pedestals up") : modelText("pedestals down") });
+  if (Math.abs(dpitch * DEG) > 5) moves.push({ mag: Math.abs(dpitch * DEG) / 25, words: dpitch > 0 ? modelText("tilts up") : modelText("tilts down") });
+  if (Math.abs(dmm) > 6) moves.push({ mag: Math.abs(dmm) / 30, words: dmm > 0 ? modelText("zooms in") : modelText("zooms out") });
+  if (!moves.length) return modelText("The camera holds a static shot.");
   moves.sort((p, q) => q.mag - p.mag);
   // The two strongest, because a prompt should name the move and not inventory
   // it: "pushes in and pedestals up" is a move, five clauses is a flight plan.
-  const top = moves.slice(0, 2).map((m) => m.words).join(` ${t("and")} `);
+  const top = moves.slice(0, 2).map((m) => m.words).join(` ${modelText("and")} `);
   const mag = moves[0].mag;
-  const amp = mag > 1.7 ? t("large") : mag < 0.42 ? t("small") : "";
+  const amp = mag > 1.7 ? modelText("large") : mag < 0.42 ? modelText("small") : "";
   const rate = mag / Math.max(0.5, duration);
-  const speed = rate > 0.55 ? t("fast") : rate < 0.18 ? t("slow") : "";
-  let sentence = t("The camera {moves}", { moves: top });
-  if (amp) sentence += " " + t("with {amp} amplitude", { amp });
-  if (speed) sentence += " " + t("at {speed} speed", { speed });
+  const speed = rate > 0.55 ? modelText("fast") : rate < 0.18 ? modelText("slow") : "";
+  let sentence = modelText("The camera {moves}", { moves: top });
+  if (amp) sentence += " " + modelText("with {amp} amplitude", { amp });
+  if (speed) sentence += " " + modelText("at {speed} speed", { speed });
   return sentence + ".";
 }
 

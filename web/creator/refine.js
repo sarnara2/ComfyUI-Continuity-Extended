@@ -45,6 +45,9 @@ import { busy as queueBusy, run as runJob } from "./queue.js";
 const SETTING = "refiner";
 const STORE = "continuity.refiner";
 const LEGACY_STORE = "minimax_creator.refiner";
+// A bundled alternative, not a new default. Keep its stored id stable while
+// giving this experimental option a readable name in the user's language.
+const FAITHFUL_BETA_SKILL = "minimax-h3-faithful-beta";
 
 const DEFAULTS = {
   // A text encoder in ComfyUI's own process, managed and evicted like any other
@@ -72,6 +75,8 @@ const DEFAULTS = {
   temperature: 0.3,
   seed: -1,
   language: "English",
+  // Refiner input only; generation keeps the piece's references unchanged.
+  reference_images: true,
   // Which skill package or prompt file writes the rewrite instead of the
   // built-in prompts. Empty is the built-in harness; a name is a `.skill` or a
   // `.md` under the node's skills/ folder.
@@ -389,10 +394,8 @@ export function chosenSkillMode(name, entries = skillCache.entries, current = se
  */
 /**
  * The refiner's half of a refine request: which backend, which model, and the
- * dials. One spelling, because two callers send it — the button here, and the
- * chat room's Refine switch, which puts a render's prompt through the same
- * prompting before queueing. `chat.REFINE_FIELDS` on the server reads exactly
- * these names, and `tests/test_chat_mirror.py` holds the two lists together.
+ * dials. Shared by individual fields, a segment and the whole timeline.
+ * The chat room's thinker request is separate from these rewrite settings.
  */
 export function refineRequest(current = settings()) {
   const { temperature, seed, language, maxTokens, skill } = current;
@@ -407,6 +410,7 @@ export function refineRequest(current = settings()) {
   return {
     model: chosenModel(current), backend, temperature, seed, language,
     max_tokens: maxTokens, skill, skill_mode: skillMode,
+    reference_images: current.reference_images !== false,
     // Meaningless to the in-process backend, which frees its weights after
     // every generation regardless.
     eject: backend === "remote" && current.eject === true,
@@ -420,9 +424,115 @@ export async function refine(payload, options) {
   // family's refiner writes the rewrite, and a template pinned for another
   // one must not ride along with it.
   const template = chosenTemplate(pieceFamily(payload.data), current);
-  return await runJob("/continuity/refine", {
-    ...payload, ...refineRequest(current), template,
-  }, options);
+  try {
+    if (current.reference_images === false) {
+      // An older live Python process ignores unknown request fields. Never
+      // silently send images when this browser explicitly asked not to.
+      let supported = false;
+      try {
+        const response = await api.fetchApi("/continuity/refine/capabilities");
+        supported = response.ok && (await response.json()).reference_images === true;
+      } catch { /* A failed probe cannot establish text-only support. */ }
+      if (!supported) throw new Error(t("Restart ComfyUI to enable text-only refining. No fields were changed."));
+    }
+    return await runJob("/continuity/refine", {
+      ...payload, ...refineRequest(current), template,
+    }, options);
+  } catch (error) {
+    if (error instanceof Error) error.message = t(payload.kind === "field" && payload.field === "all"
+      && /unknown refine field target/.test(error.message)
+      ? "Restart ComfyUI to enable field-only refining. No fields were changed." : error.message);
+    throw error;
+  }
+}
+
+/** A field owns one input; `segment` owns the three inputs of one card. */
+export async function refineField(target, field = "prompt", options) {
+  const scope = target.kind === "timeline" ? "timeline" : "segment";
+  const fields = scope === "segment" ? ["prompt", "summary", "retention_analysis", "segment"]
+    : ["prompt", "soundscape", "music"];
+  if (!["creator", "segment", "timeline"].includes(target.kind)
+      || !fields.includes(field)) {
+    throw new Error(t("the refiner returned an invalid result for this field"));
+  }
+  const index = scope === "segment" ? (target.kind === "creator" ? 0 : target.index) : null;
+  let result;
+  try {
+    // A new kind is intentional: an older, still-running Python server must
+    // reject this request rather than rewrite the piece and discard its output.
+    result = await refine({ kind: "field", scope, field, index, data: target.data }, options);
+  } catch (error) {
+    if (/unknown refine target ['"]field['"]/.test(String(error.message || error))) {
+      throw new Error(t("Restart ComfyUI to enable field-only refining. No fields were changed."));
+    }
+    throw error;
+  }
+  if (result?.scope !== "field" || result.target_scope !== scope || result.field !== field
+      || (scope === "segment" && result.index !== index)
+      || typeof result.body !== "string"
+      || (field !== "segment" && !result.body.trim() && result.unchanged !== true)
+      || (field === "segment" && (!result.sections || typeof result.sections !== "object"
+        || Object.keys(result.sections).sort().join(",") !== "retention_analysis,summary"
+        || Object.values(result.sections).some((value) => typeof value !== "string")))
+      || (field === "segment" && ["piece", "soundscape", "music", "shots"]
+        .some((key) => Object.hasOwn(result, key)))) {
+    throw new Error(t("the refiner returned an invalid result for this field"));
+  }
+  return result;
+}
+
+export async function refineSegment(target, options) {
+  if (!["creator", "segment"].includes(target.kind)) {
+    throw new Error(t("the refiner returned an invalid result for this field"));
+  }
+  return await refineField(target, "segment", options);
+}
+
+// A whole-piece reply arriving after a newer field rewrite would erase the
+// user's scoped result. Serialize refiners per live owner, never in its blob.
+const refineOwners = new WeakSet();
+const refineActivities = new WeakMap();
+
+/** One transient activity per source field, shared by every view of it. */
+export function refineActivity(owner, field) {
+  if (!refineActivities.has(owner)) refineActivities.set(owner, new Map());
+  const fields = refineActivities.get(owner);
+  if (!fields.has(field)) fields.set(field, { busy: false, waiting: false, progress: null, views: new Set() });
+  return fields.get(field);
+}
+
+export async function withRefineOwner(owner, run) {
+  if (refineOwners.has(owner)) {
+    throw new Error(t("Another refine is running for this piece. Wait until it finishes. No fields were changed."));
+  }
+  refineOwners.add(owner);
+  try { return await run(); }
+  finally { refineOwners.delete(owner); }
+}
+
+// File inventories stay one continuous vertical list. Only the list may scroll;
+// the containing popover and the non-file settings stay fully visible.
+function choiceList(choices, className = "", maxHeight = 210) {
+  const root = el("div", { class: "mmc-refine-choice-list " + className });
+  const rows = el("div", { class: "mmc-refine-choice-rows" }, choices);
+  const selected = choices.find(row => row.getAttribute("aria-checked") === "true");
+  let limit = maxHeight, pendingReveal = true;
+  rows.style.maxHeight = `${limit}px`;
+  root.mmcRefineList = {
+    shrink() {
+      if (limit <= 48) return false;
+      limit = Math.max(48, limit - 24); rows.style.maxHeight = `${limit}px`; return true;
+    },
+    reset() { limit = maxHeight; rows.style.maxHeight = `${limit}px`; pendingReveal = true; },
+    reveal() {
+      if (!pendingReveal || !rows.clientHeight) return;
+      pendingReveal = false;
+      if (selected) rows.scrollTop += selected.getBoundingClientRect().top - rows.getBoundingClientRect().top;
+    },
+  };
+  root.append(rows);
+  requestAnimationFrame(() => root.mmcRefineList.reveal());
+  return root;
 }
 
 /**
@@ -555,7 +665,8 @@ export async function drawRemoteCard(modelHost, changed, force = false) {
   }
   say("ok", t("Connected — {n} models", { n: names.length }));
   const chosen = settings().remoteModel;
-  rows.replaceChildren(...names.map((name) => el("button", {
+  rows.replaceChildren(choiceList(names.map((name) => el("button", {
+    type: "button",
     class: "mmc-opt",
     "aria-checked": name === chosen,
     title: name,
@@ -563,28 +674,69 @@ export async function drawRemoteCard(modelHost, changed, force = false) {
   }, [
     el("span", { class: "mmc-opt-label mmc-refine-name", text: name }),
     el("span", { class: "mmc-radio" }),
-  ])));
+  ])), "", 420));
 }
 
 // ---- settings popover -------------------------------------------------------
 
+let settingsSequence = 0;
+
 /**
  * Where the model and the sampling live.
  *
- * The model is the only thing anyone changes twice, so it is the whole of the
- * popover; the rest is folded away behind one line. Built out of the same
+ * Related controls share two columns on a normal screen. On smaller screens
+ * the same sections become explicit pages. Only file inventories scroll.
+ * Built out of the same
  * option rows and pills as the aspect and resolution popovers rather than as a
  * form — a `<select>` and two number inputs would be the only browser chrome in
  * the entire node.
  */
-export function openSettings(anchor, onChange, family = DEFAULT_VIDEO_FAMILY) {
-  const pop = el("div", { class: "mmc-pop mmc-refine-pop" });
+export function openSettings(anchor, onChange, family = DEFAULT_VIDEO_FAMILY, onClose = null) {
+  const pageId = `mmc-refiner-${++settingsSequence}`;
+  const pop = el("div", { class: "mmc-pop mmc-refine-pop", role: "dialog", "aria-label": t("Refiner") });
   const backendHost = el("div", { class: "mmc-refine-seg" });
   const modelHost = el("div", { class: "mmc-refine-models" });
   const noteHost = el("div", { class: "mmc-refine-hint mmc-refine-note" });
+  const referenceHost = el("div", { class: "mmc-refine-section mmc-refine-visual" });
   const skillHost = el("div", { class: "mmc-refine-section" });
   const templateHost = el("div", { class: "mmc-refine-section" });
   const moreHost = el("div", { class: "mmc-refine-more-body" });
+  const pages = [
+    el("section", { class: "mmc-refine-settings-page mmc-refine-model-page" }, [modelHost, noteHost]),
+    el("section", { class: "mmc-refine-settings-page mmc-refine-prompt-page" }, [referenceHost, skillHost, templateHost]),
+    el("section", { class: "mmc-refine-settings-page mmc-refine-sampling-page" }, [
+      el("span", { class: "mmc-note-key", text: t("Language and sampling") }), moreHost,
+    ]),
+  ];
+  let currentPage = 0;
+  const tabLabels = ["Model", "prompting", "Language and sampling"];
+  const tabs = el("div", { class: "mmc-refine-settings-tabs", role: "tablist", "aria-label": t("Refiner") });
+  const showPage = index => {
+    currentPage = index;
+    [...tabs.children].forEach((button, n) => {
+      button.setAttribute("aria-selected", String(n === index));
+      button.tabIndex = n === index ? 0 : -1;
+      pages[n].classList.toggle("active", n === index);
+    });
+  };
+  tabLabels.forEach((label, index) => {
+    pages[index].id = `${pageId}-page-${index}`;
+    pages[index].setAttribute("role", "tabpanel");
+    pages[index].setAttribute("aria-labelledby", `${pageId}-tab-${index}`);
+    tabs.append(el("button", {
+    type: "button", id: `${pageId}-tab-${index}`, class: "mmc-chip", role: "tab", text: t(label),
+    "aria-controls": pages[index].id,
+    onclick: () => showPage(index),
+    onkeydown: event => {
+      const direction = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+      if (!direction) return;
+      event.preventDefault();
+      showPage((currentPage + direction + pages.length) % pages.length);
+      tabs.children[currentPage].focus();
+    },
+  }));
+  });
+  showPage(0);
 
   const changed = () => { onChange?.(); drawTemplate(); drawMore(); };
 
@@ -618,8 +770,34 @@ export function openSettings(anchor, onChange, family = DEFAULT_VIDEO_FAMILY) {
     // paragraph under it would be the old wall of text coming back.
     noteHost.textContent = settings().backend === "remote"
       ? ""
-      : t("A Qwen3-VL text encoder, loaded and evicted like any other model. "
-          + "It also reads your attached images.");
+      : settings().reference_images !== false
+        ? t("A Qwen3-VL text encoder, loaded and evicted like any other model. "
+            + "It also reads your attached images.")
+        : t("A Qwen3-VL text encoder, loaded and evicted like any other model. Image analysis is off.");
+  }
+
+  function drawReferenceInputs() {
+    const enabled = settings().reference_images !== false;
+    referenceHost.replaceChildren(
+      el("div", { class: "mmc-refine-row" }, [
+        el("span", { class: "mmc-refine-visual-title", text: t("Reference image analysis") }),
+        el("button", {
+          type: "button", class: "mmc-chip", role: "switch",
+          "aria-label": t("Reference image analysis"), "aria-checked": String(enabled),
+          "aria-describedby": `${pageId}-visual-help`, text: t(enabled ? "on" : "off"),
+          onclick: () => {
+            saveSettings({ reference_images: !enabled });
+            drawReferenceInputs(); drawNote(); changed();
+            referenceHost.querySelector("button").focus();
+          },
+        }),
+      ]),
+      el("div", { class: "mmc-refine-hint", id: `${pageId}-visual-help`, text: enabled
+        ? t("On: also sends reference images and video frames to the refiner.")
+        : t("Off: sends text, handles, reference descriptions and usage rules only.") }),
+      el("div", { class: "mmc-refine-hint", text:
+        t("Applies to the next refine. Generation references and existing rewrites are unchanged.") }),
+    );
   }
 
   // What this family's templates are and what each is for — the family's own
@@ -685,46 +863,56 @@ export function openSettings(anchor, onChange, family = DEFAULT_VIDEO_FAMILY) {
       return el("div", { class: "mmc-refine-group mmc-refine-modes" }, [
         el("div", { class: "mmc-chips" }, [
           chip("add to the built-in", "add",
-               "The node's own instructions, guides and reply contract stay — your "
-               + "text is one more section of them. Works on a whole timeline."),
+               "Use the node's writing instructions together with the selected file. "
+               + "Conflicting instructions can make the result less reliable."),
           chip("replace it", "replace",
-               "Your text is the model's only instruction and its reply is kept "
-               + "whole, exactly as a skill package is run. One card at a time."),
+               "Use the selected file instead of the node's writing instructions. "
+               + "The node still controls which fields to rewrite and the reply format."),
         ]),
-        el("div", { class: "mmc-refine-hint", text: mode === "replace"
-          ? t("The rewrite lands as one block, and a whole-timeline refine is refused — "
-              + "one reply is one document.")
-          : t("Your lines are read after the craft notes and before the reply format, "
-              + "which stays the node's.") }),
+        el("div", { class: "mmc-refine-hint", text: chosen === FAITHFUL_BETA_SKILL
+          ? mode === "replace"
+            ? t("Beta: translate and clarify supplied facts without adding scenes or details. The button still controls which inputs are rewritten.")
+            : t("Beta: use its own instructions to reduce invented details. Combining it with creative built-in instructions can weaken that goal.")
+          : mode === "replace"
+          ? t("The selected file guides the wording. The button you press determines "
+              + "the scope: one field, one segment, or the whole timeline.")
+          : t("The node's instructions and the selected file are both applied. "
+              + "The button you press determines which inputs are rewritten.") }),
       ]);
     };
     // Each row says what kind of thing it is, because they behave nothing
     // alike: the built-in is the node's harness with the format assembled
     // around the model, a skill is a package the model follows on its own, and
     // a prompt is whatever the user wrote in a file next to them.
-    const row = (label, value, kind, title) => el("button", {
+    const row = (label, value, kind, title, beta = false) => el("button", {
       class: "mmc-opt",
+      "data-refine-skill": value,
       "aria-checked": value === chosen,
       title,
       onclick: () => { saveSettings({ skill: value }); changed(); drawSkills(); },
     }, [
       el("span", { class: "mmc-opt-label mmc-refine-name", text: label }),
+      ...(beta ? [el("span", { class: "mmc-refine-beta", text: t("Beta") })] : []),
       el("span", { class: "mmc-opt-kind", text: t(kind) }),
       el("span", { class: "mmc-radio" }),
     ]);
     skillHost.replaceChildren(
       el("span", { class: "mmc-note-key", text: t("prompting") }),
-      row(t("built-in"), "", "node",
-          t("The node's own instructions and guides, with the format assembled around the model's prose.")),
+      choiceList([row(t("built-in"), "", "node",
+          t("Refine the selected inputs using the node's built-in writing instructions.")),
       // The tag says whose the instructions are — the node's, a package's, or
       // the user's own — which is the distinction that decides how the row
       // behaves. "prompt" is the server's word for a plain file; on screen the
       // useful thing about it is that the user wrote it.
-      ...entries.map(({ name, kind }) => row(name, name, kind === "skill" ? "skill" : "yours",
-        kind === "skill"
-        ? t("The '{name}' skill package. Handed to the model whole; whether it replaces "
-          + "the node's prompting or adds to it is the switch below.", { name })
-        : t("Your own instructions, from {name} in the node's skills/ folder.", { name }))),
+      ...entries.map(({ name, kind }) => row(name === FAITHFUL_BETA_SKILL ? t("Faithful refine") : name,
+        name, kind === "skill" ? "skill" : "yours",
+        name === FAITHFUL_BETA_SKILL
+        ? t("Experimental minimal rewriting: translate and clarify your input without inventing scenes, actions or appearance. Recommended: use this skill's own instructions. The node still controls scope and reply format.")
+        : kind === "skill"
+        ? t("Send the instructions in '{name}' to the refiner. Choose below whether "
+          + "to combine them with the node's writing instructions or use them instead.", { name })
+        : t("Your own instructions, from {name} in the node's skills/ folder.", { name }),
+        name === FAITHFUL_BETA_SKILL))]),
       // Nothing is chosen, so there is no switch — and `replaceChildren` would
       // write the word "null" into the panel if it were handed one.
       ...[modes()].filter(Boolean),
@@ -750,7 +938,8 @@ export function openSettings(anchor, onChange, family = DEFAULT_VIDEO_FAMILY) {
       return;
     }
     const chosen = settings().model;
-    modelHost.replaceChildren(el("div", { class: "mmc-refine-list" }, names.map((name) => el("button", {
+    modelHost.replaceChildren(choiceList(names.map((name) => el("button", {
+      type: "button",
       class: "mmc-opt",
       "aria-checked": name === chosen,
       // The full name, because the row ellipsises it — a folder-qualified
@@ -761,7 +950,7 @@ export function openSettings(anchor, onChange, family = DEFAULT_VIDEO_FAMILY) {
     }, [
       el("span", { class: "mmc-opt-label mmc-refine-name", text: name }),
       el("span", { class: "mmc-radio" }),
-    ]))));
+    ])), "mmc-refine-list", 420));
   }
 
   /** The language chips and the two sampling pills. Redrawn whole on every
@@ -791,14 +980,15 @@ export function openSettings(anchor, onChange, family = DEFAULT_VIDEO_FAMILY) {
       el("div", { class: "mmc-refine-dials" }, [
         dial(t("reply length"), stepperPill({
           value: Number(current.maxTokens), ...TOKENS, width: "62px",
-          title: t("How many tokens the rewrite may run to. Raise it if a whole-timeline "
-               + "refine comes back cut off; there is no cost to a model that stops early."),
+          title: t("Maximum output length, not a target length. 6k means 6,144 tokens. "
+               + "The model can stop earlier. A larger limit can reserve more memory."),
           format: (n) => t("{n}k tokens", { n: Math.round(n / 1024) }),
           onChange: (next) => { saveSettings({ maxTokens: next }); changed(); },
         })),
         dial(t("temperature"), stepperPill({
           value: Number(current.temperature), min: 0, max: 2, step: 0.05, width: "58px",
-          title: t("Lower keeps closer to your wording; higher invents more around it."),
+          title: t("Controls randomness when choosing words. Lower values reduce variation; "
+               + "0 chooses the most likely next token. This does not guarantee accuracy or instruction following."),
           format: (n) => n.toFixed(2),
           onChange: (next) => { saveSettings({ temperature: next }); changed(); },
         })),
@@ -820,25 +1010,66 @@ export function openSettings(anchor, onChange, family = DEFAULT_VIDEO_FAMILY) {
       el("span", { class: "mmc-pop-title", text: t("Refiner") }),
       backendHost,
     ]),
-    modelHost,
-    noteHost,
-    skillHost,
-    templateHost,
-    el("details", { class: "mmc-refine-fold" }, [
-      el("summary", { text: t("Language and sampling") }),
-      moreHost,
-    ]),
+    tabs,
+    el("div", { class: "mmc-refine-settings-grid" }, pages),
   );
 
   document.body.appendChild(pop);
   placeNear(pop, anchor);
-  dismissable(pop);
+  let frame = 0;
+  const fit = () => {
+    frame = 0;
+    if (!pop.isConnected) return;
+    const available = window.innerHeight - 24;
+    if (window.innerWidth < 760) pop.classList.add("paged");
+    // Prefer the ordinary two-column view. Reduce file-list height first; only a
+    // screen that cannot fit all sections uses labelled section pages.
+    while (pop.getBoundingClientRect().height > available) {
+      const lists = [...pop.querySelectorAll(".mmc-refine-choice-list")]
+        .filter(node => node.getClientRects().length);
+      if (lists.map(node => node.mmcRefineList.shrink()).some(Boolean)) continue;
+      if (!pop.classList.contains("paged")) { pop.classList.add("paged"); continue; }
+      break;
+    }
+    pop.querySelectorAll(".mmc-refine-choice-list").forEach(node => node.mmcRefineList.reveal());
+  };
+  const scheduleFit = () => { if (!frame) frame = requestAnimationFrame(fit); };
+  const observer = new ResizeObserver(scheduleFit);
+  observer.observe(pop);
+  const resize = () => {
+    pop.classList.toggle("paged", window.innerWidth < 760);
+    pop.querySelectorAll(".mmc-refine-choice-list").forEach(node => node.mmcRefineList.reset());
+    scheduleFit();
+  };
+  window.addEventListener("resize", resize);
+  // Outside dismissal runs on document pointerdown, before the split button's
+  // click. Let that one anchor gesture reach its own toggle, otherwise it
+  // closes here and immediately reopens on click.
+  let anchorPointer = false;
+  const anchorGesture = event => {
+    anchorPointer = anchor.contains(event.target);
+  };
+  const endAnchorGesture = () => { anchorPointer = false; };
+  document.addEventListener("pointerdown", anchorGesture, true);
+  document.addEventListener("pointerup", endAnchorGesture, true);
+  document.addEventListener("pointercancel", endAnchorGesture, true);
+  const close = dismissable(pop, () => {
+    observer.disconnect(); window.removeEventListener("resize", resize);
+    document.removeEventListener("pointerdown", anchorGesture, true);
+    document.removeEventListener("pointerup", endAnchorGesture, true);
+    document.removeEventListener("pointercancel", endAnchorGesture, true);
+    if (frame) cancelAnimationFrame(frame);
+    onClose?.(); if (anchor.isConnected) anchor.focus();
+  }, { suspended: () => anchorPointer });
   drawBackend();
   drawNote();
+  drawReferenceInputs();
   drawModels();
   drawSkills();
   drawTemplate();
   drawMore();
+  pop.querySelector('.mmc-refine-seg-btn[aria-checked="true"]')?.focus();
+  return close;
 }
 
 // ---- the panel --------------------------------------------------------------
@@ -865,12 +1096,18 @@ export class RefinePanel {
    *   owner holding state this panel cannot reach — the timeline's own audio
    *   fields and reference sections, which no longer belong to anything once
    *   the last card's rewrite is gone.
+   * @param {boolean} [options.promptOnly]  a plain Refine owns only the prompt:
+   *   audio inputs remain manually editable, but apply/Revert never changes them.
    */
-  constructor({ getState, onCommit, audioFields = true, onRevert = null }) {
+  constructor({ getState, onCommit, audioFields = true, onRevert = null, promptOnly = false,
+                createPromptBox = null }) {
     this.getState = getState;
     this.onCommit = onCommit;
     this.audioFields = audioFields;
     this.onRevert = onRevert;
+    this.promptOnly = promptOnly;
+    this.readSource = () => this.getState().prompt ?? "";
+    this.createPromptBox = createPromptBox;
     this.problems = [];
     // What the model said it could see in the attached images, from the last
     // call. Deliberately not in the state: it describes one run of one model,
@@ -883,6 +1120,7 @@ export class RefinePanel {
     // Together they are what "refreshed in place" is made of — see `box` and
     // the shape gate at the top of `render`.
     this.boxes = new Map();
+    this.promptBoxes = new Map();
     this.shape = null;
     this.render();
   }
@@ -891,8 +1129,35 @@ export class RefinePanel {
     return this.getState().refined || null;
   }
 
-  /** Take a server reply for one shot. `soundscape`/`music` are written onto the
-   *  state only where this panel is the thing that shows them. */
+  setFieldHosts(hosts) {
+    this.fieldHosts = hosts;
+    this.shape = null;
+    this.render();
+  }
+
+  ownedFields(refined = this.refined) {
+    if (!refined) return [];
+    return Array.isArray(refined.fields) ? refined.fields : [
+      ...(refined.body ? ["prompt"] : []),
+      ...Object.keys(refined.sections ?? {}).filter((name) => ["summary", "retention_analysis"].includes(name)),
+    ];
+  }
+
+  clearField(field) {
+    const refined = this.refined;
+    if (!refined) return;
+    const fields = this.ownedFields().filter((name) => name !== field);
+    if (field === "prompt") delete refined.body;
+    else if (refined.sections) delete refined.sections[field];
+    refined.fields = fields;
+    if (refined.sources) delete refined.sources[field];
+    if (!fields.length) delete this.getState().refined;
+    this.onCommit?.();
+    this.render();
+  }
+
+  /** Take a reply for one prompt. Legacy whole-request panels may also apply
+   *  audio, but a promptOnly panel never touches another input. */
   apply(result, shot) {
     const state = this.getState();
     // What the rewrite is about to overwrite, so `clear` can put the state back
@@ -902,14 +1167,23 @@ export class RefinePanel {
     // "what was there before".
     const replaced = this.refined?.replaced
       ?? { soundscape: state.soundscape ?? "", music: state.music ?? "" };
+    const sections = this.promptOnly ? (shot.sections ?? this.refined?.sections) : result.sections;
+    const fields = this.promptOnly ? [...new Set([
+      ...(this.refined?.enabled !== false ? this.ownedFields() : []), ...(shot.fields ?? []),
+    ])].filter((field) => ["prompt", "summary", "retention_analysis"].includes(field)) : [];
 
     state.refined = {
-      body: shot.body,
+      ...(typeof shot.body === "string" ? { body: shot.body } : {}),
       // Present on a timeline segment's rewrite: the body is the shot alone,
       // and compile joins the global prompt in front of it as it does for
       // typed text. The Creator node has no global prompt and gets none.
-      ...(result.scope ? { scope: result.scope } : {}),
-      ...(result.sections ? { sections: result.sections } : {}),
+      ...(this.promptOnly ? { scope: "shot" }
+        : result.scope ? { scope: result.scope } : {}),
+      ...(sections ? { sections } : {}),
+      ...(fields.length ? { fields } : {}),
+      ...(shot.sources ? { sources: {
+        ...(this.refined?.enabled !== false ? this.refined?.sources ?? {} : {}), ...shot.sources,
+      } } : {}),
       // Which skill package or prompt file wrote this, when one did — the
       // answer to "why does this rewrite look nothing like yesterday's" once
       // the setting has moved. Only ever present on a rewrite that replaced
@@ -926,7 +1200,7 @@ export class RefinePanel {
       source: state.prompt ?? "",
       model: chosenModel(),
       enabled: true,
-      ...(this.audioFields ? { replaced } : {}),
+      ...(this.audioFields && !this.promptOnly ? { replaced } : {}),
     };
     // Only what the reply actually carries. An empty field means the model had
     // nothing to add, which is not the same as "make this empty" — and these
@@ -934,7 +1208,7 @@ export class RefinePanel {
     // blanking them on a reply that skipped them deleted a line the user wrote
     // in a box they were looking at. The timeline has always taken them this
     // way (see `Timeline.takePiece`); this is the face agreeing with it.
-    if (this.audioFields) {
+    if (this.audioFields && !this.promptOnly) {
       if (result.soundscape) state.soundscape = result.soundscape;
       if (result.music) state.music = result.music;
     }
@@ -961,20 +1235,22 @@ export class RefinePanel {
     const state = this.getState();
     const replaced = state.refined?.replaced;
     delete state.refined;
-    if (this.audioFields && replaced) {
+    if (this.audioFields && !this.promptOnly && replaced) {
       state.soundscape = replaced.soundscape ?? "";
       state.music = replaced.music ?? "";
     }
     this.seen = "";
     this.problems = [];
     this.onCommit?.();
-    this.onRevert?.();
+    if (!this.promptOnly) this.onRevert?.();
     this.render();
   }
 
   /** Whether the prompt has been edited since the rewrite was made. */
   get stale() {
     const refined = this.refined;
+    if (refined?.sources) return this.ownedFields().some((field) =>
+      Object.hasOwn(refined.sources, field) && refined.sources[field] !== this.readSource(field));
     return !!refined && (refined.source ?? "") !== (this.getState().prompt ?? "");
   }
 
@@ -996,6 +1272,20 @@ export class RefinePanel {
    */
   box(key, value, set, { rows = 3, placeholder = "", className = "mmc-refined-box" } = {}) {
     if (!this.boxes.has(key)) {
+      if (this.createPromptBox) {
+        const prompt = this.createPromptBox({
+          getState: () => ({ ...this.getState(), prompt: this.boxValue(key) }),
+          onInput: (text) => { set(text); this.onCommit?.(); },
+          compiled: null, onOverflow: null,
+        });
+        prompt.root.classList.add(...className.split(/\s+/), "mmc-refined-rich");
+        prompt.root.setAttribute("data-placeholder", placeholder);
+        prompt.root.setAttribute("aria-label", key.startsWith("section:") ? key.slice(8) : key);
+        prompt.root.style.minHeight = `${rows * 1.5}em`;
+        this.promptBoxes.set(key, prompt);
+        this.boxes.set(key, prompt.frame ?? prompt.root);
+        return this.fill(key, value);
+      }
       const made = el("textarea", {
         class: className, rows: String(rows), placeholder,
         oninput: (event) => { set(event.target.value); this.onCommit?.(); },
@@ -1009,13 +1299,30 @@ export class RefinePanel {
     return this.fill(key, value);
   }
 
+  boxValue(key) {
+    if (key === "body") return this.refined?.body ?? "";
+    if (key.startsWith("section:")) return this.refined?.sections?.[key.slice(8)] ?? "";
+    return this.getState()[key] ?? "";
+  }
+
   /** A value into a box that is already drawn, and only where it differs:
    *  writing a box's own text back into it would put the caret at the end. */
   fill(key, value) {
     const box = this.boxes.get(key);
     const next = value ?? "";
-    if (box && box.value !== next) box.value = next;
+    const prompt = this.promptBoxes.get(key);
+    if (prompt) {
+      if (prompt.getValue() !== next) prompt.setValue(next);
+      prompt.refresh();
+    } else if (box && box.value !== next) box.value = next;
     return box;
+  }
+
+  destroy() {
+    for (const prompt of this.promptBoxes.values()) {
+      prompt.setCompiledOpen(false); prompt.closeMenu(); prompt.paintWhenShown?.disconnect();
+    }
+    this.promptBoxes.clear(); this.boxes.clear();
   }
 
   /** The state into the boxes, rebuilding nothing. What a render does when the
@@ -1051,17 +1358,18 @@ export class RefinePanel {
     const shape = JSON.stringify([
       empty, !!refined, refined?.enabled !== false, refined?.model ?? null,
       refined?.template ?? null, !!refined?.forced, refined?.skill ?? null,
-      this.stale, this.seen, !!refined?.sections, audio, this.problems,
+      this.stale, this.seen, Object.keys(refined?.sections ?? {}).sort(), this.ownedFields(), audio, this.problems,
     ]);
     if (shape === this.shape) {
       this.syncBoxes();
       return;
     }
     this.shape = shape;
+    for (const host of Object.values(this.fieldHosts ?? {})) host.replaceChildren();
 
     if (empty) {
       this.root.replaceChildren();
-      this.boxes.clear();
+      this.destroy();
       return;
     }
 
@@ -1125,7 +1433,7 @@ export class RefinePanel {
 
       // The one thing the panel never said, and the thing that decides what is
       // generated: the rewrite stands in for the prompt rather than joining it.
-      parts.push(el("div", {
+      if (!this.fieldHosts) parts.push(el("div", {
         class: "mmc-refined-lede",
         text: on
           ? t("Queued instead of the prompt above, not alongside it.")
@@ -1144,22 +1452,36 @@ export class RefinePanel {
         ]));
       }
 
+      if (this.fieldHosts) {
+        for (const field of this.ownedFields()) {
+          const host = this.fieldHosts[field];
+          if (!host) continue;
+          const key = field === "prompt" ? "body" : `section:${field}`;
+          host.append(el("div", { class: "mmc-refined-head" }, [
+            el("span", { class: "mmc-refined-toggle" + (on ? " on" : ""),
+              text: t(on ? "refined" : "refined (off)") }),
+            el("span", { style: { flex: "1" } }),
+            el("button", { class: "mmc-ghost", text: t("Revert"),
+              onclick: () => this.clearField(field) }),
+          ]), this.box(key, this.boxValue(key), (value) => {
+            const current = this.refined;
+            if (!current) return;
+            if (field === "prompt") current.body = value;
+            else { current.sections ??= {}; current.sections[field] = value; }
+          }, { rows: 3 }));
+        }
+      } else {
       this.bodyBox = this.box(
         "body", refined.body,
         (value) => { const current = this.refined; if (current) current.body = value; },
         { rows: 8, placeholder: t("The rewritten description.") });
       parts.push(this.bodyBox);
 
-      // Only the reference form has these, and only a refiner ever writes them —
-      // they are the three sections nothing can derive from a sentence. Folded,
-      // like the prompt the rewrite stands in for: three more textareas held
-      // open under a rewrite this long is what doubled the node, and the summary
-      // is what stops folding them reading as the references having been
-      // dropped — it says where a @handle becomes the <Subject N> the shot
-      // bodies speak in, so the answer is one click away rather than absent.
+      // Only sections this response owns; absent compiler-owned definitions
+      // must not become an empty editable field.
       if (refined.sections) {
         const sections = el("div", { class: "mmc-refined-sections" });
-        for (const name of REF_SECTIONS) {
+        for (const name of REF_SECTIONS.filter((name) => Object.hasOwn(refined.sections, name))) {
           sections.append(el("label", { class: "mmc-refined-section" }, [
             el("span", { class: "mmc-tl-field-name", text: name }),
             this.box(
@@ -1172,6 +1494,7 @@ export class RefinePanel {
           el("summary", { text: t("reference analysis — where your @references are defined") }),
           sections,
         ]));
+      }
       }
 
     }
@@ -1204,16 +1527,20 @@ export class RefinePanel {
   }
 }
 
+// A confirmation belongs to one live control, never to the next rendering of
+// its owner or to a different refiner elsewhere in the interface.
+let armedRefine = null;
+
 /**
- * The Refine control: one press does the thing, a corner opens its settings.
+ * The Refine control: confirm the second press; a corner opens its settings.
  *
  * The settings used to hang off the button as a floating badge, which put a
  * circle over the neighbouring rail tool and read as a notification rather than
  * as a way in. It is now inside the tile's own rounded box — the same split-
  * button idea, contained, so the rail keeps its alignment and nothing overlaps.
  *
- * `run` does the work and reports back; this only handles the two states the
- * button itself has — idle, and waiting on a model that may take a minute.
+ * `run` does the work and reports back; the confirmation is only a transient
+ * view state before the original wait for a model that may take a minute.
  *
  * `family` is a getter for the id of the family the piece renders with, asked
  * when the settings open so the template chips are that family's own. Absent —
@@ -1221,52 +1548,129 @@ export class RefinePanel {
  * what the whole pill was hardcoded to before it was asked at all.
  */
 export function refineButton({ run, family = null, label = "Refine", title,
-                               className = "mmc-tool" }) {
+                               className = "mmc-tool", variant = null, contextLabel = null, activity = null }) {
+  const state = activity ?? { busy: false, waiting: false, progress: null, views: new Set() };
   let busy = false;
+  let wrapper, armed = false, observer = null, armedParent = null, minWidth = "", settingsClose = null;
+  const pill = variant === "pill" || (variant === null && className.includes("mmc-pill"));
   const text = el("span", { text: t(label) });
+  const setLabel = (value) => {
+    text.textContent = value;
+    if (contextLabel) button.setAttribute("aria-label", `${contextLabel}: ${value}`);
+  };
+  const cancel = () => {
+    if (!armed) return;
+    armed = false;
+    observer?.disconnect();
+    observer = null;
+    armedParent = null;
+    document.removeEventListener("pointerdown", outside, true);
+    document.removeEventListener("keydown", escape, true);
+    if (armedRefine === cancel) armedRefine = null;
+    button.classList.remove("mmc-refine-confirm");
+    button.style.minWidth = minWidth;
+    setLabel(t(label));
+  };
+  const outside = (event) => { if (!wrapper.contains(event.target)) cancel(); };
+  // Do not consume Escape: the containing overlay retains its own close rule.
+  const escape = (event) => { if (event.key === "Escape") cancel(); };
+  const live = () => button.isConnected && wrapper.isConnected
+    && button.parentNode === wrapper && !button.disabled
+    && !button.closest('[hidden], [aria-hidden="true"]')
+    && button.getClientRects().length > 0
+    && !["hidden", "collapse"].includes(getComputedStyle(button).visibility);
+  const fresh = (records = []) => {
+    // A remove-and-reinsert in the same turn is still a new owner lifecycle.
+    const removed = records.some(record => Array.from(record.removedNodes || [])
+      .some(node => node === wrapper || node === button
+        || node.contains?.(wrapper) || node.contains?.(button)));
+    if (removed || !live() || wrapper.parentNode !== armedParent) {
+      cancel();
+      return false;
+    }
+    return true;
+  };
+  const arm = () => {
+    armedRefine?.();
+    armed = true;
+    armedRefine = cancel;
+    armedParent = wrapper.parentNode;
+    minWidth = button.style.minWidth;
+    const width = button.offsetWidth;
+    button.classList.add("mmc-refine-confirm");
+    button.style.minWidth = `${width}px`;
+    setLabel(t("Confirm"));
+    document.addEventListener("pointerdown", outside, true);
+    document.addEventListener("keydown", escape, true);
+    observer = new MutationObserver(records => { if (armed) fresh(records); });
+    observer.observe(document.documentElement, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ["hidden", "aria-hidden", "disabled", "class", "style"],
+    });
+  };
   // Put into the button on the press and taken out again, rather than built in
   // and hidden: `.mmc-spin` sets `display`, and a class selector beats the user
   // agent's `[hidden]` rule — so the first version of this spun on every pill
   // from the moment the page loaded, with nothing running anywhere. There is a
   // `.mmc-spin[hidden]` rule now too; this deliberately does not rely on it.
   const ring = spinner();
+  const publish = () => {
+    for (const reference of state.views) {
+      const view = reference.deref();
+      if (view) view.paint();
+      else state.views.delete(reference);
+    }
+  };
   // How many tokens in. The generation ticks its own job's progress bar once
   // per token — `refine_local` under `jobs.progress`'s node — so the pill can
   // count instead of promising vaguely. Best effort: with nothing on the wire
   // the label just stays "Refining…".
   const onProgress = (fraction, step, total) => {
-    text.textContent = total
-      ? `${t("Refining…")} ${step}/${total}`
-      : t("Refining…");
+    state.waiting = false;
+    state.progress = total ? { step, total } : null;
+    publish();
   };
   const button = el("button", {
+    type: "button",
     class: className,
+    "aria-label": contextLabel ? `${contextLabel}: ${t(label)}` : null,
     title: title || t("Rewrite this prompt into the description this piece's model was trained "
                   + "to read, keeping everything you wrote and expanding it."),
+    onblur: cancel,
+    onkeydown: (event) => {
+      if (event.repeat && ["Enter", " "].includes(event.key)) event.preventDefault();
+    },
     onclick: async () => {
-      if (busy) return;
-      busy = true;
-      button.classList.add("busy");
+      if (state.busy) return;
+      if (!live()) { cancel(); return; }
+      if (!armed) { arm(); return; }
+      if (!fresh(observer?.takeRecords())) return;
+      cancel();
+      state.busy = true;
       // Waiting and working are different things and the pill says which. A
       // local refine is a queued job now, so it can sit behind a render — and a
       // pill that said "Refining…" for the ten minutes before it started would
       // be a pill nobody could trust. The remote backend never waits: it spends
       // somebody else's GPU and is answered in the request.
-      text.textContent = queueBusy() ? t("Waiting for the render…") : t("Refining…");
-      button.insertBefore(ring, text);
+      state.waiting = queueBusy();
+      state.progress = null;
+      publish();
       try {
         await run({ onProgress });
       } finally {
-        busy = false;
-        button.classList.remove("busy");
-        ring.remove();
-        text.textContent = t(label);
+        state.busy = false;
+        state.waiting = false;
+        state.progress = null;
+        publish();
       }
     },
   }, [el("span", { class: "mmc-tool-icon" }, [icon("brain")]), text]);
 
   const more = el("button", {
+    type: "button",
     class: "mmc-refine-more",
+    "aria-label": contextLabel ? `${contextLabel}: ${t("Refiner")}` : t("Refiner"),
+    "aria-haspopup": "dialog", "aria-expanded": "false",
     // The chosen model is what this opens onto, so it is what the tooltip
     // leads with — "Settings" would say less than the answer itself.
     title: chosenModel()
@@ -1274,20 +1678,47 @@ export function refineButton({ run, family = null, label = "Refine", title,
       : t("Choose a model"),
     onclick: (event) => {
       event.stopPropagation();
+      armedRefine?.();
+      if (settingsClose) { settingsClose(); return; }
       // Asked at the press, not captured when the button was built: the piece's
       // model pill can move while this tile sits on the rail, and the templates
       // the popover offers have to be the ones the next press would use.
-      openSettings(event.currentTarget, () => {
+      more.setAttribute("aria-expanded", "true");
+      settingsClose = openSettings(event.currentTarget, () => {
         more.title = chosenModel()
           ? t("{model} — click to change the model, template, language or sampling", { model: chosenModel() })
           : t("Choose a model");
-      }, family?.() ?? DEFAULT_VIDEO_FAMILY);
+      }, family?.() ?? DEFAULT_VIDEO_FAMILY, () => {
+        settingsClose = null; more.setAttribute("aria-expanded", "false");
+      });
     },
   }, [icon("chevron", 12)]);
 
   // The rail draws a tile with the chevron in its corner; the timeline bar draws
   // a pill with the chevron on its end. Same two controls, told apart by which
   // shape the caller asked for.
-  const pill = className.includes("mmc-pill");
-  return el("div", { class: `mmc-refine-split${pill ? " pill" : ""}` }, [button, more]);
+  wrapper = el("div", {
+    class: `mmc-refine-split${pill ? " pill" : ""}`,
+    onpointerleave: cancel,
+  }, [button, more]);
+  const view = { paint() {
+    busy = state.busy;
+    button.classList.toggle("busy", busy);
+    button.setAttribute("aria-busy", String(busy));
+    if (busy) {
+      const progress = state.progress;
+      setLabel(progress ? `${t("Refining…")} ${progress.step}/${progress.total}`
+        : state.waiting ? t("Waiting for the render…") : t("Refining…"));
+      button.insertBefore(ring, text);
+    } else {
+      ring.remove();
+      if (!armed) setLabel(t(label));
+    }
+  } };
+  // The activity holds only weak view references. Replacing a toolbar can
+  // collect its old controls while the replacement reads the same activity.
+  wrapper.mmcRefineActivityView = view;
+  state.views.add(new WeakRef(view));
+  view.paint();
+  return wrapper;
 }

@@ -46,8 +46,12 @@ const fire = (node, type, extra = {}) => {
   return event;
 };
 const { el } = await import("./web/creator/dom.js");
+const { noteSettings } = await import("./web/creator/api.js");
 const { t } = await import("./web/creator/i18n.js");
 const { Stage, elapsed, timingChips, watchFooterSize } = await import("./web/creator/stage.js");
+const { ExecutionTiming } = await import("./web/creator/timing.js");
+const batchScope = "From the first accepted render to the end of its queued batch, including waiting. Results without queue timing show workflow execution time only.";
+const batchPending = "The queued renders have not all finished.";
 const labels = (root) => root.querySelectorAll(".mmc-stage-clock-label").map((n) => n.textContent);
 const values = (root) => root.querySelectorAll(".mmc-stage-clock-value").map((n) => n.textContent);
 const chipSnapshot = (chips) => chips.map((chip) => ({
@@ -81,7 +85,12 @@ for (const [language, expected] of languages) {
   for (const chip of missing) truth(chip.getAttribute("title").includes(
     t("Timing is unavailable for this result.")), `${language} unavailable explanation`);
   truth(timingChips({ totalMs: 1000, totalPending: true })[0].getAttribute("title").includes(
-    t("The queued renders have not all finished.")), `${language} pending explanation`);
+    t(batchPending)), `${language} pending queued-batch explanation`);
+  eq(chips[0].getAttribute("title"), t(batchScope), `${language} total tooltip describes queued-batch timing`);
+  if (language !== "en") {
+    truth(t(batchScope) !== batchScope, `${language} queued-batch scope is translated`);
+    truth(t(batchPending) !== batchPending, `${language} queued-batch pending note is translated`);
+  }
 }
 locale = "en";
 for (const invalid of [undefined, null, NaN, Infinity, -1, "0"]) {
@@ -92,11 +101,39 @@ eq(chipSnapshot(timingChips({ totalMs: 0, tookMs: 0 })).map((c) => c.value),
   ["0:00", "0:00"], "a measured zero is still a valid time");
 const explanations = timingChips({ totalMs: 1000, tookMs: 500 });
 eq(explanations[0].getAttribute("title"),
-  "From the first accepted render to the end of its queued batch, including waiting. Results without queue timing show workflow execution time only.",
-  "total scope includes queued batches and distinguishes older workflow-only timing");
+  batchScope,
+  "total scope includes accepted batch waiting and documents execution-only fallback");
 eq(explanations[1].getAttribute("title"),
   "From the first detected sampling progress or preview to the saved result, including decoding, post-processing and saving; not sampling alone.",
   "render window is not described as sampling alone");
+
+// Keep tooltip wording tied to the clock's actual contract. A completed first
+// render still carries its batch's growing total while a second is queued, so
+// the pending note cannot claim only that this one workflow is still running.
+const batchClock = new ExecutionTiming();
+batchClock.queued("batch-first", 1000);
+batchClock.queued("batch-second", 1500);
+batchClock.start("batch-first", 10000, 4000);
+batchClock.stop("batch-first", "execution_success", 12000, 6000);
+const firstRun = batchClock.runs.get("batch-first");
+const waitingForSecond = batchClock.read(firstRun, 7000);
+eq(waitingForSecond, { totalMs: 6000, totalPending: true },
+  "accepted batch total includes pre-execution waiting and an unfinished sibling");
+truth(timingChips(waitingForSecond)[0].getAttribute("title").includes(batchPending),
+  "completed first render still explains the pending queued batch");
+batchClock.start("batch-second", 13000, 8000);
+batchClock.stop("batch-second", "execution_success", 16000, 11000);
+eq(batchClock.read(firstRun, 99000), { totalMs: 10000, totalPending: false },
+  "batch total stops when all queued renders finish, including waiting");
+eq(batchClock.read(batchClock.runs.get("batch-second"), 99000),
+  { totalMs: 10000, totalPending: false }, "both render results share their accepted batch total");
+truth(!timingChips(batchClock.read(firstRun))[0].getAttribute("title").includes(batchPending),
+  "finished batch drops its pending note");
+const executionOnlyClock = new ExecutionTiming();
+executionOnlyClock.start("external", 1000, 90000);
+executionOnlyClock.stop("external", "execution_success", 4000, 93000);
+eq(executionOnlyClock.read(executionOnlyClock.runs.get("external")),
+  { totalMs: 3000, totalPending: false }, "results without accepted queue timing use workflow execution only");
 
 // Layout pixels are deliberately unlike zoomed screen pixels. Repeated equal
 // measurements should not write another style or retrigger a layout cycle.
@@ -161,8 +198,17 @@ eq(clocks(stage.readout), chipSnapshot(timingChips(result)), "stage uses the sha
 for (const attr of ["controls", "loop", "playsinline"]) eq(video.getAttribute(attr), "", `stage native ${attr}`);
 eq(video.getAttribute("preload"), "metadata", "stage keeps native metadata preload");
 truth(fire(video, "pointerdown").stopped, "scrubbing does not pan the canvas");
-fire(video, "mouseenter"); eq(video.muted, false, "stage hover enables sound");
-fire(video, "mouseleave"); eq(video.muted, true, "stage leaving mutes sound");
+eq(video.muted, true, "stage starts muted before any pointer event");
+fire(video, "mouseenter"); eq(video.muted, true, "default stage hover stays silent");
+fire(video, "mouseleave"); eq(video.muted, true, "default stage leaving stays silent");
+video.muted = false;
+fire(video, "mouseenter"); fire(video, "mouseleave");
+eq(video.muted, false, "default stage pointer preserves manual sound choice");
+noteSettings({ preview_audio: "hover" });
+fire(video, "mouseenter"); eq(video.muted, false, "opt-in stage hover enables sound");
+fire(video, "mouseleave"); eq(video.muted, true, "opt-in stage leaving mutes sound");
+noteSettings({ preview_audio: "muted" });
+fire(video, "mouseenter"); eq(video.muted, true, "existing stage reads changed setting");
 Object.assign(video, { currentTime: 12.75, paused: false });
 for (const [language, expected] of languages) {
   locale = language;
@@ -234,8 +280,16 @@ for (const attr of ["autoplay", "controls", "loop", "playsinline"]) {
 }
 eq(reviewMedia.getAttribute("preload"), "metadata", "review retains metadata preload");
 eq(reviewMedia.muted, true, "review starts silent");
-fire(reviewMedia, "mouseenter"); eq(reviewMedia.muted, false, "review hover enables sound");
-fire(reviewMedia, "mouseleave"); eq(reviewMedia.muted, true, "review leaving mutes sound");
+fire(reviewMedia, "mouseenter"); eq(reviewMedia.muted, true, "default review hover stays silent");
+fire(reviewMedia, "mouseleave"); eq(reviewMedia.muted, true, "default review leaving stays silent");
+reviewMedia.muted = false;
+fire(reviewMedia, "mouseenter"); fire(reviewMedia, "mouseleave");
+eq(reviewMedia.muted, false, "default review pointer preserves manual sound choice");
+noteSettings({ preview_audio: "hover" });
+fire(reviewMedia, "mouseenter"); eq(reviewMedia.muted, false, "opt-in review hover enables sound");
+fire(reviewMedia, "mouseleave"); eq(reviewMedia.muted, true, "opt-in review leaving mutes sound");
+noteSettings({ preview_audio: "muted" });
+fire(reviewMedia, "mouseenter"); eq(reviewMedia.muted, true, "existing review reads changed setting");
 fire(shell.reviewLayer, "click", { target: reviewMedia });
 eq(shell.reviewing.media, reviewMedia, "native media clicks do not close the review");
 eq(reviewObserver.target, reviewReadout, "take review observes its own footer");
@@ -274,7 +328,7 @@ for (const [language, expected] of languages) {
   await Promise.resolve();
 }
 
-// A retired result can still be waiting for workflow completion. The Stage
+// A retired result can still be waiting for its queued batch to finish. The Stage
 // mutates that same result object; review repaints clocks without rebuilding
 // the action group, card, or playing media, then stops after the terminal tick.
 locale = "en";
@@ -287,7 +341,7 @@ const pendingMedia = shell.reviewing.media;
 const pendingActions = pendingCard.querySelector(".mmc-stage-actions");
 const pendingClocks = pendingCard.querySelector(".mmc-stage-times");
 Object.assign(pendingMedia, { currentTime: 6.25, paused: false });
-truth(clocks(pendingCard)[0].title.includes("The queued renders have not all finished."), "review explains the pending total");
+truth(clocks(pendingCard)[0].title.includes(batchPending), "review explains the pending queued-batch total");
 pendingResult.totalMs = 7000;
 tickReviews();
 eq(values(pendingCard), ["0:07", "0:03"], "pending tick reads updated timing from the same result");
@@ -301,7 +355,7 @@ pendingResult.totalMs = 9000;
 pendingResult.totalPending = false;
 tickReviews();
 eq(values(pendingCard), ["0:09", "0:03"], "terminal tick paints the final total");
-eq(clocks(pendingCard)[0].title.includes("The queued renders have not all finished."), false, "terminal tick removes the pending note");
+eq(clocks(pendingCard)[0].title.includes(batchPending), false, "terminal tick removes the pending queued-batch note");
 eq(reviewTimers.size, 0, "terminal repaint stops its timer");
 eq([pendingMedia.currentTime, pendingMedia.paused], [6.25, false], "terminal repaint still does not restart video");
 shell.endReview({ animate: false });

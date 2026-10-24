@@ -24,6 +24,7 @@ button rewrote every family's prompt into Context-IR.
 
 import asyncio
 import functools
+import json
 import os
 
 from aiohttp import web
@@ -93,9 +94,17 @@ def _picture(asset):
     return None
 
 
-def _sighted(slot, asset, picture):
+def _sighted(slot, asset, picture, reference_images=True):
     """Mark whether the slot's asset could be shown, on the slot itself."""
-    if picture is not None:
+    authored = [f"Reference {key.replace('_', ' ')}: {value}"
+                for key, value in (("description", asset.description), ("usage_rules", asset.usage_rules))
+                if value]
+    if authored:
+        slot["note"] = ". ".join(filter(None, [slot.get("note"), *authored]))
+    if not reference_images and asset.kind != "audio" and asset.track != "sound":
+        note = "image analysis is off; no picture of this reference is sent to the refiner"
+        slot["note"] = f"{slot['note']}. {note}" if slot.get("note") else note
+    elif picture is not None:
         # Which of the message's images this is comes later, in `_number`, once
         # every picture is in one list and the tail past `MAX_IMAGES` is known.
         slot["picture"] = True
@@ -105,11 +114,12 @@ def _sighted(slot, asset, picture):
         # and a handle the model believes it can see is worse than one it
         # knows it cannot. (A fileless asset — the storyboard — carries its own
         # note saying why there is nothing to see.)
-        slot["note"] = "the file could not be read, so no picture of it is attached"
+        note = "the file could not be read, so no picture of it is attached"
+        slot["note"] = f"{slot['note']}. {note}" if slot.get("note") else note
     return slot
 
 
-def _look(prompting, compiled, show_labels):
+def _look(prompting, compiled, show_labels, reference_images=True):
     """The glossary and the pictures for one shot."""
     slots, images = [], []
     ordered = [a for a in (compiled.first_frame, compiled.last_frame) if a is not None]
@@ -117,14 +127,14 @@ def _look(prompting, compiled, show_labels):
 
     for asset in ordered:
         slot = prompting.slot_row(asset, compiled.labels.get(asset.handle), show_labels)
-        picture = _picture(asset)
+        picture = _picture(asset) if reference_images else None
         if picture is not None:
             images.append(picture)
-        slots.append(_sighted(slot, asset, picture))
+        slots.append(_sighted(slot, asset, picture, reference_images))
     return slots, images
 
 
-def _look_pool(prompting, pool):
+def _look_pool(prompting, pool, reference_images=True):
     """The piece's own reference pool, as glossary lines and pictures.
 
     No labels: a pool asset's ordinal depends on which segment cites it, so
@@ -134,15 +144,15 @@ def _look_pool(prompting, pool):
     slots, images = [], []
     for asset in pool:
         slot = prompting.slot_row(asset)
-        picture = _picture(asset)
+        picture = _picture(asset) if reference_images else None
         if picture is not None:
             images.append(picture)
-        slots.append(_sighted(slot, asset, picture))
+        slots.append(_sighted(slot, asset, picture, reference_images))
     return slots, images
 
 
-def _shot(prompting, compiled, text, seconds, continues, show_labels):
-    slots, images = _look(prompting, compiled, show_labels)
+def _shot(prompting, compiled, text, seconds, continues, show_labels, reference_images=True):
+    slots, images = _look(prompting, compiled, show_labels, reference_images)
     assets = [a for a in [compiled.first_frame, compiled.last_frame] if a is not None]
     assets += compiled.ref_images + compiled.ref_videos + compiled.ref_audios
     return {
@@ -166,6 +176,22 @@ def _shot(prompting, compiled, text, seconds, continues, show_labels):
         "refs": {a.handle for a in
                  compiled.ref_images + compiled.ref_videos + compiled.ref_audios},
     }, images
+
+
+def _source_text(segment, cast, family, global_text=""):
+    """Read-only user constraints accompany the rewrite, never become its owner."""
+    raw = {**segment, "refined": {"enabled": False}}
+    body, sections = compiler.prompt_parts(raw, compiler.grammar.of(family))
+    active = compiler.subjects.cited(cast, compiler._cited_texts(raw, (global_text,)))
+    rules = compiler._retention_text(raw, active, body, structured=False)
+    constraints = compiler.contextir.join_paragraphs(
+        *(f"{name}:\n{text}" for name, text in sections.items()), rules)
+    if not constraints:
+        return str(segment.get("prompt") or "")
+    return compiler.contextir.join_paragraphs(body,
+        "USER-OWNED CONSTRAINTS — read only. These are stored separately from "
+        "the shot description. Respect them when rewriting, but do not copy "
+        "them into the description or redefine their subjects:\n" + constraints)
 
 
 def _target(body):
@@ -220,8 +246,10 @@ def _plan(body):
     family = compiler.piece_family(data)
     prompting = refine.of(family)
 
+    reference_images = body.get("reference_images") is not False
+    image_size = media.image_size if reference_images else None
     segments = compiler.timeline_segments(data)
-    payloads = compiler.timeline_payloads(data, media.image_size)
+    payloads = compiler.timeline_payloads(data, image_size)
 
     # A payload is a pass, not a card: a run of merged segments compiles to one
     # generation, so the two lists are different lengths the moment anything is
@@ -245,7 +273,7 @@ def _plan(body):
     pool_assets = compiler.timeline_pool(data)
     pool = None
     if pool_assets:
-        slots, pictures = _look_pool(prompting, pool_assets)
+        slots, pictures = _look_pool(prompting, pool_assets, reference_images)
         pool = {"slots": slots, "images": pictures,
                 "handles": {a.handle for a in pool_assets}}
 
@@ -288,7 +316,7 @@ def _plan(body):
         payload = payloads[position]
         if position not in compiled_of:
             compiled_of[position] = compiler.compile_segment(
-                payload, media.image_size, family=family)
+                payload, image_size, family=family)
         compiled = compiled_of[position]
         merged = end - start > 1
         shot, pictures = _shot(
@@ -297,7 +325,8 @@ def _plan(body):
             # The segment's own text, not the payload's join: the global prompt
             # rides beside the shots as THE PIECE, said once, and stays a
             # compile-time join in front of the shot-scoped rewrite.
-            str(segments[index].get("prompt") or ""),
+            _source_text(compiler.inherited_prompt_inputs(data, segments[index]), cast, family,
+                         str(data.get("prompt") or "")),
             # Inside a pass the compile's length is the whole pass's, so a card
             # there is worth only the length it was given; a card that is its
             # own pass takes the compiled length, which is the one that will be
@@ -309,6 +338,7 @@ def _plan(body):
             # `timeline_payloads` writes it.
             index == start and bool(payload.get("continue")),
             lone,
+            reference_images,
         )
         shot["index"] = index
         if pool:
@@ -399,8 +429,8 @@ def _number(groups, images, limit, shared=frozenset()):
                 continue
             if len(kept) >= limit:
                 dropped += 1
-                slot["note"] = (f"not shown to the model — one call looks at at most "
-                                f"{limit} images")
+                note = f"not shown to the model — one call looks at at most {limit} images"
+                slot["note"] = f"{slot['note']}. {note}" if slot.get("note") else note
                 continue
             kept.append(picture)
             shown.append(handle)
@@ -461,6 +491,24 @@ def _backend(body):
     return refine_local.chat, refine_local.to_tensor
 
 
+def _reference_messages(body, system, message):
+    """Distinguish generation references from pixels available to this rewrite."""
+    if body.get("reference_images") is False:
+        note = (
+            "REFERENCE IMAGE ANALYSIS IS OFF. No image pixels, video stills or keyframes "
+            "are attached to this refinement request. The reference glossary describes "
+            "files used by the video generator, not images you can see. Preserve its "
+            "handles, reference descriptions, usage rules and cast identity mappings "
+            "using only the supplied text. Do not infer visual details from filenames, "
+            "claim to have inspected a reference, or return what_i_see. Any guide "
+            "instruction to inspect attached images applies only when pixels are supplied; "
+            "it does not apply to this text-only request."
+        )
+        system += "\n\n" + note
+        message = note + "\n\n" + message
+    return system, message
+
+
 def _run_skill(body, skill, mode, shots, pictures, seconds, dropped, piece_text=None):
     """The replace path: the loaded skill or prompt is the whole instruction.
 
@@ -487,12 +535,14 @@ def _run_skill(body, skill, mode, shots, pictures, seconds, dropped, piece_text=
     if (piece_text or "").strip():
         shot = {**shot, "text": compiler._join_prompt(piece_text, shot.get("text"))}
 
+    system, message = _reference_messages(
+        body, refine_skill.system_prompt(skill),
+        refine_skill.user_message(shot, seconds=seconds, images=len(pictures),
+                                  mode=mode, language=body.get("language")))
     chat, look = _backend(body)
     content = chat(
         body.get("model") or "",
-        refine_skill.system_prompt(skill),
-        refine_skill.user_message(shot, seconds=seconds, images=len(pictures),
-                                  mode=mode, language=body.get("language")),
+        system, message,
         [look(p) for p in pictures],
         temperature=body.get("temperature", 0.7),
         seed=body.get("seed", -1),
@@ -557,8 +607,22 @@ def _instructions(body):
     return skill, ""
 
 
+def _scoped_skill(text):
+    """Use a package's writing guidance inside the editor's selected scope."""
+    return (
+        "The skill files below are included in full; no tools or follow-up questions are available. "
+        "Use their video-writing guidance only within the selected input fields. "
+        "The editor's scope, language and output contract after the files take precedence over "
+        "full-document examples, all-section checklists and instructions to invent missing details. "
+        "Do not fill empty inputs or invent events, identities, wardrobe or audio.\n\n"
+        "<skill_reference>\n" + text + "\n</skill_reference>"
+    )
+
+
 def _run(body):
     """The blocking half: compile, look, ask, parse. Runs on a thread."""
+    if body.get("kind") == "field":
+        return _run_field(body)
     body = _target(body)
     kind = body.get("kind")
     prompting, derived, shots, pictures, piece_text, single, pool, footage, cast = _plan(body)
@@ -646,6 +710,7 @@ def _run(body):
         footage=footage,
         cast=cast,
     )
+    system, message = _reference_messages(body, system, message)
     chat, look = _backend(body)
     content = chat(
         body.get("model") or "",
@@ -867,6 +932,395 @@ def _run(body):
     }
 
 
+def _segment_fields(segment, family):
+    raw = {**segment, "refined": {"enabled": False}}
+    prompt, sections = compiler.prompt_parts(raw, compiler.grammar.of(family))
+    retention = compiler.contextir.join_paragraphs(
+        sections.get("retention_analysis"),
+        *(str(block.get("text") or "") for block in raw.get("retention_blocks") or ()
+          if isinstance(block, dict) and block.get("type") == "text"))
+    return {"prompt": prompt, "summary": sections.get("summary", ""),
+            "retention_analysis": retention}
+
+
+def _field_target(body):
+    """Validate a new, unambiguous one-input target before looking or asking."""
+    scope, field = body.get("scope"), body.get("field")
+    data = body.get("data")
+    if not isinstance(data, dict):
+        raise compiler.CompileError("no state was sent")
+    fields = (("prompt", "summary", "retention_analysis", "segment") if scope == "segment"
+              else ("prompt", "soundscape", "music"))
+    if scope not in ("timeline", "segment") or field not in fields:
+        raise compiler.CompileError("unknown refine field target")
+    data = compiler.as_piece(data)
+    index = body.get("index") if scope == "segment" else None
+    segments = ([] if scope == "timeline" and data.get("segments") == []
+                else compiler.timeline_segments(data))
+    if scope == "segment":
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(segments):
+            raise compiler.CompileError("there is no segment at that refine target")
+        if compiler.is_clip(segments[index]):
+            raise compiler.CompileError("a supplied clip has no prompt to rewrite")
+        sources = _segment_fields(segments[index], compiler.piece_family(data))
+        source = sources if field == "segment" else sources[field]
+    else:
+        source = str(data.get(field) or "")
+    return scope, field, index, data, segments, source
+
+
+def _field_context(segments, cast, handles, index=None):
+    return {
+        "cards": [{"index": n, "supplied_clip": compiler.is_clip(segment),
+                   "seconds": segment.get("duration_s")}
+                  for n, segment in enumerate(segments) if index is None or n == index],
+        "cast": [{"handle": subject.handle, "takes": subject.takes,
+                  "description": subject.description, "usage_rules": subject.usage_rules,
+                  "sources": [handle for handle in subject.sources if handle in handles],
+                  "motion": [handle for handle in subject.motion if handle in handles],
+                  "voice": subject.voice if subject.voice in handles else None,
+                  "replaces": [handle for handle in subject.replaces if handle in handles],
+                  "replaces_what": subject.replaces_what, "marker": subject.marker,
+                  "relationship": subject.relationship, "seeded": subject.seeded,
+                  "features": [{"text": feature.phrase(subject.takes), "instead": feature.instead,
+                                "attribute": feature.attr} for feature in subject.features],
+                  "notes": {handle: text for handle, text in subject.notes.items() if handle in handles},
+                  "triggers": {handle: words for handle, words in subject.triggers.items() if handle in handles},
+                  "send": subject.send}
+                 for subject in cast],
+        "available_handles": sorted(handles),
+    }
+
+
+def _field_value(original, written, handles, labels):
+    value = refine.normalize_handles(written, labels) if original.strip() else ""
+    value, kept_source = refine.preserve_dialogue(original, value)
+    if original.strip() and not value.strip():
+        raise refine.RefineError("the refiner returned nothing for this field")
+    if original.strip().casefold() == "n/a" and value.strip().casefold() != "n/a":
+        raise refine.RefineError("the refiner changed an explicit N/A field into content")
+    if compiler.contextir.split_sections(value)[1].get("subject_definitions"):
+        raise refine.RefineError("the refiner rewrote compiler-owned subject definitions")
+    problems = ["The field " + problem for problem in refine.check(value, handles, labels)]
+    if kept_source:
+        problems.append("The refiner changed the dialogue count or speaker binding. This field's original text was kept.")
+    for span in refine.dropped_quotes([original], value):
+        problems.append(f'the field quotes "{span}" and the rewrite never writes it')
+    for variation in refine.dropped_variations([original], value):
+        problems.append(f"the field leaves {variation} to the seed and the rewrite no longer offers that choice")
+    return value, problems
+
+
+def _run_field(body):
+    """Ask for one field, not a whole rewrite whose other fields are thrown away.
+
+    The original piece/card endpoint remains compatible for chat and Refine all.
+    This new target has its own strict output contract, so an old Python process
+    rejects it instead of silently spending a broad rewrite on a narrow button.
+    """
+    if body.get("scope") == "timeline" and body.get("field") == "all":
+        return _run_all_fields(body)
+    scope, field, index, data, segments, source = _field_target(body)
+    whole = scope == "segment" and field == "segment"
+    empty = not any(value.strip() for value in source.values()) if whole else not source.strip()
+    if empty:
+        return {"scope": "field", "target_scope": scope, "field": field, "index": index,
+                "body": "", "unchanged": True, "seen": "", "problems": [],
+                **({"sections": {"summary": "", "retention_analysis": ""}} if whole else {})}
+    if scope == "segment" or any(not compiler.is_clip(s) for s in segments):
+        plan = {**body, "kind": "segment" if scope == "segment" else "timeline"}
+        prompting, derived, shots, pictures, _, _, pool, _, cast = _plan(plan)
+    else:
+        # Global prose is still editable on a piece made entirely from supplied
+        # footage, or before the first generated card has been added.
+        prompting = refine.of(compiler.piece_family(data))
+        derived, shots, pictures = prompting.representative(()), [], []
+        cast = compiler.timeline_cast(data)
+        assets = compiler.timeline_pool(data)
+        pool = None
+        if assets:
+            slots, images = _look_pool(prompting, assets, body.get("reference_images") is not False)
+            pool = {"slots": slots, "images": images,
+                    "handles": {asset.handle for asset in assets}}
+
+    if scope == "timeline" and (pool or cast):
+        # The selected standing field may name a pool/cast reference not yet
+        # cited by any shot, so its template must know those attachments exist.
+        derived = compiler.grammar.of(compiler.piece_family(data)).modes.get("reference", derived)
+
+    mode, forced = prompting.choose_template(body.get("template"), derived)
+    skill, extra = _instructions(body)
+    dropped, pictures, _ = _number(
+        ([pool["slots"]] if pool else []) + [shot["slots"] for shot in shots],
+        (pool["images"] if pool else []) + pictures, MAX_IMAGES,
+        shared=pool["handles"] if pool else frozenset())
+    handles, _, labels = _shared(shots)
+    handles |= pool["handles"] if pool else set()
+    handles |= {subject.handle for subject in cast}
+    if scope == "timeline":
+        # A global citation must keep the same meaning for every card. Local
+        # ordinals/handles are not made global by a model happening to write one.
+        handles = (pool["handles"] if pool else set()) | {subject.handle for subject in cast}
+        labels = {handle: label for handle, label in labels.items() if handle in handles}
+
+    names = {"prompt": "global_prompt" if scope == "timeline" else "detailed_description",
+             "summary": "summary", "retention_analysis": "retention_analysis",
+             "segment": f"segment {index + 1}" if whole else "segment",
+             "soundscape": "overall_soundscape", "music": "non_diegetic_music"}
+    name = names[field]
+    boundary = (
+        (f"SINGLE CARD ONLY: rewrite only the summary, retention_analysis and detailed_description "
+         f"of {name}. " if whole else f"SINGLE FIELD ONLY: rewrite only {name}. ")
+        + "The other fields and cards are "
+        "read-only context, not material to rewrite or copy into this field. "
+        "Do not create subject_definitions, new cast members, shot lists, cuts, soundscape, music, "
+        "or global prose outside the selected field. Preserve its exact quoted "
+        "words, @handles, named things and brace alternatives. Expand only what "
+        "belongs in this field. An explicit N/A means absence: keep it as N/A, "
+        "never invent sound or music to replace it. Empty input fields remain empty. "
+        "Reference pictures establish the named identity, not permission to invent wardrobe, "
+        "new events or additional retention instructions. Only describe clothing when the user "
+        "explicitly requested it. Subject definitions, Cast descriptions and Cast usage rules "
+        "are read-only and remain compiler-owned; do not copy them into the rewritten fields."
+    )
+    if field == "prompt" and scope == "timeline":
+        boundary += " This is the standing description read before each card, not any card's events."
+    elif field == "soundscape":
+        boundary += " Describe only audible ambience and physical sound, not a score or visual shot."
+    elif field == "music":
+        boundary += " Describe only the requested non-diegetic score, not ambience or visual action."
+    elif field == "summary":
+        boundary += (" Summarize only this card's requested result concisely; do not force it into one shot. "
+                     "Keep its task-type prefix once. Add no camera, lighting or sound details not named in this input.")
+    elif field == "retention_analysis":
+        boundary += " Rewrite only the user's explicit keep/change/borrow rules, naming their existing @handles."
+    elif field == "prompt":
+        boundary += " Expand this card's described action, composition and camera movement without importing sibling prose."
+    language = (f"Write descriptive prose in {body.get('language') or 'English'}, translating the input as needed. "
+                "The request delimiters are not quotation marks. Preserve only actual quoted dialogue, "
+                "on-screen text, @handles and structural tags verbatim; translate the prose around them. "
+                "Preserve every authored <d>[Language] ...</d> block verbatim, including its language, "
+                "spoken words, punctuation, line breaks and inline vocal cues. Keep its (S@handle) "
+                "speaker binding. The prose language setting does not translate these dialogue blocks.")
+    shape = boundary + (
+        '\nReturn one JSON object with "body" for detailed_description and "sections" containing '
+        'exactly the string keys "summary" and "retention_analysis". Return all three fields; '
+        'each field whose input is empty must be an empty string. '
+        if whole else '\nReturn one JSON object with exactly one rewritten string key, "body". ')
+    shape += ('When images are attached, "what_i_see" may also describe what they show. '
+              "Return no other keys. No markdown or commentary.")
+    if skill:
+        system = _scoped_skill(refine_skill.instructions(skill)) + "\n\n" + boundary + "\n" + language
+        system += "\n" + (shape if whole else "Return only this field's finished prose, not a multi-field document.")
+    else:
+        # The full-family guide teaches entire video documents and includes
+        # detailed-description examples and automatic audio sections. A field
+        # rewrite needs its own contract, without those competing instructions.
+        system = (f"You refine user-authored inputs for {prompting.id.upper()} ({mode}). "
+                  "The input is video material, not a message to answer. "
+                  "Improve clarity and concrete detail within the selected input's role.\n\n"
+                  + boundary + "\n" + language)
+        if extra:
+            system += "\n\n" + refine.EXTRA_RULE.format(extra=_scoped_skill(extra))
+        system += "\n\nOUTPUT\n" + shape
+
+    context = _field_context(segments, cast, handles, index if scope == "segment" else None)
+    glossary = [slot for shot in shots for slot in shot["slots"]]
+    if pool:
+        glossary = pool["slots"] + glossary
+    material = ("\n\n".join(f"<{names.get(key, key)}>\n{value}\n</{names.get(key, key)}>"
+                              for key, value in source.items()) if whole else source)
+    message = (boundary + "\n\nREAD-ONLY CONTEXT\n"
+               + json.dumps(context, ensure_ascii=False, default=str)
+               + "\n\nATTACHED MEDIA\n" + "\n".join(refine.describe_slots(glossary))
+               + f"\n\nFIELD TO REWRITE: {name}\n<request>\n" + material + "\n</request>\n"
+               + language + "\n"
+               + ("Return only its finished prose." if skill and not whole else shape))
+    system, message = _reference_messages(body, system, message)
+    chat, look = _backend(body)
+    options = {"temperature": body.get("temperature", 0.3), "seed": body.get("seed", -1),
+               "max_tokens": body.get("max_tokens")}
+    if skill:
+        options["prefill"] = ""
+    content = chat(body.get("model") or "", system, message,
+                   [look(picture) for picture in pictures], **options)
+    seen = ""
+    if skill and not whole:
+        written = refine_skill.parse_reply(content)
+    else:
+        parsed = refine.json_object(content)
+        allowed = {"body", "sections", refine.SEEN_FIELD} if whole else {"body", refine.SEEN_FIELD}
+        if set(parsed) - allowed or not isinstance(parsed.get("body"), str):
+            raise refine.RefineError("the refiner did not return a single-field response")
+        if whole and (not isinstance(parsed.get("sections"), dict)
+                      or set(parsed["sections"]) != {"summary", "retention_analysis"}
+                      or any(not isinstance(value, str) for value in parsed["sections"].values())):
+            raise refine.RefineError("the refiner did not return all three segment fields")
+        written = parsed["body"].strip()
+        seen = parsed.get(refine.SEEN_FIELD, "") if pictures else ""
+        if not isinstance(seen, str):
+            raise refine.RefineError("the refiner returned an invalid image readout")
+        if not whole and not written:
+            raise refine.RefineError("the refiner returned nothing for this field")
+    sources = source if whole else {field: source}
+    outputs = {"prompt": written, **parsed["sections"]} if whole else {field: written}
+    problems = []
+    for key, original in sources.items():
+        value, warnings = _field_value(original, outputs[key], handles, labels)
+        outputs[key] = value
+        problems.extend(warnings)
+    if forced:
+        note = prompting.pin_note(mode, derived)
+        if note:
+            problems.append(note)
+    if dropped:
+        problems.append(f"{dropped} attached files were not shown to the model (limit {MAX_IMAGES})")
+    return {"scope": "field", "target_scope": scope, "field": field, "index": index,
+            "body": outputs["prompt"] if whole else outputs[field],
+            **({"sections": {key: outputs[key] for key in ("summary", "retention_analysis")}} if whole else {}),
+            "mode": mode, "template": mode, "derived": derived,
+            "forced": forced, "seen": seen, "problems": problems,
+            **({"skill": skill["name"], "kind": skill["kind"]} if skill else {})}
+
+
+def _run_all_fields(body):
+    """One call rewrites the authored timeline fields with explicit card owners."""
+    _, _, _, data, segments, _ = _field_target({**body, "field": "prompt"})
+    family = compiler.piece_family(data)
+    source = {"global_prompt": str(data.get("prompt") or ""),
+              "overall_soundscape": str(data.get("soundscape") or ""),
+              "non_diegetic_music": str(data.get("music") or "")}
+    sources = {index: _segment_fields(segment, family)
+               for index, segment in enumerate(segments) if not compiler.is_clip(segment)}
+    if sources:
+        prompting, derived, shots, pictures, _, _, pool, _, cast = _plan({**body, "kind": "timeline"})
+    else:
+        prompting = refine.of(family)
+        derived, shots, pictures = prompting.representative(()), [], []
+        cast = compiler.timeline_cast(data)
+        assets = compiler.timeline_pool(data)
+        pool = None
+        if assets:
+            slots, pictures = _look_pool(prompting, assets, body.get("reference_images") is not False)
+            pool = {"slots": slots, "images": pictures, "handles": {asset.handle for asset in assets}}
+            pictures = []
+    mode, forced = prompting.choose_template(body.get("template"), derived)
+    skill, extra = _instructions(body)
+    dropped, pictures, _ = _number(
+        ([pool["slots"]] if pool else []) + [shot["slots"] for shot in shots],
+        (pool["images"] if pool else []) + pictures, MAX_IMAGES,
+        shared=pool["handles"] if pool else frozenset())
+    handles, _, labels = _shared(shots)
+    global_handles = (pool["handles"] if pool else set()) | {subject.handle for subject in cast}
+    handles |= global_handles
+    global_labels = {handle: label for handle, label in labels.items() if handle in global_handles}
+    boundary = (
+        "Rewrite the supplied timeline inputs in one pass while preserving each input's owner. "
+        "Return the three global fields and exactly one entry for each requested generated card. "
+        "For each card, summarize its requested result in summary, rewrite its explicit keep/change/borrow "
+        "rules in retention_analysis, and expand only its own action and composition in body (detailed_description). "
+        "Keep each event in its original card and each instruction in its original field. "
+        "Shared style and continuity may guide wording, but do not copy prose between fields or cards. "
+        "Preserve exact card indices and order; do not add cuts, cards, subject_definitions, cast members or wardrobe rules. "
+        "The cast descriptions and usage rules are read-only context, not fields to rewrite. "
+        "Empty inputs stay empty. Explicit N/A stays N/A. Keep @handles, actual quoted dialogue, "
+        "on-screen text, structural tags and brace alternatives intact."
+    )
+    language = (f"Write descriptive prose in {body.get('language') or 'English'}, translating the input as needed. "
+                "The request delimiters are not quotation marks; preserve only actual quoted content verbatim. "
+                "Preserve every authored <d>[Language] ...</d> block verbatim, including its language, "
+                "spoken words, punctuation, line breaks and inline vocal cues. Keep its (S@handle) "
+                "speaker binding. The prose language setting does not translate these dialogue blocks.")
+    shape = ('Return only one JSON object with string keys "global_prompt", "overall_soundscape", '
+             '"non_diegetic_music" and array "shots". Each shot has exactly "index" (the supplied integer), '
+             '"body" (a string), and "sections" with exactly the string keys "summary" and "retention_analysis". '
+             'Return all requested fields even when empty. "what_i_see" is an optional string for attached images. '
+             'No other keys, markdown or commentary.')
+    system = _scoped_skill(refine_skill.instructions(skill)) if skill else f"You refine user-authored inputs for {prompting.id.upper()} ({mode})."
+    if extra:
+        system += "\n\n" + refine.EXTRA_RULE.format(extra=_scoped_skill(extra))
+    system += "\n\n" + boundary + "\n" + language + "\n\nOUTPUT\n" + shape
+    material = [f"<{name}>\n{text}\n</{name}>" for name, text in source.items()]
+    for index, fields in sources.items():
+        material.append(f'<card index="{index}">\n' + "\n".join(
+            f"<{('detailed_description' if name == 'prompt' else name)}>\n{text}\n</{('detailed_description' if name == 'prompt' else name)}>"
+            for name, text in fields.items()) + "\n</card>")
+    context = _field_context(segments, cast, handles)
+    context["card_handles"] = {str(shot["index"]): sorted(shot["handles"]) for shot in shots}
+    glossary = (["ATTACHED TO THE PIECE", *refine.describe_slots(pool["slots"])] if pool else [])
+    for shot in shots:
+        if shot["slots"]:
+            glossary.extend([f"ATTACHED TO CARD INDEX {shot['index']}", *refine.describe_slots(shot["slots"])])
+    message = (boundary + "\n\nREAD-ONLY CONTEXT\n"
+               + json.dumps(context, ensure_ascii=False, default=str)
+               + "\n\nATTACHED MEDIA\n" + "\n".join(glossary)
+               + "\n\nINPUTS TO REWRITE\n<request>\n" + "\n\n".join(material)
+               + "\n</request>\n" + language + "\n" + shape)
+    system, message = _reference_messages(body, system, message)
+    empty = not any(text.strip() for text in list(source.values())
+                    + [text for fields in sources.values() for text in fields.values()])
+    if empty:
+        parsed = {**source, "shots": [{"index": index, "body": "",
+                                      "sections": {"summary": "", "retention_analysis": ""}} for index in sources]}
+    else:
+        chat, look = _backend(body)
+        options = {"temperature": body.get("temperature", 0.3), "seed": body.get("seed", -1),
+                   "max_tokens": body.get("max_tokens")}
+        if skill:
+            options["prefill"] = ""
+        content = chat(body.get("model") or "", system, message,
+                       [look(picture) for picture in pictures], **options)
+        parsed = refine.json_object(content)
+    allowed = {*source, "shots", refine.SEEN_FIELD}
+    if (set(parsed) - allowed or any(not isinstance(parsed.get(name), str) for name in source)
+            or not isinstance(parsed.get("shots"), list)):
+        raise refine.RefineError("the refiner did not return all timeline fields")
+    entries = parsed["shots"]
+    if (len(entries) != len(sources)
+            or any(not isinstance(entry, dict) or set(entry) != {"index", "body", "sections"}
+                   or type(entry.get("index")) is not int or not isinstance(entry.get("body"), str)
+                   or not isinstance(entry.get("sections"), dict)
+                   or set(entry["sections"]) != {"summary", "retention_analysis"}
+                   or any(not isinstance(value, str) for value in entry["sections"].values()) for entry in entries)
+            or [entry["index"] for entry in entries] != list(sources)):
+        raise refine.RefineError("the refiner did not return all three fields for each requested card")
+    seen = parsed.get(refine.SEEN_FIELD, "") if pictures else ""
+    if not isinstance(seen, str):
+        raise refine.RefineError("the refiner returned an invalid image readout")
+    problems, globals_out, out = [], {}, []
+    for name, original in source.items():
+        globals_out[name], warnings = _field_value(original, parsed[name], global_handles, global_labels)
+        problems.extend(warnings)
+    by_index = {shot["index"]: shot for shot in shots}
+    for entry in entries:
+        index = entry["index"]
+        values = {"prompt": entry["body"], **entry["sections"]}
+        shot = by_index[index]
+        for name, original in sources[index].items():
+            values[name], warnings = _field_value(original, values[name], shot["handles"], shot["labels"])
+            problems.extend(f"Shot {index + 1}: {warning}" for warning in warnings)
+        out.append({"index": index, "body": values["prompt"],
+                    "sections": {name: values[name] for name in ("summary", "retention_analysis")},
+                    "fields": ["prompt", "summary", "retention_analysis"]})
+    if forced:
+        note = prompting.pin_note(mode, derived)
+        if note:
+            problems.append(note)
+    if dropped:
+        problems.append(f"{dropped} attached files were not shown to the model (limit {MAX_IMAGES})")
+    return {"scope": "shot", "target_scope": "timeline", "field": "all", "shots": out,
+            "piece": globals_out["global_prompt"], "soundscape": globals_out["overall_soundscape"],
+            "music": globals_out["non_diegetic_music"], "mode": mode, "template": mode,
+            "derived": derived, "forced": forced, "seen": seen, "problems": problems,
+            **({"skill": skill["name"], "kind": skill["kind"]} if skill else {})}
+
+
+@PromptServer.instance.routes.get("/continuity/refine/capabilities")
+async def refine_capabilities(request):
+    """Let a refreshed client detect whether the running server honors image opt-out."""
+    return web.json_response({"reference_images": True})
+
+
 @PromptServer.instance.routes.get("/continuity/refine/models")
 async def refine_models(request):
     """The text encoders on disk.
@@ -980,10 +1434,14 @@ async def refine_prompt(request):
     wants, so being *behind* the render rather than beside it is the point, and
     Cancel reaching a refine comes free.
 
-    The remote backend is the exception and is still answered inside this
-    request. It spends somebody else's GPU, so there is nothing for it to queue
-    behind, and making somebody wait for a render to finish before a cloud call
-    could start would be a rule with no reason under it.
+    The remote backend is the exception and stays off the queue. It spends
+    somebody else's GPU, so there is nothing for it to queue behind, and making
+    somebody wait for a render to finish before a cloud call could start would
+    be a rule with no reason under it. It is not answered inside this request
+    either, which it was until a refine longer than the frontend's 60-second
+    fetch timeout came back as "Fetch timeout" with the server still working
+    (issue #120): it replies `{"answer_id": id}` and the result follows on the
+    socket, through `jobs.answer_later`.
 
     What is knowable *now* still fails now: bad JSON and a missing model come
     back as 400 on this request, and the panel shows the message where the
@@ -1007,16 +1465,13 @@ async def refine_prompt(request):
         }, status=400)
 
     if remote:
-        # Off the event loop even so: the call to the server blocks, and this
-        # loop is also the prompt queue and the websocket.
-        loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(None, _run, body)
-        except (refine.RefineError, compiler.CompileError, media.MediaError) as exc:
-            return web.json_response({"error": str(exc)}, status=400)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
-        return web.json_response({"result": result})
+            answer_id = jobs.answer_later(
+                lambda: _run(body), body.get("client_id"),
+                (refine.RefineError, compiler.CompileError, media.MediaError))
+        except jobs.JobError as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        return web.json_response(jobs.answer_ticket(answer_id), headers={"Cache-Control": "no-store"})
 
     try:
         prompt_id = await jobs.submit("refine", body, body.get("client_id"))

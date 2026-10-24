@@ -11,21 +11,24 @@
 // contenteditable destroys the caret, and attaching an asset from the @ menu
 // commits *while the user is typing in it*.
 
-import { el, icon, ICONS, dismissable, keepScroll, placeNear, svg, swappable } from "./dom.js";
+import { el, icon, ICONS, closeOwnedPopovers, dismissable, keepScroll, placeNear, svg, swappable } from "./dom.js";
 import { CastShelf, CAST_REFERENCE_TAKES } from "./cast.js";
 import { isVisualReference, previewable, openReferencePreview } from "./reference-preview.js";
 import { castFamilies, keepAsMod } from "./refmod.js";
 import { t } from "./i18n.js";
 import { openPicker } from "./picker.js";
 import { screenChips, screenTool, screenMentions, uncitedScreens } from "./screens.js";
-import { openLoras, loraBlock, settlePins } from "./loras.js";
+import { openLoras, globalLoraOptions, loraBlock, settlePins } from "./loras.js";
 import { openSettings } from "./settings.js";
 import { openPresetLibrary, styleCastMember } from "./presetlib.js";
 import { castIntoPiece, keepSubject } from "./presets.js";
 import { openTrim, trimLabel } from "./trim.js";
 import { editPicture, asPick, applyPick, cropLabel } from "./picture.js";
 import { PromptBox, focusEnd, openEditorSheet } from "./prompt.js";
-import { RefinePanel, refineButton, refine } from "./refine.js";
+import { SegmentPromptSections, openCompiledPrompt } from "./prompt-sections.js";
+import { createDisclosure } from "./disclosure.js";
+import { clearButton } from "./clear.js";
+import { RefinePanel, refineButton, refineField, refineSegment, withRefineOwner, refineActivity } from "./refine.js";
 import { openAspectPopover, openResolutionPopover, openChoicePopover, facesPill, motionPill, neuralPill, guideLoraPill, aspectGlyph,
          resolutionPillText,
          PILL_GLYPH, pillSet, pillClass } from "./pills.js";
@@ -90,7 +93,7 @@ export const takesHelp = (asset) =>
  * four of those said nothing four times. Empty for an ordinary file, which is
  * most of them.
  */
-export function referenceSummary(asset) {
+export function referenceSummary(asset, { size = true } = {}) {
   const said = [];
   if (S.takeable(asset) && S.takes(asset) !== "full") said.push(t(S.takeWord(S.takes(asset))));
   if (asset.kind !== "image" && asset.trim) said.push(trimLabel(asset));
@@ -98,7 +101,7 @@ export function referenceSummary(asset) {
   if (asset.kind === "video" && (asset.track ?? S.DEFAULT_TRACK) !== S.DEFAULT_TRACK) {
     said.push(t(TRACK_CHIP[asset.track]?.text ?? ""));
   }
-  if (S.sizeable(asset) && S.refSize(asset) !== S.DEFAULT_REF_SIZE[asset.kind]) {
+  if (size && S.sizeable(asset) && S.refSize(asset) !== S.DEFAULT_REF_SIZE[asset.kind]) {
     said.push(t(S.refSize(asset)));
   }
   return said.filter(Boolean).join(" · ");
@@ -136,12 +139,11 @@ export class CreatorEditor {
    *   wants — `{kind, data, index}`. Supplied by the owner because only it knows
    *   whether this state is a whole `creator_data` or one card of a timeline;
    *   without it the Refine button is not drawn at all.
-   * @param {(result: object) => void} [options.onRefined]  the parts of a reply
-   *   that are not this state's: in a timeline the soundscape and the score
-   *   belong to the timeline, so the owner takes them.
-   * @param {() => void} [options.onReverted]  the rewrite was thrown away — the
-   *   other half of `onRefined`, so an owner holding parts of a reply can drop
-   *   them too rather than keep prose nothing refers to any more.
+   * @param {(result: object) => void} [options.onRefined]  legacy owner marker.
+   *   Plain Refine no longer calls a whole-piece callback; it writes only this prompt.
+   * @param {() => void} [options.onReverted]  legacy callback, not called by prompt-only Revert.
+   * @param {boolean} [options.refineAudioFields]  whether existing audio inputs are
+   *   edited here. Explicit for a timeline card; the legacy marker is its fallback.
    */
   /**
    * @param {() => string|number} [options.nodeId]  the ComfyUI node this body is
@@ -214,8 +216,8 @@ export class CreatorEditor {
    *   is only the writes that have to land where the value actually lives, or
    *   the next mirror would wipe them.
    */
-  constructor({ state, onCommit, canvasPills = true, continuePill = false,
-                refineTarget = null, onRefined = null, onReverted = null,
+  constructor({ state, onCommit, onPromptCommit = null, canvasPills = true, continuePill = false,
+                refineTarget = null, onRefined = null, onReverted = null, refineAudioFields = null,
                 samplingWidgets = null, onWidgetChange = null, nodeId = null,
                 routeOf = null, setRoute = null, preStage = null, pieceView = null,
                 durationPill = true, extraPills = null, modelPill = null, extraTools = null,
@@ -224,7 +226,8 @@ export class CreatorEditor {
                 samplingStore = null, pinFamily = null,
                 clearTool = null, seedTarget = null, compiledPrompt = null,
                 castFromLibrary = null, fullscreen = null, varies = null,
-                openCast = null }) {
+                openCast = null, structuredPrompt = false }) {
+    this.structuredPrompt = structuredPrompt;
     // The seed and card a `{day|night}` in this prompt is chosen on, for the
     // box to light the alternative the render will take. Null where there is
     // no node under the box to answer for it — see `PromptBox.paintVariations`.
@@ -288,6 +291,9 @@ export class CreatorEditor {
     this.extraTools = extraTools;
     this.clearTool = clearTool;
     this.state = state;
+    // A field rewrite arriving after an edit, even an edit-and-undo, is stale.
+    this.refineEpoch = 0;
+    this.destroyed = false;
     // Where the standing checkpoint route is read from and written to. A node
     // body owns its own; a timeline segment editor reads the timeline's and
     // cannot set it, because a route that differed between two shots of one clip
@@ -295,11 +301,13 @@ export class CreatorEditor {
     this.routeOf = routeOf ?? (() => this.piece.models?.route ?? "auto");
     this.setRoute = setRoute;
     this.onCommit = onCommit;
+    this.onPromptCommit = onPromptCommit;
     this.canvasPills = canvasPills;
     this.continuePill = continuePill;
     this.refineTarget = refineTarget;
     this.onRefined = onRefined;
     this.onReverted = onReverted;
+    this.refineAudioFields = refineAudioFields;
     // Only the node body has these. The same editor opens as a timeline
     // segment, where the sampler belongs to the timeline and not to one shot.
     this.samplingWidgets = samplingWidgets;
@@ -316,9 +324,10 @@ export class CreatorEditor {
     this.lengths = new Map();
 
     this.prompt = new PromptBox({
-      getState: () => this.state,
+      getState: () => this.sectionEditor?.detailedState() ?? this.state,
       replaceHandles: true,
       onInput: (text) => {
+        if (this.sectionEditor) { this.sectionEditor.inputBody(text); return; }
         this.state.prompt = text;
         this.onCommit?.();
         this.renderNotices();   // dangling-handle warning, without disturbing the caret
@@ -327,7 +336,7 @@ export class CreatorEditor {
         // moves on keystrokes that never touch the sentence's own words.
         this.prompt.refreshCompiled();
       },
-      compiled: this.compiledPrompt ? () => this.compiledPrompt() : null,
+      compiled: this.compiledPrompt && !this.structuredPrompt ? () => this.compiledPrompt() : null,
       pick: () => this.varies?.() ?? null,
       // The plates the sentence woke, so the box can underline the word that
       // did it in the owner's hue — the chip's ring fills in that hue, and the
@@ -407,20 +416,32 @@ export class CreatorEditor {
     this.prompt.root.addEventListener("blur", () => { this.overflowWaived = false; });
 
     // Built once and refreshed in place: it holds textareas that are typed into,
-    // and a full render would rebuild the one under the caret. `onRefined`
-    // decides whether the two audio fields live here — in a timeline they are
-    // the timeline's and are edited in its own modal.
+    // and a full render would rebuild the one under the caret. Audio inputs can
+    // still be edited manually here, but a plain Refine never writes them.
     this.refinePanel = new RefinePanel({
       getState: () => this.state,
       // Also the dimming: the panel's toggle and its Revert both change whether
       // the prompt above is queued, and neither goes through a full render.
-      onCommit: () => { this.onCommit?.(); this.syncPrompt(); },
-      audioFields: !this.onRefined,
+      onCommit: () => this.commitPrompt(),
+      audioFields: this.refineAudioFields ?? !this.onRefined,
       onRevert: () => this.onReverted?.(),
+      promptOnly: true,
+      createPromptBox: (options) => new PromptBox({ ...this.prompt.hooks,
+        compiled: null, onOverflow: null, ...options,
+        // A generated draft is not ownership of an original attachment.
+        onUncited: () => {},
+      }),
     });
 
-    this.railHost = el("div");
+    this.railHost = el("div", { class: this.structuredPrompt ? "mmc-editor-sheet-tools" : "" });
+    this.headerTools = this.railHost;
     this.assetsHost = el("div", { class: "mmc-assets-host" });
+    if (this.structuredPrompt) {
+      this.assetsSection = createDisclosure({ title: t("Cast and piece references"), content: this.assetsHost,
+        inlineActions: true, actionsBeforeHint: true });
+      this.assetsSection.root.classList.add("mmc-editor-references");
+      this.sectionEditor = new SegmentPromptSections(this);
+    }
     // The cast, under the files it is built out of, because a subject is built
     // out of what is there and reads as nonsense above it. Left empty — not
     // hidden — while the shelf is folded or the host has a shelf of its own,
@@ -460,11 +481,12 @@ export class CreatorEditor {
     // that window, and there it is the window, so nothing about it escalates.
     this.onFace = !!this.nodeId;
     this.expandHost = el("div", { class: "mmc-panel-corner" });
-    this.root = el("div", { class: "mmc-root" }, [
-      this.railHost,
-      this.assetsHost,
+    this.root = el("div", { class: `mmc-root${this.structuredPrompt ? " mmc-structured-editor" : ""}` }, [
+      ...(!this.structuredPrompt ? [this.railHost] : []),
+      ...(this.structuredPrompt ? [this.loraHost] : []),
+      this.assetsSection?.root ?? this.assetsHost,
       this.castHost,
-      this.loraHost,
+      ...(!this.structuredPrompt ? [this.loraHost] : []),
       // `frame`, not `root`: the box brings its own disclosure, which folds it
       // away once a rewrite is what gets queued.
       this.panel = el("div", { class: "mmc-panel" }, [
@@ -478,17 +500,43 @@ export class CreatorEditor {
         // keepScroll: the well is the face's scroll container once a rewrite
         // outgrows the node, and on the canvas the wheel is the zoom.
         this.well = keepScroll(el("div", { class: "mmc-well" }, [
-          this.prompt.frame, this.refinePanel.root,
+          this.sectionEditor?.root ?? this.prompt.frame, this.refinePanel.root,
         ])),
         this.pillsHost,
       ]),
       this.noticeHost,
       this.samplingHost,
     ]);
+    // A name restored on blur may widen its owner caption and move the very
+    // reference button being pressed. Paint passive names after that gesture's
+    // click, not between pointerdown and pointerup. State/warnings stay live.
+    this.referencePressEnd = (event) => {
+      if (event && event.pointerId !== this.referencePress) return;
+      this.referencePress = null;
+      document.removeEventListener("pointerup", this.referencePressEnd, true);
+      document.removeEventListener("pointercancel", this.referencePressEnd, true);
+      window.removeEventListener("blur", this.referencePressBlur);
+      clearTimeout(this.referenceNameTimer);
+      this.referenceNameTimer = setTimeout(() => {
+        this.referenceNameTimer = null;
+        if (!this.destroyed && this.referenceNamesPending) {
+          this.referenceNamesPending = false;
+          for (const paint of this.referenceNameReadouts ?? []) paint();
+        }
+      }, 0);
+    };
+    this.referencePressBlur = () => this.referencePressEnd();
+    this.root.addEventListener("pointerdown", (event) => {
+      if (this.destroyed || event.button !== 0 || !event.target.closest?.(".mmc-asset")) return;
+      this.referencePress = event.pointerId;
+      document.addEventListener("pointerup", this.referencePressEnd, true);
+      document.addEventListener("pointercancel", this.referencePressEnd, true);
+      window.addEventListener("blur", this.referencePressBlur);
+    }, true);
 
     // The whole panel is the writing area, not just the box inside it — see
     // `PromptBox.claim`.
-    this.prompt.claim(this.panel);
+    this.prompt.claim(this.sectionEditor ? this.sectionEditor.descriptionSection.body : this.panel);
 
     // The weights pill needs the file lists to say anything useful, and every
     // node body on the canvas shares the one request.
@@ -505,14 +553,36 @@ export class CreatorEditor {
       primeSettings(() => this.adoptWeights());
     }
 
-    this.prompt.setValue(this.state.prompt ?? "");
+    this.prompt.setValue(this.sectionEditor?.detailedState().prompt ?? this.state.prompt ?? "");
     this.render();
     this.probeKeyframe();
   }
 
   /** Called when the node body goes away. */
   destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.refineEpoch = (this.refineEpoch ?? 0) + 1;
+    this.sheet?.();
+    this.sheet = null;
+    this.sheetEditor?.destroy();
+    this.sheetEditor = null;
+    closeOwnedPopovers(this.root);
+    this.referenceNameReadouts = [];
+    clearTimeout(this.referenceNameTimer);
+    this.referenceNameTimer = null;
+    this.referenceNamesPending = false;
+    this.referencePress = null;
+    document.removeEventListener("pointerup", this.referencePressEnd, true);
+    document.removeEventListener("pointercancel", this.referencePressEnd, true);
+    window.removeEventListener("blur", this.referencePressBlur);
     if (this.ownsStage) this.stage?.destroy();
+    this.prompt.setCompiledOpen(false);
+    this.prompt.closeMenu();
+    this.prompt.paintWhenShown?.disconnect();
+    this.sectionEditor?.destroy();
+    this.refinePanel?.destroy();
+    this.compiledView?.close();
   }
 
   /**
@@ -547,6 +617,7 @@ export class CreatorEditor {
   }
 
   commit() {
+    this.refineEpoch = (this.refineEpoch ?? 0) + 1;
     // Before notifying, because attaching a reference can invalidate a
     // checkpoint pin that was legal when it was made.
     S.normalizeCheckpoint(this.state, S.pieceFamily(this.piece));
@@ -558,6 +629,14 @@ export class CreatorEditor {
     this.render();
   }
 
+  /** A prose-only commit must not normalize weights, sampling or pinned LoRAs. */
+  commitPrompt() {
+    this.refineEpoch = (this.refineEpoch ?? 0) + 1;
+    this.syncPrompt();
+    this.refinePanel?.render();
+    (this.onPromptCommit ?? this.onCommit)?.();
+  }
+
   /** Point the editor at a different state object.
    *
    *  The Creator node needs this because loading a saved workflow assigns widget
@@ -565,7 +644,14 @@ export class CreatorEditor {
    *  an empty blob and has to catch up once the graph has finished configuring.
    */
   setState(state) {
+    if (this.state !== state && this.sheetEditor) {
+      this.sheetEditor.destroy();
+      this.sheetEditor = null;
+      this.sheet?.();
+      this.sheet = null;
+    }
     this.state = state;
+    this.sectionEditor?.reset();
     this.sizes.clear();
     this.lengths.clear();
     this.prompt.setValue(this.state.prompt ?? "");
@@ -574,23 +660,53 @@ export class CreatorEditor {
     this.probeKeyframe();
   }
 
-  /**
-   * Ask the refiner to rewrite this state's prompt.
-   *
-   * The reply is a whole-request answer even when only one shot was asked for —
-   * the soundscape and the score describe the piece — so the shot body lands
-   * here and the rest goes wherever the owner keeps it.
-   */
-  async refine(options) {
+  /** Rewrite only this editor's prompt; the owner's other prose is read-only. */
+  async refine(options, field = this.structuredPrompt ? "segment" : "prompt") {
+    const owner = this.state;
+    const epoch = this.refineEpoch ?? 0;
+    const target = this.refineTarget();
+    const snapshot = JSON.stringify(target);
+    const attached = !!this.root?.isConnected;
+    const retained = this.mmcRetainRefineWhileHidden === true;
     try {
-      const result = await refine(this.refineTarget(), options);
-      const shot = result.shots?.[0];
-      if (!shot?.body) throw new Error(t("the refiner returned nothing for this prompt"));
-      this.refinePanel.apply(result, shot);
-      this.onRefined?.(result);
-      this.commit();
+      await withRefineOwner(this.piece ?? owner, async () => {
+        const result = field === "segment" ? await refineSegment(target, options)
+          : await refineField(target, field, options);
+        if (this.destroyed || this.state !== owner || (this.refineEpoch ?? 0) !== epoch
+            || (attached && !this.root?.isConnected && !retained)
+            || JSON.stringify(this.refineTarget()) !== snapshot) {
+          if (!this.destroyed && this.state === owner && (retained || !attached || this.root?.isConnected)) {
+            this.refinePanel.fail(t("The prompt changed while refining. No fields were changed."));
+          }
+          return;
+        }
+        if (result.unchanged) return;
+        const previous = owner.refined?.enabled !== false ? owner.refined : null;
+        const shot = { body: result.body };
+        if (this.structuredPrompt) {
+          shot.fields = field === "segment" ? ["summary", "retention_analysis", "prompt"] : [field];
+          shot.sources = Object.fromEntries(shot.fields.map((name) => [name, this.sectionEditor.readField(name)]));
+          shot.sections = { ...(previous?.sections ?? {}) };
+          if (field === "segment") {
+            shot.sections.summary = result.sections.summary;
+            shot.sections.retention_analysis = result.sections.retention_analysis;
+          } else if (field !== "prompt") {
+            shot.sections[field] = result.body;
+            // A summary rewrite must not freeze the original description as a
+            // second, supposedly refined draft.
+            if (previous?.body && (!Array.isArray(previous.fields) || previous.fields.includes("prompt"))) {
+              shot.body = previous.body;
+            } else delete shot.body;
+          }
+        }
+        this.refinePanel.apply(result, shot);
+        this.commitPrompt();
+      });
     } catch (error) {
-      this.refinePanel.fail(String(error.message || error));
+      if (!this.destroyed && this.state === owner && (this.refineEpoch ?? 0) === epoch
+          && (retained || !attached || this.root?.isConnected)) {
+        this.refinePanel.fail(String(error.message || error));
+      }
     }
   }
 
@@ -677,6 +793,7 @@ export class CreatorEditor {
   async pickReferences(kind, sheet, { edit = false } = {}) {
     const spec = this.plateSpec();
     const chosen = await openPicker({
+      selectionPurpose: edit ? "segment-edit-sheet" : "segment-references",
       kinds: edit ? ["image", "renders"] : ["image", "video", "audio", "renders", "refmods"],
       aspect: this.pickerAspect(),
       kind,
@@ -863,6 +980,7 @@ export class CreatorEditor {
    *  model — so the picker is told there is room. -> `{path, kind}` or null. */
   async pickScreenContent(kind = null) {
     const chosen = await openPicker({
+      selectionPurpose: "segment-screen-content",
       kinds: ["image", "video", "renders"],
       aspect: this.pickerAspect(),
       kind: kind ?? "image",
@@ -877,6 +995,7 @@ export class CreatorEditor {
   async addGuide() {
     const existing = S.guideAsset(this.state);
     const chosen = await openPicker({
+      selectionPurpose: "segment-guide",
       kinds: ["guides"],
       aspect: this.pickerAspect(),
       kind: "guides",
@@ -914,6 +1033,7 @@ export class CreatorEditor {
     const spec = this.plateSpec();
     const sheet = this.seedSheet("image");
     const chosen = await openPicker({
+      selectionPurpose: "segment-gallery-reference",
       kinds: ["renders", "image", "video", "audio", "refmods"],
       aspect: this.pickerAspect(),
       kind: "renders",
@@ -961,6 +1081,10 @@ export class CreatorEditor {
       if (S.takeOptions(entry).includes(asset.takes)) entry.takes = asset.takes;
       if (asset.trim) entry.trim = asset.trim;
       if (asset.crop) entry.crop = asset.crop;
+      if (asset.replacement_origin) entry.replacement_origin = asset.replacement_origin;
+      if (asset.replacement_annotation) entry.replacement_annotation = asset.replacement_annotation;
+      if (asset.width) entry.width = asset.width;
+      if (asset.height) entry.height = asset.height;
       this.state.assets.push(entry);
       // A saved clip has no soundtrack to ask about.
       if (asset.kind !== "video" || S.isRefMod(entry)) continue;
@@ -1024,6 +1148,7 @@ export class CreatorEditor {
    */
   async replaceAsset(asset) {
     const chosen = await openPicker({
+      selectionPurpose: "segment-replace-file",
       kinds: [asset.kind, "renders"],
       aspect: this.pickerAspect(),
       kind: asset.kind,
@@ -1091,7 +1216,8 @@ export class CreatorEditor {
     const rewrite = refined && refined.enabled !== false
       ? [refined.body, ...Object.values(refined.sections ?? {})]
       : [];
-    return [this.state.prompt, this.state.soundscape, this.state.music, ...rewrite];
+    return [this.state.prompt, this.state.soundscape, this.state.music,
+      ...S.promptSectionTexts(this.state), ...rewrite];
   }
 
   /**
@@ -1476,7 +1602,8 @@ export class CreatorEditor {
     const blocked = S.blockedReason(this.state, role);
     if (blocked) return this.flash(blocked);
     const existing = S.frameAsset(this.state, role);
-    const chosen = await openPicker({ kinds: ["image"], kind: "image", single: true, capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
+    const chosen = await openPicker({ selectionPurpose: role === "first_frame" ? "segment-first-frame" : "segment-last-frame",
+                                      kinds: ["image"], kind: "image", single: true, capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
                                       aspect: this.pickerAspect() });
     if (!chosen) return;
     const asset = chosen[0];
@@ -1524,11 +1651,13 @@ export class CreatorEditor {
    *  off the probe route, like a clip card's. A file that cannot be read
    *  stays unmeasured and the readout keeps the preset. */
   probeKeyframe() {
+    const owner = this.state;
     for (const asset of S.aspectDonors(this.state)) {
       if (this.sizes.has(asset.filename)) continue;
       this.sizes.set(asset.filename, null);
       if (asset.kind === "video") {
         probe(asset.filename).then(({ width, height }) => {
+          if (this.destroyed || this.state !== owner) return;
           if (!width || !height) return;
           this.sizes.set(asset.filename, { width, height });
           this.render();
@@ -1537,6 +1666,7 @@ export class CreatorEditor {
       }
       const measure = new Image();
       measure.onload = () => {
+        if (this.destroyed || this.state !== owner) return;
         this.sizes.set(asset.filename, { width: measure.naturalWidth, height: measure.naturalHeight });
         this.render();
       };
@@ -1549,6 +1679,7 @@ export class CreatorEditor {
    *  trips; a trimmed clip is not asked either, because the range is the
    *  length. */
   probeLengths() {
+    const owner = this.state;
     // `S.timedAssets` rather than the references alone: the guide has a length
     // too, and a length nobody asked the server for is a length the pill cannot
     // offer to match. It was the one file on the card this loop had never
@@ -1557,6 +1688,7 @@ export class CreatorEditor {
       if (asset.trim || this.lengths.has(asset.filename)) continue;
       this.lengths.set(asset.filename, null);
       probe(asset.filename).then(({ duration }) => {
+        if (this.destroyed || this.state !== owner) return;
         if (!duration) return;
         this.lengths.set(asset.filename, duration);
         this.render();
@@ -1615,6 +1747,7 @@ export class CreatorEditor {
   // ---- render --------------------------------------------------------------
 
   render() {
+    if (this.destroyed) return;
     const state = this.state;
     this.onRender?.();
     this.probeKeyframe();
@@ -1631,7 +1764,8 @@ export class CreatorEditor {
     // The family's pins go on before the row is read: a stack that does not
     // hold them yet takes them here, and is written out with them.
     if (settlePins(state, this.pinFamily(), () => this.commit())) this.onCommit?.();
-    this.loraHost.replaceChildren(...(state.loras.length ? [this.renderLoras()] : []));
+    this.loraHost.replaceChildren(...(state.loras.length || (this.structuredPrompt && this.piece !== state)
+      ? [this.renderLoras()] : []));
     this.pillsHost.replaceChildren(
       this.renderPills(geometry, S.mode(state, this.piece)));
     // A card's own seed, where the sampler row belongs to the node above it.
@@ -1710,8 +1844,6 @@ export class CreatorEditor {
         // `face_payload` the moment it sees one, and a family that has no such
         // method raises. A pill you can switch off is the difference between a
         // render that says what is wrong and one that stops.
-        ...(S.canDo(this.piece, "face") || this.piece.face?.on
-          ? [facesPill({ target: this.piece, commit: () => this.commit() })] : []),
         // The motion fix, which on a strip is a chip on each card: a lone
         // shot has no card, so its switch sits here. Only where the family
         // has the pass, and this editor is the node's face rather than a
@@ -1736,16 +1868,18 @@ export class CreatorEditor {
         weightsPill({
           piece: this.piece,
           models: this.piece.models,
-          checkpoints: S.checkpointsFor(this.state, S.pieceFamily(this.piece)),
-          face: Boolean(this.piece.face?.on),
+          checkpoints: S.effectiveCheckpoints(this.state, this.piece),
+          face: S.faceAnywhere(this.piece),
           onChange: () => this.commit(),
           turbo: { container: this.piece, widgetIO: this.widgetIO() },
         }),
       ] : [],
     })] : []));
     this.prompt.refresh();
+    this.sectionEditor?.refresh();
     this.syncPrompt();
     this.prompt.refreshCompiled();
+    this.compiledView?.refresh();
     this.refinePanel.render();
     this.renderExpand();
     this.renderNotices();
@@ -1830,9 +1964,21 @@ export class CreatorEditor {
    */
   openEditor({ caret = null } = {}) {
     if (this.sheet) return;
-    const editor = new CreatorEditor({
+    const binding = JSON.stringify([S.pieceFamily(this.piece), S.hasPromptSections(this.piece), this.canvasPills]);
+    if (this.sheetEditor && (this.sheetEditor.destroyed || this.sheetEditor.state !== this.state
+        || this.sheetEditor.piece !== this.piece || this.sheetEditor.mmcSheetBinding !== binding)) {
+      this.sheetEditor.destroy();
+      this.sheetEditor = null;
+    }
+    const editor = this.sheetEditor ?? new CreatorEditor({
       state: this.state,
       onCommit: () => { this.onCommit?.(); this.render(); },
+      onPromptCommit: () => {
+        this.refineEpoch = (this.refineEpoch ?? 0) + 1;
+        this.refinePanel.render();
+        this.syncPrompt();
+        (this.onPromptCommit ?? this.onCommit)?.();
+      },
       canvasPills: this.canvasPills,
       piece: this.piece,
       pinFamily: this.pinFamilyOf,
@@ -1842,9 +1988,11 @@ export class CreatorEditor {
       extraTools: this.extraTools,
       settingsTool: this.settingsTool,
       compiledPrompt: this.compiledPrompt,
+      structuredPrompt: S.hasPromptSections(this.piece),
       refineTarget: this.refineTarget,
       onRefined: this.onRefined,
       onReverted: this.onReverted,
+      refineAudioFields: this.refineAudioFields,
       routeOf: this.routeOf,
       setRoute: this.setRoute,
       // The roster and the library are the generation's as much as the prompt
@@ -1856,6 +2004,8 @@ export class CreatorEditor {
       // No nodeId: the sampler row, the weights pill and the stage belong to
       // the node and stay on its face. What is in here is the generation.
     });
+    editor.mmcSheetBinding = binding;
+    editor.mmcRetainRefineWhileHidden = true;
     // Held so the face can redraw it. Every control in the window whose write
     // goes through a callback the *owner* supplied — the route badge is the one
     // that showed it — lands on the node's own editor and re-renders that one;
@@ -1866,14 +2016,13 @@ export class CreatorEditor {
       title: this.editorTitle,
       subtitle: t("Prompt, references, LoRAs and canvas. The sampler stays on the node."),
       content: [editor.root],
+      headerTools: editor.structuredPrompt ? [editor.headerTools] : [],
       onClose: () => {
         this.sheet = null;
-        this.sheetEditor = null;
-        editor.destroy();
         // The face is about to show a box the text still does not fit. It is
         // not to grab the caret again for it — see `onPromptOverflow`.
         this.overflowWaived = this.overflowing;
-        this.render();
+        if (!this.destroyed) this.render();
       },
     });
     if (caret === "end") focusEnd(editor.prompt.root);
@@ -1891,7 +2040,15 @@ export class CreatorEditor {
    */
   syncPrompt() {
     const refined = this.state.refined;
-    this.prompt.setSuperseded(!!refined?.body?.trim() && refined.enabled !== false);
+    const owns = (field) => !!refined && refined.enabled !== false
+      && (!Array.isArray(refined.fields) || refined.fields.includes(field));
+    this.prompt.setSuperseded(owns("prompt") && !!refined.body?.trim());
+    if (this.sectionEditor) {
+      this.sectionEditor.summary.setSuperseded(owns("summary") && Object.hasOwn(refined?.sections ?? {}, "summary"));
+      for (const box of this.sectionEditor.textBoxes.values()) {
+        box.setSuperseded(owns("retention_analysis") && Object.hasOwn(refined?.sections ?? {}, "retention_analysis"));
+      }
+    }
   }
 
   renderNotices() {
@@ -1899,6 +2056,26 @@ export class CreatorEditor {
       ...(this.notice ? [el("div", { class: "mmc-warn", text: this.notice })] : []),
       ...(this.renderDangling() || []),
     );
+  }
+
+  /** Refresh connections, not the text or sampler settings an open editor owns. */
+  refreshReferences({ namesOnly = false } = {}) {
+    // A name field can blur during a reference-button press. Keep that exact
+    // button mounted until the press finishes; only its passive captions change.
+    if (namesOnly) {
+      if (this.referencePress != null || this.referenceNameTimer != null) {
+        this.referenceNamesPending = true;
+      } else {
+        for (const paint of this.referenceNameReadouts ?? []) paint();
+      }
+    } else {
+      this.renderAssetsRow();
+    }
+    this.prompt.refresh();
+    this.sectionEditor?.refresh();
+    this.prompt.refreshCompiled();
+    this.compiledView?.refresh();
+    this.renderNotices();
   }
 
   /**
@@ -1954,7 +2131,15 @@ export class CreatorEditor {
       // it is refused, and the shelf says why, which is more use than a picture
       // that is on the node and not in the menu.
       getAssets: () => [...(this.state.assets ?? []), ...(this.state.pool ?? [])],
-      addAsset: (subject) => this.attachOneAsset(subject),
+      addAsset: (subject, options) => this.attachOneAsset(subject, options),
+      addReplacementAsset: async (saved, options = {}) => {
+        if (options.isCurrent?.() === false) return null;
+        const owner = this.state;
+        const before = new Set(this.state.assets.map((asset) => asset.handle));
+        await this.attachAssets([saved]);
+        if (this.state !== owner || options.isCurrent?.() === false) return null;
+        return this.state.assets.find((asset) => !before.has(asset.handle) && asset.filename === saved.path) ?? null;
+      },
       whereCited: (subject) => {
         const cited = S.citedCast({ ...this.state, cast: [subject] }).length > 0;
         // Named only inside an alternative this seed passes over: cut at queue
@@ -2016,12 +2201,11 @@ export class CreatorEditor {
       // in: it belongs to the piece, and one card is not the place a file is
       // taken off every other card.
       dropAssets: (handles) => {
-        const texts = [this.state.prompt, this.state.soundscape, this.state.music,
-                       ...(this.castPiece === this.state ? [] : S.allTexts(this.castPiece))];
         this.state.assets = (this.state.assets ?? []).filter(
-          (asset) => !handles.includes(asset.handle) || S.handleWritten(texts, asset.handle));
+          (asset) => !handles.includes(asset.handle));
       },
-      touch: () => this.onCommit?.(),
+      touch: () => this.onCommit?.({ namesOnly: true }),
+      onNameChange: () => this.refreshReferences({ namesOnly: true }),
       commit: () => this.commit(),
     });
     // Mounted once. `replaceChildren` with the same node still detaches and
@@ -2063,12 +2247,15 @@ export class CreatorEditor {
   }
 
   /** Picked files, attached to this shot, for the cast shelf's plus tile. */
-  async attachOneAsset(subject = null) {
+  async attachOneAsset(subject = null, options = {}) {
+    const owner = this.state, piece = this.castPiece;
     const blocked = S.blockedReason(this.state, "reference");
     if (blocked) { this.flash(blocked); return null; }
     const spec = this.plateSpec();
     const chosen = await openPicker({
-      kinds: ["image", "video", "audio", "renders", "refmods"],
+      selectionPurpose: "segment-cast-files",
+      rememberSelection: false,
+      kinds: options.replacement ? ["image", "video", "renders"] : ["image", "video", "audio", "renders", "refmods"],
       aspect: this.pickerAspect(),
       kind: "image",
       referenceOptions: { allowedTakes: CAST_REFERENCE_TAKES },
@@ -2079,9 +2266,10 @@ export class CreatorEditor {
       // The scissors ride along: a picture attached while casting somebody is
       // the purest cutout case there is — the `takes` prose already promises
       // the background is dropped, and the chip makes the pixels agree.
-      plate: spec ? { ...spec, panels: [] } : null,
+      plate: !options.replacement && spec ? { ...spec, panels: [] } : null,
     });
-    if (!chosen?.length) return null;
+    if (!chosen?.length || this.destroyed || this.state !== owner || this.castPiece !== piece
+        || options.isCurrent?.() === false) return null;
     const before = new Set(this.state.assets.map((a) => a.handle));
     await this.attachAssets(chosen);
     const added = this.state.assets.filter((a) => !before.has(a.handle));
@@ -2194,6 +2382,8 @@ export class CreatorEditor {
         // settled first.
         ...(this.refineTarget ? [refineButton({
           run: (options) => this.refine(options),
+          activity: refineActivity(this.state, this.structuredPrompt ? "segment" : "prompt"),
+          label: this.structuredPrompt ? t("Refine segment {n}", { n: this.refineTarget().index + 1 }) : "Refine",
           // Off the same blob the press sends, so the templates the popover
           // offers cannot disagree with the refiner that will write the prose.
           family: () => S.pieceFamily(this.refineTarget().data),
@@ -2206,6 +2396,15 @@ export class CreatorEditor {
         // With the machine's cluster rather than the piece's: a preset outlives
         // this generation the way the gallery and the settings do, and applying
         // one is reaching for something already made rather than making it.
+        ...(this.structuredPrompt && this.compiledPrompt ? [el("button", {
+          class: "mmc-tool mmc-tool-compiled",
+          title: t("Inspect the final prompt exactly as it will be sent to the model."),
+          onclick: () => {
+            if (this.compiledView) return;
+            this.compiledView = openCompiledPrompt(() => this.compiledPrompt(), () => { this.compiledView = null; });
+          },
+        }, [el("span", { class: "mmc-tool-icon" }, [icon("speech")]),
+            el("span", { text: t("What the model reads") })])] : []),
         ...(this.presetTarget ? [el("button", {
           class: "mmc-tool",
           title: t("Save this setup so you can put it back, or apply one you saved before"),
@@ -2249,7 +2448,9 @@ export class CreatorEditor {
    *  one", and landing at the top of a folder of hundreds did not say so. */
   async manageLoras(entry = null) {
     await openLoras({ state: this.state, family: S.pieceFamily(this.piece),
-                      scope: "piece", reveal: entry?.name ?? null,
+                      targets: S.effectiveCheckpoints(this.state, this.piece),
+                      scope: "piece", unified: true, reveal: entry?.name ?? null,
+                      contextLabel: this.structuredPrompt ? t("Segment LoRAs · this card") : "",
                       onChange: () => this.commit() });
     this.commit();
   }
@@ -2258,6 +2459,7 @@ export class CreatorEditor {
    *  picker and the pick lands where this entry stood. See `state.replaceLora`. */
   async swapLora(entry) {
     await openLoras({ state: this.state, family: S.pieceFamily(this.piece),
+                      targets: S.effectiveCheckpoints(this.state, this.piece),
                       scope: "piece", swapping: entry.name,
                       onChange: () => this.commit() });
     this.commit();
@@ -2271,11 +2473,11 @@ export class CreatorEditor {
   }
 
   renderLoras() {
-    return loraBlock(this.state, {
+    const own = loraBlock(this.state, {
       family: S.pieceFamily(this.piece),
       pinTo: this.pinFamily(),
       onPinChange: () => this.commit(),
-      targets: S.checkpointsFor(this.state, S.pieceFamily(this.piece)),
+      targets: S.effectiveCheckpoints(this.state, this.piece),
       // Only where this rail *is* the piece's — a node body's own stack. A
       // strip's card draws the segment's, and the switch's LoRA is never in it.
       turbo: this.state === this.piece ? (this.piece.turbo?.lora || null) : null,
@@ -2284,6 +2486,26 @@ export class CreatorEditor {
       onSwap: (entry) => this.swapLora(entry),
       onRemove: (entry) => { S.removeLora(this.state, entry.name); this.commit(); },
     });
+    if (!this.structuredPrompt || this.piece === this.state) return own;
+    const inherited = this.piece.loras ?? [];
+    if (!inherited.length && !this.state.loras?.length) return own;
+    return el("section", { class: "mmc-segment-loras" }, [
+      el("div", { class: "mmc-segment-lora-scope",
+        title: t("Same filename: segment settings override the global entry. Merged cards share one LoRA stack for the entire pass.") }, [
+        el("button", { class: "mmc-pill mmc-segment-lora-global",
+          title: t("Manage the LoRAs patched onto every segment of this timeline"), onclick: async () => {
+          await openLoras({ ...globalLoraOptions(this.piece),
+            onChange: () => this.commit() }); this.render();
+        } }, [el("span", { text: t("Global LoRAs") }),
+          el("span", { class: "mmc-pill-sub", text: t("{count} files", { count: inherited.length }) })]),
+        el("span", { class: "mmc-segment-lora-divider", "aria-hidden": "true" }),
+        el("button", { class: "mmc-pill mmc-segment-lora-local",
+          title: t("Segment LoRAs · this card"), onclick: () => this.manageLoras() }, [
+          el("span", { text: t("Segment LoRAs") }),
+          el("span", { class: "mmc-pill-sub", text: t("{count} files", { count: this.state.loras?.length ?? 0 }) }),
+        ]),
+      ]), own,
+    ]);
   }
 
   /** For each cast file awake in this shot on its words: the words, and the
@@ -2314,6 +2536,7 @@ export class CreatorEditor {
    *  every render, without the caret ever leaving the box (#92). */
   renderAssetsRow() {
     const state = this.state;
+    this.referenceNameReadouts = [];
     // The screens under the attachments, and drawn whatever the family: a
     // screen carried onto one that cannot render it is refused by the
     // compiler, and the chip is where it is taken off.
@@ -2322,6 +2545,23 @@ export class CreatorEditor {
     this.assetsHost.replaceChildren(
       ...(state.assets.length || S.citedPool(state).length ? [this.renderAssets()] : []),
       ...(screens ? [screens] : []));
+    if (this.assetsSection) {
+      const assets = [...state.assets, ...S.citedPool(state)];
+      this.assetsSection.setHint(t("{count} references", { count: assets.length }));
+      this.assetsClear ??= clearButton({ written: true, compact: true,
+        what: t("Clear files attached to this segment only. Shared piece references and written prompt tags stay unchanged."),
+        getOwner: () => this.state,
+        getValue: () => [this.refineEpoch, this.state.assets],
+        run: () => {
+          closeOwnedPopovers(this.assetsHost);
+          for (const asset of [...this.state.assets]) this.remove(asset.handle, { silent: true });
+          this.commit();
+        },
+      });
+      this.assetsClear.disabled = !state.assets.length;
+      if (this.assetsClear.disabled) this.assetsClear.cancelClear?.();
+      if (!this.assetsClear.isConnected) this.assetsSection.setActions(this.assetsClear);
+    }
   }
 
   renderAssets() {
@@ -2352,6 +2592,29 @@ export class CreatorEditor {
     // Which members the sentence writes, for the two reasons a file can be
     // out: their owner is not in the shot at all, or is and left it behind.
     const named = new Set(S.citedCast(this.state).map((subject) => subject.handle));
+    const ownerAttributes = (asset, owner, pooled = false) => {
+      const mod = S.isRefMod(asset);
+      const note = S.subjectNotes(owner)[asset.handle] ?? "";
+      return {
+        class: `mmc-asset-owner mmc-tag-${S.tagIndex(owner.handle)}`,
+        text: mod ? t("{who}'s RefMod", { who: owner.handle }) : t("{who}'s", { who: owner.handle }),
+        title: (note ? `${note}\n` : "") + (pooled
+          ? t("@{who} is built out of this, and this shot writes their name. "
+              + "Click to open them.", { who: owner.handle })
+          : mod
+            ? t("@{who} is built out of this saved reference — encoded once, read off the "
+                + "file on every render. Click to open them.", { who: owner.handle })
+            : t("@{who} is built out of this picture. Click to open them.", { who: owner.handle })),
+      };
+    };
+    const paintOwner = (label, row, asset, owner, pooled = false) => {
+      if (!owner || !label) return;
+      const attrs = ownerAttributes(asset, owner, pooled);
+      label.className = attrs.class;
+      label.textContent = attrs.text;
+      label.title = attrs.title;
+      row.style.setProperty("--owner", `var(--mmc-tag-${S.tagIndex(owner.handle)})`);
+    };
     const chip = (asset) => {
       // A guide shows its own frame, where every other clip shows a glyph. That
       // is not a flourish: the only question anybody has about a guide is
@@ -2473,17 +2736,13 @@ export class CreatorEditor {
       // img-5, img-6" with the one fact that tells them apart a click away.
       const note = owner ? S.subjectNotes(owner)[asset.handle] ?? "" : "";
       const wake = owner ? S.subjectTriggers(owner)[asset.handle] ?? "" : "";
+      let ownerLabel = null;
       if (owner) {
-        parts.push(el("button", {
-          class: `mmc-asset-owner mmc-tag-${S.tagIndex(owner.handle)}`,
-          text: mod ? t("{who}'s RefMod", { who: owner.handle }) : t("{who}'s", { who: owner.handle }),
-          title: (note ? `${note}\n` : "")
-            + (mod
-              ? t("@{who} is built out of this saved reference — encoded once, read off the "
-                + "file on every render. Click to open them.", { who: owner.handle })
-              : t("@{who} is built out of this picture. Click to open them.", { who: owner.handle })),
+        ownerLabel = el("button", {
+          ...ownerAttributes(asset, owner),
           onclick: () => this.openCastMember(owner.handle),
-        }));
+        });
+        parts.push(ownerLabel);
         if (note) parts.push(el("span", { class: "mmc-asset-note", text: note }));
         if (wake) {
           parts.push(el("span", {
@@ -2502,8 +2761,16 @@ export class CreatorEditor {
           title: t("A saved reference — encoded once, read off the file on every render."),
         }));
       }
-      const said = referenceSummary(asset);
+      const said = referenceSummary(asset, { size: false });
       if (said) parts.push(el("span", { class: "mmc-asset-said", text: said }));
+      if (S.sizeable(asset)) parts.push(el("button", { class: "mmc-pill mmc-asset-ref-size",
+        text: S.refSize(asset), title: t("Reference image size"),
+        onclick: () => {
+          if (!(this.state.assets ?? []).includes(asset)) return;
+          asset.ref_size = S.refSize(asset) === "max" ? "match" : "max";
+          this.commit();
+        },
+      }));
 
       // The mute, on references only: a keyframe is where the shot opens or
       // closes rather than something the prompt reaches for, so there is
@@ -2518,23 +2785,24 @@ export class CreatorEditor {
       // What the press means where a name is built out of the file: this shot
       // loses it and nobody else does — see `releaseHere`. Said on the button
       // because the row marks a cast file and does not say what happens to it.
-      parts.push(el("button", {
+      const remove = el("button", {
         class: "mmc-asset-x", text: "✕",
-        title: owners.length
-          ? t("Remove @{handle} — {who} is built out of it and is built without it "
-            + "in this shot. Every other shot keeps it.",
-              { handle: asset.handle, who: owners.map((s) => `@${s.handle}`).join(", ") })
-          : t("Remove @{handle}", { handle: asset.handle }),
         onclick: () => this.remove(asset.handle),
-      }));
-      return el("div", {
+      });
+      parts.push(remove);
+      const row = el("div", {
         class: `mmc-asset mmc-tag-${S.tagIndex(asset.handle)}${
           cast.has(asset.handle) ? " mmc-asset-cast" : ""}${S.muted(asset) ? " off" : ""}${
           passed.has(asset.handle) ? " passed" : ""}${asleep.has(asset.handle) ? " asleep" : ""}`,
-        // The rule down the edge in the owner's hue, so it joins the chip to
-        // their name in the sentence rather than to its own handle.
-        ...(owner ? { style: { "--owner": `var(--mmc-tag-${S.tagIndex(owner.handle)})` } } : {}),
-        title: passed.has(asset.handle)
+      }, parts);
+      const paintNames = () => {
+        paintOwner(ownerLabel, row, asset, owner);
+        remove.title = owners.length
+          ? t("Remove @{handle} — {who} is built out of it and is built without it "
+            + "in this shot. Every other shot keeps it.",
+              { handle: asset.handle, who: owners.map((s) => `@${s.handle}`).join(", ") })
+          : t("Remove @{handle}", { handle: asset.handle });
+        row.title = passed.has(asset.handle)
           ? t("Not in this take: the sentence names it only in an alternative this seed passes over.")
           : asleep.has(asset.handle)
             ? owner && !named.has(owner.handle)
@@ -2542,8 +2810,11 @@ export class CreatorEditor {
                 + "write their name.", { who: owner.handle })
               : t("Not in this shot: it wakes on {words}, and the sentence says none of them.",
                   { words: wake })
-            : asset.filename,
-      }, parts);
+            : asset.filename;
+      };
+      paintNames();
+      (this.referenceNameReadouts ??= []).push(paintNames);
+      return row;
     };
 
     /**
@@ -2599,15 +2870,13 @@ export class CreatorEditor {
       const mod = S.isRefMod(asset);
       const note = owner ? S.subjectNotes(owner)[asset.handle] ?? "" : "";
       const wake = owner ? S.subjectTriggers(owner)[asset.handle] ?? "" : "";
+      let ownerLabel = null;
       if (owner) {
-        parts.push(el("button", {
-          class: `mmc-asset-owner mmc-tag-${S.tagIndex(owner.handle)}`,
-          text: mod ? t("{who}'s RefMod", { who: owner.handle }) : t("{who}'s", { who: owner.handle }),
-          title: (note ? `${note}\n` : "")
-            + t("@{who} is built out of this, and this shot writes their name. "
-              + "Click to open them.", { who: owner.handle }),
+        ownerLabel = el("button", {
+          ...ownerAttributes(asset, owner, true),
           onclick: () => this.openCastMember(owner.handle),
-        }));
+        });
+        parts.push(ownerLabel);
         if (note) parts.push(el("span", { class: "mmc-asset-note", text: note }));
         // Lit, always: `citedPool` drops a plate whose word the sentence does
         // not say, so one that reached this row is one that woke.
@@ -2619,11 +2888,19 @@ export class CreatorEditor {
       } else if (mod) {
         parts.push(el("span", { class: "mmc-asset-owner", text: t("RefMod") }));
       }
-      const said = referenceSummary(asset);
+      const said = referenceSummary(asset, { size: false });
       if (said) parts.push(el("span", { class: "mmc-asset-said", text: said }));
       // Why this chip has neither of the two buttons every other chip has. A
       // row where some entries can be removed and some cannot, with nothing
       // saying which is which, is a row that reads as half broken.
+      if (S.sizeable(asset)) parts.push(el("button", { class: "mmc-pill mmc-asset-ref-size",
+        text: S.refSize(asset), title: t("Shared reference size. Changing this updates every segment that uses this file."),
+        onclick: () => {
+          if (!(this.state.pool ?? []).includes(asset)) return;
+          asset.ref_size = S.refSize(asset) === "max" ? "match" : "max";
+          this.commit();
+        },
+      }));
       parts.push(el("span", {
         class: "mmc-asset-pooled",
         text: t("on the piece"),
@@ -2631,26 +2908,28 @@ export class CreatorEditor {
                + "its prompt. Change it or take it off in the Timeline's own reference "
                + "shelf, where it answers for every shot at once."),
       }));
-      return el("div", {
+      const row = el("div", {
         class: `mmc-asset mmc-asset-pooled-chip mmc-tag-${S.tagIndex(asset.handle)}${
           owner ? " mmc-asset-cast" : ""}${S.muted(asset) ? " off" : ""}${
           passed.has(asset.handle) ? " passed" : ""}`,
-        ...(owner ? { style: { "--owner": `var(--mmc-tag-${S.tagIndex(owner.handle)})` } } : {}),
         title: passed.has(asset.handle)
           ? t("Not in this take: the sentence names it only in an alternative this seed passes over.")
           : asset.filename,
       }, parts);
+      if (owner) {
+        const paintNames = () => paintOwner(ownerLabel, row, asset, owner, true);
+        paintNames();
+        (this.referenceNameReadouts ??= []).push(paintNames);
+      }
+      return row;
     };
 
     // Bounded on the face (see the stylesheet), so it needs the wheel the way
     // the prompt box does — otherwise the row that scrolls zooms the canvas.
-    // The card's own files lead: they are the ones this shot can act on, and a
-    // row that opened with three chips nothing here can change would read as a
-    // row of dead controls.
-    return keepScroll(el("div", { class: "mmc-assets" }, [
-      ...this.state.assets.map(chip),
-      ...S.citedPool(this.state).map(pooledChip),
-    ]));
+    // Sort the readout, not the source arrays: their order numbers model inputs.
+    const shown = S.sortByHandle([...this.state.assets, ...S.citedPool(this.state)]);
+    return keepScroll(el("div", { class: "mmc-assets" }, shown.map((asset) =>
+      this.state.assets.includes(asset) ? chip(asset) : pooledChip(asset))));
   }
 
   /**
@@ -2782,21 +3061,22 @@ export class CreatorEditor {
    * card carries several, the one offered is the one its length leads — see
    * `S.lengthMatch`. Empty for a card of stills, which is most of them.
    */
-  matchTail() {
+  matchTail(offer) {
     // Nothing to offer while the model is choosing the length: "matches
     // @vid-1" would be a claim about a frame count that does not exist yet,
     // and the offer to set one is an offer to do what auto is already doing.
     // Turning auto off brings both back.
     if (this.state.auto_duration) return [];
-    const match = S.lengthMatch(this.state, (filename) => this.lengthOf(filename),
-                                this.piece);
+    const match = offer === undefined
+      ? S.lengthMatch(this.state, (filename) => this.lengthOf(filename), this.piece)
+      : offer;
     if (!match) return [];
     const handle = match.asset.handle;
     const length = match.seconds.toFixed(2);
     if (match.matched) {
       return [el("span", {
         class: "mmc-dur-match on",
-        text: t("matches @{handle}", { handle }),
+        text: t("Length matched"),
         title: t("@{handle} runs {length} s and this card lands on the same frame count.",
                  { handle, length }),
       })];
@@ -2813,9 +3093,30 @@ export class CreatorEditor {
         this.commit();
       },
     }, [
-      el("span", { text: t("match @{handle}", { handle }) }),
-      el("span", { class: "mmc-pill-sub", text: t("{seconds} s", { seconds: length }) }),
+      el("span", { text: t("Match length") }),
     ])];
+  }
+
+  /** Read-only facts beside the duration control, using the same offer as its
+   *  action. The reference can be a trimmed range, so this never calls it the
+   *  whole source file. No extra media probes or duration calculations. */
+  matchReadout(match) {
+    if (!match) return null;
+    return el("div", {
+      class: "mmc-duration-match-info", role: "group",
+      "aria-label": t("Reference and match target lengths"),
+    }, [
+      el("span", {
+        class: "mmc-duration-match-reference",
+        text: t("Reference @{handle}: {seconds} s", {
+          handle: match.asset.handle, seconds: match.seconds.toFixed(2),
+        }),
+      }),
+      el("span", {
+        class: "mmc-duration-match-target",
+        text: t("Match target: {seconds} s", { seconds: match.duration.toFixed(2) }),
+      }),
+    ]);
   }
 
   renderPills(geometry, currentMode) {
@@ -2861,6 +3162,8 @@ export class CreatorEditor {
     // capability, not an id: H3 has no such weights, and a later family might.
     const predicts = S.canDo(this.piece, "duration");
     const auto = predicts && state.auto_duration === true;
+    const lengthMatch = state.auto_duration ? null
+      : S.lengthMatch(state, (filename) => this.lengthOf(filename), this.piece);
     const setAuto = (on) => { state.auto_duration = on; this.commit(); };
     const duration = el("div", {
       class: `mmc-pill mmc-pill-group${trained || auto ? "" : " off-distribution"}`,
@@ -2925,8 +3228,12 @@ export class CreatorEditor {
                 max: Math.round(S.familyOf(this.piece).capabilities.duration.max_seconds) }),
         onclick: () => setAuto(!auto),
       })] : []),
-      ...this.matchTail(),
+      ...this.matchTail(lengthMatch),
     ]);
+    const matchReadout = this.matchReadout(lengthMatch);
+    const durationControl = matchReadout
+      ? el("div", { class: "mmc-duration-control" }, [duration, matchReadout])
+      : duration;
 
     // Live even when a picture decides the ratio: the list is where the source
     // itself is chosen now — any attached picture, or the preset over them.
@@ -2978,7 +3285,14 @@ export class CreatorEditor {
                framePill("last_frame", "End frame", "frameOut")], { className: "mmc-frames" }),
       // A body that is not making a video says how long it runs in its own
       // terms, or not at all — see `extraPills`.
-      ...(this.durationPill ? [duration] : []),
+      ...(this.durationPill ? [durationControl] : []),
+      // A lone shot has no Timeline card. Its control belongs to this shot's
+      // settings, never the piece-wide sampler/accelerator row.
+      ...(this.nodeId && !S.isClip(state) && S.canDo(this.piece, "face")
+        ? [facesPill({ target: state, piece: this.piece,
+            valid: () => !this.destroyed && (this.piece === state
+              || this.piece.segments?.includes(state)),
+            commit: () => this.commit() })] : []),
       ...(this.extraPills?.() ?? []),
       // In a timeline the canvas belongs to the timeline, not to one shot: the
       // segments are concatenated at the end and have to come out the same size.
@@ -3175,7 +3489,7 @@ export class CreatorEditor {
     const label = S.checkpointLabels(family);
     const route = this.routeOf?.() ?? "auto";
     const forced = route !== "auto";
-    const routed = forced ? route : S.checkpoint(state, family);
+    const routed = forced ? route : S.effectiveCheckpoints(state, this.piece)[0];
     const pinned = !forced && S.checkpointPinned(state, family);
     const canCycle = !!this.setRoute;
 
@@ -3201,13 +3515,9 @@ export class CreatorEditor {
    *  piece's pool. compile.py rejects these, so say so here rather than at
    *  queue time. */
   renderDangling() {
-    const known = new Set([
-      ...this.state.assets.map((a) => a.handle),
-      ...(this.state.pool ?? []).map((a) => a.handle),
-      ...(this.state.screens ?? []).map((s) => s.handle),
-    ]);
-    const missing = [...new Set(Array.from(this.state.prompt.matchAll(HANDLE_RE), (m) => m[1]))]
-      .filter((handle) => !known.has(handle));
+    const missing = S.missingPromptHandles(this.citingTexts(),
+      [...this.state.assets, ...(this.state.pool ?? [])],
+      this.castPiece.subjects ?? this.state.cast ?? [], this.state.screens ?? []);
     // The other way round for a screen: set up on the card and never said
     // where it is, which compile refuses (`spec.uncited`).
     const uncited = uncitedScreens(this.state);
@@ -3215,9 +3525,9 @@ export class CreatorEditor {
     return [
       ...(missing.length ? [el("div", {
         class: "mmc-warn",
-        text: missing.length > 1
-          ? t("{handles} are in the prompt but not attached.", { handles: missing.map((h) => "@" + h).join(", ") })
-          : t("{handles} is in the prompt but not attached.", { handles: missing.map((h) => "@" + h).join(", ") }),
+        role: "status", "aria-live": "polite",
+        text: t("Unconnected tags: {handles}. Your text is kept. Attach a reference or cast member with the same handle to reconnect automatically.",
+                { handles: missing.map((h) => "@" + h).join(", ") }),
       })] : []),
       ...(uncited ? [el("div", { class: "mmc-warn", text: uncited })] : []),
     ];

@@ -15,6 +15,7 @@ lists this module produces in exactly that order; the two must be read together.
 """
 
 import re
+import json
 from dataclasses import dataclass, field, replace
 
 from . import canvas
@@ -293,6 +294,9 @@ class Asset:
     # has. Empty on a picture nobody saved, and on a mod asset, which *is* one
     # rendition. See `creator/refmod.py` and `families/h3/encode`.
     mods: dict = field(default_factory=dict)
+    replacement_origin: dict = field(default_factory=dict)
+    description: str = ""
+    usage_rules: str = ""
     # The storyboard's alone (issue #96): the marker its retention line
     # carries, and the line the piece wrote about what carries over, or empty
     # for the defaults. On the sheet's asset because the prompt is written from
@@ -523,6 +527,7 @@ class Compiled:
     # each screen's own handle; this is what the screen pass reads after
     # decode — which file each screen shows, and how.
     screens: tuple = ()
+    warnings: list[str] = field(default_factory=list)   # advisory only, never prompt text
 
     def encodes_video(self):
         """Whether building this segment's conditioning calls `vae.encode`.
@@ -831,6 +836,10 @@ def _parse_assets(raw):
             takes=takes,
             cut=bool(item.get("cut")),
             panels=_parse_panels(handle, role, kind, item.get("panels"), seen),
+            replacement_origin=(dict(item["replacement_origin"])
+                                if isinstance(item.get("replacement_origin"), dict) else {}),
+            description=str(item.get("description") or "").strip(),
+            usage_rules=str(item.get("usage_rules") or "").strip(),
             # The bench's tracing id, on a guide and nowhere else. Not validated
             # against a list: the catalogue of tracings is `control.py`'s and
             # grows, and a guide naming one this build has never heard of is
@@ -886,6 +895,8 @@ def _parse_panels(owner, role, kind, raw, seen):
         panels.append(Asset(handle=handle, kind="image", role="reference",
                             filename=filename, takes=takes,
                             cut=bool(item.get("cut")), rect=rect,
+                            description=str(item.get("description") or "").strip(),
+                            usage_rules=str(item.get("usage_rules") or "").strip(),
                             # Recorded, like `cut` and `rect`: the plate file
                             # already looks this way. Validated so a blob
                             # cannot carry a framing nothing could apply.
@@ -1201,6 +1212,8 @@ def refined_body(data):
     refined = data.get("refined")
     if not isinstance(refined, dict) or refined.get("enabled") is False:
         return None
+    if isinstance(refined.get("fields"), list) and "prompt" not in refined["fields"]:
+        return None
     body = str(refined.get("body") or "").strip()
     return body or None
 
@@ -1221,7 +1234,7 @@ def refined_scope(data):
     refined = data.get("refined")
     if not isinstance(refined, dict) or refined.get("enabled") is False:
         return None
-    if not str(refined.get("body") or "").strip():
+    if not refined_body(data):
         return None
     return "shot" if refined.get("scope") == "shot" else None
 
@@ -1243,9 +1256,375 @@ def refined_sections(data, family_grammar=None):
     sections = refined.get("sections")
     if not isinstance(sections, dict):
         return None
+    fields = refined.get("fields")
     kept = {name: str(sections.get(name) or "").strip()
-            for name in family_grammar.written_sections}
+            for name in family_grammar.written_sections
+            if not isinstance(fields, list) or name not in {"summary", "retention_analysis"} or name in fields}
     return kept if any(kept.values()) else None
+
+
+def apply_field_refinement(segment):
+    """Replace only the refined card's manual fields on a disposable copy.
+
+    This happens before standing inputs are inherited. Shared Cast rules and
+    global prose remain live, and original source fields remain untouched.
+    Legacy rewrites without an explicit field list retain their old behavior.
+    """
+    refined = segment.get("refined")
+    if not isinstance(refined, dict) or refined.get("enabled") is False:
+        return segment
+    fields = refined.get("fields")
+    if not isinstance(fields, list):
+        return segment
+    selected = {name for name in fields if isinstance(name, str)} & {"summary", "retention_analysis"}
+    out = dict(segment)
+    draft = dict(refined)
+    draft.pop("fields", None)
+    if "prompt" not in fields:
+        draft.pop("body", None)
+    sections = {key: value for key, value in draft.get("sections", {}).items()
+                if key not in {"summary", "retention_analysis"} or key in fields} \
+        if isinstance(draft.get("sections"), dict) else {}
+    owned = dict(out["prompt_sections"]) if isinstance(out.get("prompt_sections"), dict) else {}
+    body, legacy = contextir.split_sections(str(out.get("prompt") or ""))
+    for name in selected:
+        if name not in sections:
+            continue
+        value = str(sections.pop(name) or "")
+        owned[name] = value
+        legacy.pop(name, None)
+        if name == "retention_analysis" and isinstance(out.get("retention_blocks"), list):
+            blocks, inserted = [], False
+            for block in out["retention_blocks"]:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    if not inserted:
+                        blocks.append({"type": "text", "text": value}); inserted = True
+                else:
+                    blocks.append(dict(block))
+            if not inserted:
+                blocks.insert(0, {"type": "text", "text": value})
+            out["retention_blocks"] = blocks
+    out["prompt"] = contextir.join_paragraphs(body, *(
+        f"{name}:\n{value}" for name, value in legacy.items()))
+    out["prompt_sections"] = owned
+    draft["sections"] = sections
+    out["refined"] = draft
+    return out
+
+
+def inherited_prompt_inputs(piece, segment):
+    """Piece-owned manual inputs stay live when inherited by a card.
+
+    Source text contributes separate paragraphs; a card's subject-node placement
+    wins over the standing layout. An explicit card override list is scoped to
+    that card (including an empty list), not an alteration of the cast or piece.
+    Internal source markers are only for collapsing standing text once in a
+    merged pass; they never become saved user state.
+    """
+    if not any(key in piece for key in ("prompt_sections", "retention_blocks", "retention_overrides")):
+        return segment
+    request = dict(segment)
+    standing = piece.get("prompt_sections")
+    own = segment.get("prompt_sections")
+    standing = standing if isinstance(standing, dict) else {}
+    own = own if isinstance(own, dict) else {}
+    if standing:
+        request["prompt_sections"] = {**own, **{
+            name: contextir.join_paragraphs(standing.get(name), own.get(name))
+            for name in ("summary", "retention_analysis")
+            if name in standing or name in own}}
+    global_blocks, local_blocks = piece.get("retention_blocks"), segment.get("retention_blocks")
+    if (isinstance(global_blocks, list) or isinstance(local_blocks, list)
+            or standing.get("retention_analysis")):
+        global_blocks = (global_blocks if isinstance(global_blocks, list) else
+                         [{"type": "text", "text": standing["retention_analysis"]}]
+                         if standing.get("retention_analysis") else [])
+        local_blocks = (local_blocks if isinstance(local_blocks, list) else
+                        [{"type": "text", "text": own["retention_analysis"]}]
+                        if own.get("retention_analysis") else [])
+        placed = {block.get("handle") for block in local_blocks
+                  if isinstance(block, dict) and block.get("type") == "subject"}
+        request["retention_blocks"] = [
+            {**block, "_source_scope": "piece", "_source_index": index}
+            for index, block in enumerate(global_blocks) if isinstance(block, dict)
+            and not (block.get("type") == "subject" and block.get("handle") in placed)
+        ] + [dict(block) for block in local_blocks if isinstance(block, dict)]
+    if "retention_overrides" not in segment and isinstance(piece.get("retention_overrides"), list):
+        request["retention_overrides"] = list(piece["retention_overrides"])
+    return request
+
+
+def prompt_parts(data, family_grammar):
+    """User-owned section inputs, separate from the refiner's replaceable prose."""
+    body, sections = contextir.split_sections(str(data.get("prompt") or ""))
+    rewritten = refined_body(data)
+    if rewritten:
+        body, refined = contextir.split_sections(rewritten)
+        for name, value in refined.items():
+            if value != sections.get(name):
+                sections[name] = contextir.join_paragraphs(sections.get(name), value)
+    if "retention_analysis" not in family_grammar.written_sections:
+        body = contextir.join_paragraphs(body, sections.pop("subject_definitions", ""))
+    owned = data.get("prompt_sections")
+    if isinstance(owned, dict):
+        for name in ("summary", "retention_analysis"):
+            if name == "retention_analysis" and isinstance(data.get("retention_blocks"), list):
+                continue
+            sections[name] = contextir.join_paragraphs(sections.get(name), owned.get(name))
+    return body, {name: text for name, text in sections.items() if text}
+
+
+def retention_blocks(data, cast):
+    """The user block order, with absent inherited rules appended once.
+
+    An override suppresses only this subject's user-owned usage_rules, never
+    the compiler's identity or source-video preservation rules.
+    """
+    by_handle = {subject.handle: subject for subject in cast if subject.usage_rules}
+    overrides = set(data.get("retention_overrides") or ())
+    raw = data.get("retention_blocks")
+    blocks = []
+    seen = set()
+    if isinstance(raw, list):
+        for block in raw:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and str(block.get("text") or "").strip():
+                blocks.append(dict(block))
+            elif block.get("type") == "subject" and block.get("handle") in by_handle:
+                key = (block["handle"], tuple(block.get("shots") or ()))
+                if key in seen:
+                    continue
+                seen.add(key)
+                blocks.append({**block, "override": bool(block.get("override")
+                                                         or block["handle"] in overrides)})
+    for handle in by_handle:
+        if not any(key[0] == handle for key in seen):
+            blocks.append({"type": "subject", "handle": handle,
+                           "override": handle in overrides})
+    return blocks
+
+
+def _rule_scope(data, shots, text="", cast=()):
+    """Use a local source, not a cast identity picture, to delimit local rules."""
+    own = set(shots or ())
+    if not own:
+        return ""
+    local = [handle for handle, scope in
+             (data.get("reference_scopes") or {}).items() if set(scope) == own]
+    assets = {asset.get("handle"): asset for asset in data.get("assets") or ()
+              if isinstance(asset, dict)}
+    identity = {handle for subject in cast for handle in subject.sources}
+    references = ["@" + handle for handle in local
+                  if handle not in identity and assets.get(handle, {}).get("kind") == "video"
+                  and assets[handle].get("track", "picture") in ("picture", "picture+sound")
+                  and not assets[handle].get("replacement_origin")]
+    if not references:
+        cited = set(HANDLE_RE.findall(text or ""))
+        references = ["@" + handle for handle in local if handle in cited
+                      and handle not in identity and not assets.get(handle, {}).get("replacement_origin")]
+    if not references:
+        references = ["@" + handle for handle, scope in
+                      (data.get("subject_scopes") or {}).items() if set(scope) == own]
+    return ", ".join(references)
+
+
+def _scope_windows(data, scope):
+    windows = data.get("target_windows")
+    if not isinstance(windows, dict):
+        return []
+    ranges = [windows.get(str(n), windows.get(n)) for n in sorted(set(scope or ()))]
+    return ranges if ranges and all(isinstance(pair, (list, tuple)) and len(pair) == 2
+                                   for pair in ranges) else []
+
+
+def _target_scopes(data):
+    return {handle: ranges for scopes in (data.get("reference_scopes"), data.get("subject_scopes"))
+            for handle, scope in (scopes or {}).items()
+            if (ranges := _scope_windows(data, scope))}
+
+
+def _reference_annotations(data, assets):
+    """Prose for references this pass already sends; it never activates files."""
+    present = {part.handle: part for asset in assets if asset.role == "reference"
+               for part in (asset, *asset.panels)}
+    rows = [{"handle": asset.handle, "description": asset.description,
+             "usage_rules": asset.usage_rules}
+            for asset in present.values() if asset.description or asset.usage_rules]
+    rows += [dict(row) for row in data.get("reference_annotations") or ()
+             if isinstance(row, dict) and row.get("handle") in present]
+    result = []
+    for row in rows:
+        description, rules = (str(row.get(key) or "").strip()
+                              for key in ("description", "usage_rules"))
+        if not description and not rules:
+            continue
+        ranges = row.get("intervals") or _scope_windows(data, row.get("shots"))
+        if row.get("shots") and not ranges:
+            raise CompileError("reference instructions need their target-video time range "
+                               "to keep local rules inside the intended segment")
+        old = next((entry for entry in result if entry["handle"] == row["handle"]
+                    and entry["description"] == description and entry["usage_rules"] == rules), None)
+        if old is not None:
+            old["intervals"] = old["intervals"] + ranges if old["intervals"] and ranges else []
+        else:
+            result.append({"handle": row["handle"], "description": description,
+                           "usage_rules": rules, "intervals": ranges})
+    return result
+
+
+def _reference_rule_owners(active, cast, annotations, assets, target_scopes):
+    """Appearance rules on a source also govern its claimed subject."""
+    for row in annotations:
+        if not row["usage_rules"]:
+            continue
+        owner = next((asset for asset in assets if asset.handle == row["handle"] or
+                      any(panel.handle == row["handle"] for panel in asset.panels)), None)
+        handles = {row["handle"]}
+        if owner:
+            handles.add(owner.handle)
+            if owner.handle == row["handle"]:
+                handles.update(panel.handle for panel in owner.panels)
+        for subject in cast:
+            if not handles.intersection(subject.sources):
+                continue
+            intervals = row["intervals"]
+            own = target_scopes.get(subject.handle)
+            if intervals and own:
+                intervals = [(max(first, low), min(last, high))
+                    for first, last in intervals for low, high in own
+                    if max(first, low) < min(last, high)]
+                if not intervals:
+                    continue
+            if not intervals:
+                active[subject.handle] = True
+            elif active.get(subject.handle) is not True:
+                active.setdefault(subject.handle, []).extend(intervals)
+    return active
+
+
+def _reference_subjects(annotations, declared, active):
+    if not declared:
+        return
+    names = sorted((subject.handle for subject in declared), key=len, reverse=True)
+    pattern = re.compile(r"(?<![\w@])@(" + "|".join(re.escape(name) for name in names) + r")(?![\w-])")
+    handles = {subject.handle for subject in active}
+    for row in annotations:
+        for key in ("description", "usage_rules"):
+            dormant = sorted(set(pattern.findall(str(row.get(key) or ""))) - handles)
+            if dormant:
+                raise CompileError(f"@{row['handle']} {key} mentions " +
+                    ", ".join("@" + handle for handle in dormant) +
+                    " but that subject is not cited in this segment. Cite the subject "
+                    "in a segment field to send its definition and references.")
+
+
+def _explicit_rules(data, cast):
+    active = {}
+    by_handle = {subject.handle: subject for subject in cast}
+    blocks = retention_blocks(data, cast)
+    if not isinstance(data.get("retention_blocks"), list):
+        _, sections = contextir.split_sections(str(data.get("prompt") or ""))
+        owned = data.get("prompt_sections")
+        text = contextir.join_paragraphs(sections.get("retention_analysis"),
+            owned.get("retention_analysis") if isinstance(owned, dict) else "")
+        if text:
+            blocks.append({"type": "text", "text": text})
+    for block in blocks:
+        if block["type"] != "subject" or block.get("override"):
+            continue
+        handle = block["handle"]
+        if not str(block.get("rules") or by_handle[handle].usage_rules).strip():
+            continue
+        ranges = _scope_windows(data, block.get("shots"))
+        if not ranges:
+            active[handle] = True
+        elif active.get(handle) is not True:
+            active.setdefault(handle, []).extend(ranges)
+    for block in blocks:
+        if block["type"] != "text":
+            continue
+        pattern = subjects.citation_re(cast)
+        owners = set(pattern.findall(str(block.get("text") or ""))) if pattern else set()
+        scope = set(block.get("shots") or ())
+        if scope:
+            owners.update(other["handle"] for other in blocks
+                          if other["type"] == "subject" and other.get("override")
+                          and set(other.get("shots") or ()) == scope)
+        else:
+            owners.update(set(data.get("retention_overrides") or ()) & by_handle.keys())
+        ranges = _scope_windows(data, scope)
+        for handle in owners:
+            if not ranges:
+                active[handle] = True
+            elif active.get(handle) is not True:
+                active.setdefault(handle, []).extend(ranges)
+    return active
+
+
+def _retention_text(data, cast, body, structured=True, shots=1):
+    pieces = []
+    by_handle = {subject.handle: subject for subject in cast}
+    blocks, repeated = [], {}
+    for source in retention_blocks(data, cast):
+        block = dict(source)
+        if block.get("override"):
+            continue
+        text = (str(block.get("rules") or by_handle[block["handle"]].usage_rules)
+                if block["type"] == "subject" else str(block.get("text") or "").strip())
+        key = (block["type"], block.get("handle"), text)
+        previous = repeated.get(key)
+        if previous is not None:
+            previous["shots"] = (sorted(set(previous["shots"]) | set(block["shots"]))
+                                 if previous.get("shots") and block.get("shots") else [])
+        else:
+            repeated[key] = block
+            blocks.append(block)
+    for block in blocks:
+        if block["type"] == "subject":
+            if block.get("override"):
+                continue
+            handle = block["handle"]
+            scope = set(block.get("shots") or ())
+            all_own = set((data.get("subject_scopes") or {}).get(handle) or ())
+            rules = str(block.get("rules") or by_handle[handle].usage_rules)
+            reference = _rule_scope(data, scope, rules, cast) if scope and scope != all_own else ""
+            timed = contextir.target_scope(_scope_windows(data, scope)) if scope and scope != all_own else ""
+            if structured and scope and all_own and scope != all_own and not reference and not timed:
+                raise CompileError("local reference usage rules differ across segments sharing "
+                                   "the same references — render those segments separately "
+                                   "so their rules are not applied to the whole merged video")
+            head = (f"For {reference}:\n" if reference else f"{timed}:\n" if timed else "") + (
+                f"@{handle}:\n" if structured else f"For @{handle}:\n")
+            pieces.append(head + rules)
+        else:
+            text = str(block.get("text") or "").strip()
+            if structured and block.get("shots"):
+                all_shots = set(range(1, max(1, int(shots)) + 1))
+                all_shots.update(n for own in (data.get("reference_scopes") or {}).values() for n in own)
+                all_shots.update(n for own in (data.get("subject_scopes") or {}).values() for n in own)
+                scope = set(block["shots"])
+                reference = _rule_scope(data, scope, text, cast) if scope != all_shots else ""
+                timed = contextir.target_scope(_scope_windows(data, scope)) if scope != all_shots else ""
+                if all_shots and scope != all_shots and not reference and not timed:
+                    raise CompileError("local retention instructions cannot be distinguished "
+                                       "across segments sharing the same references — render "
+                                       "those segments separately instead of widening the rules")
+                if reference:
+                    text = f"For {reference}:\n{text}"
+                elif timed:
+                    text = f"{timed}:\n{text}"
+            pieces.append(text)
+    return contextir.join_paragraphs(*pieces)
+
+
+def _usage_texts(data, cast):
+    by_handle = {subject.handle: subject for subject in cast}
+    return [str(block.get("rules") or by_handle[block["handle"]].usage_rules)
+            for block in retention_blocks(data, cast)
+            if block["type"] == "subject" and not block.get("override")]
 
 
 def audio_tail_seconds(raw):
@@ -1318,7 +1697,7 @@ def face_piece(data):
     module cannot read.
     """
     raw = data.get("face")
-    if not isinstance(raw, dict) or not raw.get("on"):
+    if not isinstance(raw, dict) or raw.get("on") is not True:
         return None
     try:
         edge = int(raw.get("canvas", DEFAULT_FACE_CANVAS))
@@ -1341,28 +1720,19 @@ def face_piece(data):
 
 def face_for(data, segment):
     """The face settings one shot actually runs, or None.
-
-    Three states on the card and only three: `on`, `off`, or nothing said, which
-    inherits. A shot cannot turn the pass *on* with settings of its own — it
-    turns on the piece's — so the two knobs stay single-valued across a render
-    and a card is only ever answering "does this shot need it".
+    A generated card owns the complete block. There is no global inheritance.
+    Legacy workflows are reset OFF by `as_piece`, not by the runtime reader.
     """
-    override = str(segment.get("face") or "").strip().lower() if isinstance(segment, dict) else ""
-    if override and override not in FACE_OVERRIDES:
-        raise CompileError(
-            f"a shot's face switch is {', '.join(FACE_OVERRIDES)} or nothing at "
-            f"all (got {override!r})")
-    if override == "off":
+    if not isinstance(segment, dict) or segment.get("kind") == "clip":
         return None
-    settings = face_piece(data)
-    if override == "on" and settings is None:
-        # The piece is not running one, so there is nothing for the card to opt
-        # into. Said rather than ignored: a card showing "on" while the render
-        # does nothing is worse than a refusal that names the switch.
-        raise CompileError(
-            "a shot asks for the face pass but the piece has it switched off — "
-            "turn it on for the piece, or clear the shot's switch")
-    return settings
+    if piece_family(data) != h3.ID:
+        return None
+    if not _face_current(data):
+        return None
+    raw = segment.get("face")
+    if raw is not None and not isinstance(raw, dict):
+        raise CompileError("a shot's face settings must be an object")
+    return face_piece(segment)
 
 
 def face_label(settings):
@@ -1408,7 +1778,7 @@ def plain_prompt(body, soundscape, music):
     parts = [str(body or "").strip(),
              str(soundscape or "").strip(),
              str(music or "").strip()]
-    return " ".join(part for part in parts if part).strip()
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 def plain_shot_body(shots):
@@ -1455,7 +1825,7 @@ def plain_shot_body(shots):
         if out and out[-1][-1] not in ".!?…\"'”’":
             out[-1] += "."
         out.append(text)
-    return " ".join(out)
+    return "\n\n".join(out)
 
 
 def _check_feather(width, live, what, rules):
@@ -1530,6 +1900,8 @@ def compile_request(data, image_size_lookup=None, continues=False, canvas_spec=N
     if not isinstance(data, dict):
         raise CompileError("creator_data must be a JSON object")
 
+    data = apply_field_refinement(data)
+
     rules = registry.RULES[family]
     # How this family reads a request — its caps, its mode names, its routing
     # rule and what its encoder is sent. See `families/grammar.py`.
@@ -1552,13 +1924,37 @@ def compile_request(data, image_size_lookup=None, continues=False, canvas_spec=N
         cast = subjects.parse(data.get("subjects"), family)
     except subjects.SubjectError as exc:
         raise CompileError(str(exc)) from exc
-    raw_body = refined_body(data) or str(data.get("prompt") or "")
+    raw_body, manual_sections = prompt_parts(data, family_grammar)
     raw_sections = refined_sections(data, family_grammar)
+    if raw_sections:
+        raw_sections = {name: text for name, text in raw_sections.items()
+                        if text != manual_sections.get(name)}
     everybody = cast
     prose = [raw_body,
              str(data.get("soundscape") or ""),
-             str(data.get("music") or "")] + list((raw_sections or {}).values())
+             str(data.get("music") or "")] + list((raw_sections or {}).values()) \
+            + list(manual_sections.values())
+    if isinstance(data.get("retention_blocks"), list):
+        prose += [str(block.get("text") or "") for block in data["retention_blocks"]
+                  if isinstance(block, dict) and block.get("type") == "text"]
     cast = subjects.cited(cast, prose)
+    usage = _usage_texts(data, cast)
+    pattern = subjects.citation_re(everybody)
+    active_handles = {subject.handle for subject in cast}
+    inactive = set()
+    if pattern:
+        by_handle = {subject.handle: subject for subject in cast}
+        for block in retention_blocks(data, cast):
+            if block["type"] != "subject" or block.get("override"):
+                continue
+            owner = block["handle"]
+            text = str(block.get("rules") or by_handle[owner].usage_rules)
+            inactive.update((owner, handle) for handle in pattern.findall(text)
+                            if handle not in active_handles)
+    warnings = [f"The usage rule for @{owner} mentions @{handle}, but @{handle} is not "
+                f"cited in this shot. Cite @{handle} in a segment field to send that reference."
+                for owner, handle in sorted(inactive)]
+    prose += usage
     # Only members in this shot can refuse words-only input or override a
     # shared picture's saved rendition. Keep `everybody` above intact for
     # ownership pruning: an absent member's files must still leave with them.
@@ -1610,6 +2006,21 @@ def compile_request(data, image_size_lookup=None, continues=False, canvas_spec=N
     if absent:
         assets = [a for a in assets
                   if a.role != "reference" or a.handle not in absent]
+
+    # A newly selected replacement locator supplies a picture, not incidental
+    # sound from a similar clip. Keep independent structural audio/edit roles;
+    # never change the saved asset or infer sound intent from natural language.
+    locators = {h for s in cast if s.replacement_reference_only for h in s.replaces}
+    independent = {h for s in cast if not s.replacement_reference_only for h in s.replaces}
+    independent.update(s.voice for s in cast if s.voice)
+    audio_texts = [str(data.get(key) or "") for key in ("soundscape", "music")]
+    audio_texts += [manual_sections.get(name, "") for name in
+                   (contextir.SOUNDSCAPE_FIELD, contextir.MUSIC_FIELD)]
+    independent.update(h for text in audio_texts for h in HANDLE_RE.findall(text))
+    assets = [replace(a, track="picture")
+              if a.handle in locators - independent and a.kind == "video"
+              and a.track == "picture+sound" and a.takes not in ("edit", "continue")
+              else a for a in assets]
 
     frame_assets = [a for a in assets if a.role in ("first_frame", "last_frame")]
     for role in ("first_frame", "last_frame"):
@@ -1881,6 +2292,15 @@ def compile_request(data, image_size_lookup=None, continues=False, canvas_spec=N
                         _substitute(text, labels, citable, where=name, muted=muted),
                         cast, subject_labels)
                     for name, text in sections.items()}
+    structured = "retention_analysis" in family_grammar.written_sections
+    manual_sections["retention_analysis"] = contextir.join_paragraphs(
+        manual_sections.get("retention_analysis"), _retention_text(data, cast, body, structured, shots))
+    manual_sections = {name: _substitute_subjects(
+        _substitute(text, labels, citable, where=name, muted=muted), cast, subject_labels)
+        for name, text in manual_sections.items() if text}
+    if not structured:
+        body = contextir.join_paragraphs(body, *manual_sections.values())
+        manual_sections = {}
 
     # The files no subject claimed are defined in this same section rather than
     # in a paragraph of their own: the guide puts every label's meaning in
@@ -1900,22 +2320,89 @@ def compile_request(data, image_size_lookup=None, continues=False, canvas_spec=N
     # nothing — and section 4.1 asks for one retention line per label, which is
     # what `retention_lines` writes for the files no subject claimed.
     #
-    # A refined section always wins: `raw_sections` is merged over these, not
-    # under them.
-    # The sections themselves are the family's to derive — H3 writes
-    # `subject_definitions`, `retention_analysis` and `summary` in its guide's
-    # own forms, and a family with no such document has none to write. A refined
-    # section always wins: `raw_sections` is merged over these, not under them.
+    # Legacy rewrites keep their precedence. New user-owned contributions are
+    # additive, and never silently remove the compiler's reference bindings.
+    assets_by_handle = {asset.handle: asset for asset in assets}
+    for asset in assets:
+        origin = asset.replacement_origin
+        if not origin:
+            continue
+        source = assets_by_handle.get(origin.get("handle"))
+        if source and source.kind == "video" and source.filename != origin.get("filename"):
+            warnings.append(f"Replacement reference @{asset.handle} was captured from an earlier "
+                            f"file attached as @{source.handle}. Re-capture it to identify the "
+                            "target in the current video; its original capture is unchanged.")
+        elif not source or source.kind != "video":
+            warnings.append(f"The source video for replacement reference @{asset.handle} is not "
+                            "attached here. Attach the source or re-capture the replacement target.")
+        elif source.trim and isinstance(origin.get("time_s"), (int, float)) \
+                and not source.trim[0] <= origin["time_s"] <= source.trim[1]:
+            warnings.append(f"Replacement reference @{asset.handle} is outside the current trim "
+                            f"of @{source.handle}. Re-capture a frame inside the selected portion.")
+    target_scopes = _target_scopes(data)
+    annotations = _reference_annotations(data, assets)
+    _reference_subjects(annotations, everybody, cast)
+    annotation_labels = dict(labels)
+    if family_grammar.cites_panels:
+        for asset in assets:
+            if asset.panels and any(row["handle"] == asset.handle for row in annotations):
+                annotation_labels[asset.handle] = "the reference sheet containing " + ", ".join(
+                    labels[panel.handle] for panel in asset.panels if panel.handle in labels)
+    bindings = {**annotation_labels, **subject_labels}
+    reference_handles = re.compile(r"(?<![\w@])@([A-Za-z]+-\d+)(?![\w-])")
+    for row in annotations:
+        row["label"] = annotation_labels.get(row["handle"])
+        for key in ("description", "usage_rules"):
+            tokens = " ".join("@" + handle for handle in reference_handles.findall(row[key]))
+            _substitute(tokens, annotation_labels, citable,
+                        where=f"@{row['handle']} {key}", muted=muted)
+            row[key] = subjects.bound_text(row[key], bindings)
+    if structured and data.get("subject_scopes"):
+        for subject in cast:
+            own = set(data["subject_scopes"].get(subject.handle) or ())
+            for handle in subject.replaces:
+                asset = assets_by_handle.get(handle)
+                if asset and asset.replacement_origin:
+                    source = assets_by_handle.get(asset.replacement_origin.get("handle"))
+                    if source and source.kind == "video" and source.track in ("picture", "picture+sound"):
+                        handle = source.handle
+                scope = set((data.get("reference_scopes") or {}).get(handle) or ())
+                if own and scope and not scope.issubset(own) and not target_scopes.get(subject.handle):
+                    raise CompileError("replacement policies differ across segments using the "
+                                       "same source reference — render those segments separately "
+                                       "so the replacement does not affect the whole merged video")
     derived = family_grammar.sections(
         cast=cast, labels=labels, subject_labels=subject_labels, plan=plan,
         body=body, shots=shots, framed=bool(first_frame or last_frame),
-        speaker_ids=speaker_ids)
+        speaker_ids=speaker_ids, subject_scopes=data.get("subject_scopes"),
+        reference_scopes=data.get("reference_scopes"), target_scopes=target_scopes,
+        reference_annotations=annotations,
+        explicit_rules=_reference_rule_owners(_explicit_rules(data, cast), cast, annotations, assets, target_scopes))
+    generated_summary = (derived or {}).get("summary", "")
+    written_summary = contextir.join_paragraphs((sections or {}).get("summary"),
+                                               manual_sections.get("summary"))
     if derived:
         merged = {name: text for name, text in derived.items() if str(text or "").strip()}
         for name, text in (sections or {}).items():
+            if family == "h3" and name == "summary":
+                continue
             if str(text or "").strip():
-                merged[name] = text
+                if manual_sections:
+                    join = contextir.merge_summary if family == "h3" and name == "summary" else contextir.join_paragraphs
+                    merged[name] = join(merged.get(name), text)
+                else:
+                    merged[name] = text
         sections = merged
+    if manual_sections:
+        sections = dict(sections or {})
+        for name, text in manual_sections.items():
+            if family == "h3" and name == "summary":
+                continue
+            join = contextir.merge_summary if family == "h3" and name == "summary" else contextir.join_paragraphs
+            sections[name] = join(sections.get(name), text)
+    if family == "h3" and (generated_summary or written_summary):
+        sections = dict(sections or {})
+        sections["summary"] = contextir.merge_summary(generated_summary, written_summary)
     # The mode as far as the *prompt* is concerned. H3's `contextir.instruction`
     # quotes the guide's alignment line by mode — I2VA names <Picture 1> at
     # 0.00 s, FL2VA names two — and a blended seam whose frame is not pinned
@@ -1963,7 +2450,7 @@ def compile_request(data, image_size_lookup=None, continues=False, canvas_spec=N
         # Whether the sound crosses the cut unlabelled — the case where a
         # family citing by ordinal has a label with nothing defining it.
         audio_seam=continues_audio and feather == 1,
-        shots=shots, sections=sections)
+        shots=shots, sections=sections, plan=plan, cast=cast, reference_annotations=annotations)
 
     # In the image modes the aspect comes from the keyframe (the hosted API calls
     # this "adaptive"); the slider still owns the scale. The first frame wins
@@ -2039,6 +2526,8 @@ def compile_request(data, image_size_lookup=None, continues=False, canvas_spec=N
     # ratio above, because it is not a canvas the finished picture is ever seen
     # at, only the one a crop of it is re-generated on.
     face_settings = face_piece(data)
+    if face_settings and family != h3.ID:
+        raise CompileError(f"{family} does not support the face pass")
     face = Face(face_settings["canvas"], face_settings["canvas"],
                 face_settings["denoise"]) if face_settings else None
 
@@ -2067,6 +2556,7 @@ def compile_request(data, image_size_lookup=None, continues=False, canvas_spec=N
         labels=labels,
         cast=cast,
         subject_labels=subject_labels,
+        warnings=warnings,
         plan=plan,
         triggers=triggers,
         feather_pin=feather_pin,
@@ -2436,6 +2926,11 @@ def varied_piece(data, seed):
     """
     data = as_piece(data)
     piece = variations.vary_mapping(data, seed, "piece")
+    cast_before = timeline_cast(data) if data.get("subjects") else []
+    cast_after = timeline_cast(piece) if piece.get("subjects") else []
+    usage_changed = any(before.usage_rules != after.usage_rules
+                        for before, after in zip(cast_before, cast_after))
+    global_before, global_after = _cited_texts(data), _cited_texts(piece)
     segments = timeline_segments(data)
     chosen = []
     changed = False
@@ -2444,9 +2939,18 @@ def varied_piece(data, seed):
         card = int(segment.get("card_no") or index + 1)
         varied = variations.vary_mapping(
             segment, seed if own is None else own, card)
-        if varied is not segment:
+        if varied is not segment or usage_changed or piece is not data:
             passed = variations.passed_over(segment, varied, HANDLE_RE)
+            inherited_before = inherited_prompt_inputs(data, segment)
+            inherited_after = inherited_prompt_inputs(piece, varied)
+            before_texts = _cited_texts(inherited_before, global_before)
+            after_texts = _cited_texts(inherited_after, global_after)
+            before_texts += _usage_texts(inherited_before, subjects.cited(cast_before, before_texts))
+            after_texts += _usage_texts(inherited_after, subjects.cited(cast_after, after_texts))
+            passed |= ({h for text in before_texts for h in HANDLE_RE.findall(text)}
+                       - {h for text in after_texts for h in HANDLE_RE.findall(text)})
             if passed:
+                varied = dict(varied)
                 varied["assets"] = [
                     {**asset, "enabled": False}
                     if isinstance(asset, dict)
@@ -2736,7 +3240,7 @@ def _duration_seconds(segment):
 def _join_prompt(global_prompt, segment_prompt):
     """The global prompt in front of the segment's own.
 
-    Two lines rather than a comma splice: the global prompt is a standing
+    Separate paragraphs rather than a comma splice: the global prompt is a standing
     description of the piece and the segment's is what happens in this shot, and
     running them together as one sentence reads as one clause qualifying the
     other. The only `@handles` with meaning in the global prompt are the
@@ -2745,8 +3249,17 @@ def _join_prompt(global_prompt, segment_prompt):
     lands. A segment-asset handle stays what it always was — a name that means
     a different file in every card, and prose to this pass.
     """
+    global_body, global_sections = contextir.split_sections(global_prompt)
+    segment_body, segment_sections = contextir.split_sections(segment_prompt)
+    if global_sections or segment_sections:
+        merged = dict(global_sections)
+        for name, value in segment_sections.items():
+            merged[name] = contextir.join_paragraphs(merged.get(name), value)
+        return contextir.join_paragraphs(
+            *(f"{name}: {value}" for name, value in merged.items()),
+            "detailed_description: " + contextir.join_paragraphs(global_body, segment_body))
     parts = [p for p in (global_prompt.strip(), str(segment_prompt or "").strip()) if p]
-    return "\n".join(parts)
+    return "\n\n".join(parts)
 
 
 def merge_loras(global_entries, segment_entries):
@@ -2847,11 +3360,12 @@ def cited_pool(pool, request, extra_texts=(), cast=()):
             named.update(pattern.findall(text))
         for subject in cast:
             if subject.handle in named:
+                usage = _usage_texts(request, [subject])
                 # Minus the plates whose word the prose does not say: a member
                 # with a sheet per costume brings the one the sentence dressed
                 # them in. See `subjects.asleep`.
                 found.update(h for h in subject.files
-                             if h not in subjects.asleep(subject, texts))
+                             if h not in subjects.asleep(subject, texts + usage))
                 # `update`, not `add`: this is a list of clips now, and adding
                 # the tuple itself put an object in a set of handles that
                 # matched nothing — so a subject standing in for somebody across
@@ -2859,7 +3373,9 @@ def cited_pool(pool, request, extra_texts=(), cast=()):
                 # generation was refused for a file the citation should have
                 # brought with it.
                 found.update(subject.replaces)
-    return [asset for asset in pool if asset.handle in found]
+                found.update(h for text in usage for h in HANDLE_RE.findall(text))
+    return [asset for asset in pool if asset.handle in found
+            or any(panel.handle in found for panel in asset.panels)]
 
 
 def _cited_texts(request, extra_texts=()):
@@ -2868,6 +3384,14 @@ def _cited_texts(request, extra_texts=()):
              str(request.get("soundscape") or ""),
              str(request.get("music") or "")]
     texts.extend(str(text or "") for text in extra_texts)
+    owned = request.get("prompt_sections")
+    if isinstance(owned, dict):
+        texts.extend(str(text or "") for name, text in owned.items()
+                     if name != "retention_analysis" or not isinstance(request.get("retention_blocks"), list))
+    blocks = request.get("retention_blocks")
+    if isinstance(blocks, list):
+        texts.extend(str(block.get("text") or "") for block in blocks
+                     if isinstance(block, dict) and block.get("type") == "text")
     refined = request.get("refined")
     if isinstance(refined, dict) and refined.get("enabled") is not False:
         texts.append(str(refined.get("body") or ""))
@@ -2929,7 +3453,7 @@ def _inject_pool(pool, request, extra_texts=(), cast=()):
 # way — and nothing on this side ever reads either.
 PIECE_FIELDS = ("family", "aspect", "aspect_source", "short_edge", "upscale",
                 "sample_edge", "refine_denoise", "refine_upscaler", "refine_steps",
-                "face", "models",
+                "face_schema", "models",
                 "models_spare", "upscale_models", "turbo",
                 "output_prefix", "subjects", "sampling", "sampling_spare")
 
@@ -2937,7 +3461,40 @@ PIECE_FIELDS = ("family", "aspect", "aspect_source", "short_edge", "upscale",
 # version-1 `creator_data` blob from a fresh node's "{}" — which is an empty
 # piece and must not become a shot nobody wrote.
 _LONE_SHOT_KEYS = ("prompt", "assets", "loras", "duration_s", "checkpoint",
-                   "refined", "soundscape", "music")
+                   "refined", "soundscape", "music", "prompt_sections",
+                   "retention_blocks", "retention_overrides")
+
+# A workflow boundary, never a low-level resolved render request. Old global
+# switches and card string overrides start OFF once; saved new choices survive.
+FACE_SCHEMA = 1
+
+
+def _face_current(piece):
+    marker = piece.get("face_schema")
+    return type(marker) in (int, float) and marker == FACE_SCHEMA
+
+
+def _migrate_faces(piece):
+    if not isinstance(piece, dict) or not isinstance(piece.get("segments"), list):
+        return piece
+    if _face_current(piece):
+        return piece
+    migrated = dict(piece)
+    old = piece.get("face") if isinstance(piece.get("face"), dict) else {}
+    migrated.pop("face", None)
+    migrated["face_schema"] = FACE_SCHEMA
+    migrated["segments"] = []
+    for raw in piece["segments"]:
+        if not isinstance(raw, dict) or raw.get("kind") == "clip":
+            migrated["segments"].append(raw)
+            continue
+        segment = dict(raw)
+        knobs = raw.get("face") if isinstance(raw.get("face"), dict) else old
+        segment["face"] = {"on": False,
+                           "canvas": knobs.get("canvas", DEFAULT_FACE_CANVAS),
+                           "denoise": knobs.get("denoise", DEFAULT_FACE_DENOISE)}
+        migrated["segments"].append(segment)
+    return migrated
 
 
 def as_piece(data):
@@ -2968,7 +3525,7 @@ def as_piece(data):
       weights by being opened.
     """
     if not isinstance(data, dict) or isinstance(data.get("segments"), list):
-        return data
+        return _migrate_faces(data)
     if data.get("version") != 1 and not any(key in data for key in _LONE_SHOT_KEYS):
         return data
 
@@ -2979,7 +3536,7 @@ def as_piece(data):
         if field in shot:
             piece[field] = shot.pop(field)
     piece["segments"] = [shot]
-    return piece
+    return _migrate_faces(piece)
 
 
 def _refmod_space(family):
@@ -3210,6 +3767,35 @@ def timeline_payloads(data, image_size_lookup=None):
     the whole timeline would mean editing the last shot re-generated all of them.
     A payload only changes when its own segment does.
     """
+    return _timeline_payloads(data, image_size_lookup)
+
+
+def _runtime_prompt_overrides(data, segments, runs):
+    raw = data.get("prompt_overrides", [])
+    if not isinstance(raw, list) or len(raw) > 1000:
+        raise CompileError("final-prompt drafts must name existing generation passes")
+    result = {}
+    for draft in raw:
+        if not isinstance(draft, dict) or not isinstance(draft.get("binding"), dict):
+            raise CompileError("final-prompt draft needs the original compiled reference binding")
+        cards = draft.get("cards")
+        if not isinstance(cards, list) or not cards or not all(isinstance(card, str) and card for card in cards):
+            raise CompileError("final-prompt draft must name stable card identities")
+        matching = [position for position, (start, end) in enumerate(runs)
+                    if cards == [card.get("card_id") for card in segments[start:end]]]
+        remaining = [card for card in segments if card.get("card_id") in cards]
+        if not remaining or all(is_clip(card) for card in remaining):
+            continue  # Held cards and kept footage do not generate this time.
+        if len(matching) != 1 or matching[0] in result or is_clip(segments[runs[matching[0]][0]]):
+            raise CompileError("final-prompt draft pass changed; enable Force edit again for the current pass")
+        text = draft.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 200000:
+            raise CompileError("final-prompt draft must contain 1 to 200000 characters")
+        result[matching[0]] = {"text": text, "binding": draft["binding"]}
+    return result
+
+
+def _timeline_payloads(data, image_size_lookup=None, reference_bindings=None):
     # Rebound rather than lifted piecemeal: everything below reads the piece —
     # the global prompt, the pool, the canvas — and a half-lifted blob would
     # read a lone generation's keyframes as a reference pool.
@@ -3224,6 +3810,7 @@ def timeline_payloads(data, image_size_lookup=None):
     # cited globally rides into the whole strip without a per-segment mention,
     # keyframe segments included, whose frames ride as pinned guides on Ref2VA.
     runs = timeline_runs(data, segments)
+    runtime_overrides = _runtime_prompt_overrides(data, segments, runs)
 
     # The work bound, asked here because this is the one function both node paths
     # go through and because it is answerable off the blob alone — before a
@@ -3265,6 +3852,9 @@ def timeline_payloads(data, image_size_lookup=None):
 
     for position, (start, end) in enumerate(runs):
         head = segments[start]
+        bindings = {"assets": {}, "subjects": {}} if reference_bindings is not None else None
+        if reference_bindings is not None:
+            reference_bindings.append(bindings)
         for index in range(start, end):
             payload_of[index] = position
 
@@ -3276,14 +3866,14 @@ def timeline_payloads(data, image_size_lookup=None):
             # is a fact about the cut, not about how the card is made.
             payloads.append({"clip": clip_spec(head, start)})
         elif end - start > 1:
-            payloads.append(group_payload(data, start, end))
+            payloads.append(_group_payload(data, start, end, bindings))
         else:
             payloads.append({"request": _chained_request(
                 data, head, pool, global_prompt, cast)})
 
         payload = payloads[-1]
 
-        # `prompt_override` replaces the composed prompt verbatim, and the
+        # `prompt_override` replaces the composed prompt's content, and the
         # segment node reads it off the *payload* — so it has to be lifted out
         # of the request that carries it. It describes one generation, which is
         # why only a pass of one segment can have one: in a merged run the
@@ -3297,7 +3887,13 @@ def timeline_payloads(data, image_size_lookup=None):
         if "request" in payload:
             override = payload["request"].pop("prompt_override", None)
             if override:
-                payload["prompt_override"] = override
+                payload["prompt_override"] = (contextir.normalize_model_prompt(override)
+                    if piece_family(data) == h3.ID else override)
+        if position in runtime_overrides:
+            text = runtime_overrides[position]["text"]
+            payload["prompt_override"] = (contextir.normalize_model_prompt(text)
+                if piece_family(data) == h3.ID else text)
+            payload["prompt_override_binding"] = runtime_overrides[position]["binding"]
 
         # Segment 1 has nothing in front of it, so the flags are ignored there
         # rather than rejected: they are leftovers from reordering, not a
@@ -3693,6 +4289,7 @@ def _chained_request(data, segment, pool, global_prompt, cast=()):
     segment, and unchanged otherwise — a segment in no pass compiles to exactly
     the bytes it did before merging existed, which is what keeps its node a
     cache hit."""
+    segment = inherited_prompt_inputs(data, apply_field_refinement(segment))
     request = dict(segment)
     # Lifted out of the request and onto the payload: they are facts about
     # the seam in front of this segment, not about the generation. `merge` goes
@@ -3831,6 +4428,11 @@ def _asset_dict(asset):
     # silently re-encodes the picture instead of using its saved conditioning.
     if asset.mods:
         out["mods"] = dict(asset.mods)
+    if asset.replacement_origin:
+        out["replacement_origin"] = dict(asset.replacement_origin)
+    for key, value in (("description", asset.description), ("usage_rules", asset.usage_rules)):
+        if value:
+            out[key] = value
     return out
 
 
@@ -3845,7 +4447,18 @@ def _panel_dict(panel):
         out["rect"] = list(panel.rect)
     if panel.crop:
         out["crop"] = framing.to_dict(panel.crop)
+    for key, value in (("description", panel.description), ("usage_rules", panel.usage_rules)):
+        if value:
+            out[key] = value
     return out
+
+
+def _renamed_text(text, rename):
+    if not rename:
+        return text
+    pattern = re.compile(r"(?<![\w@])@(" + "|".join(
+        re.escape(h) for h in sorted(rename, key=len, reverse=True)) + r")(?![\w-])")
+    return pattern.sub(lambda m: "@" + rename[m.group(1)], text)
 
 
 def _renamed(subject, rename):
@@ -3854,18 +4467,22 @@ def _renamed(subject, rename):
         return subject
     pick = lambda h: rename.get(h, h) if h else h
     return subjects.Subject(
-        handle=subject.handle,
+        handle=pick(subject.handle),
         sources=[pick(h) for h in subject.sources],
         takes=subject.takes,
-        description=subject.description,
+        description=_renamed_text(subject.description, rename),
+        usage_rules=_renamed_text(subject.usage_rules, rename),
         motion=[pick(h) for h in subject.motion],
         voice=pick(subject.voice),
-        notes={pick(h): text for h, text in subject.notes.items()},
+        notes={pick(h): _renamed_text(text, rename) for h, text in subject.notes.items()},
         triggers={pick(h): words for h, words in subject.triggers.items()},
-        features=subject.features,
+        features=[subjects.Feature(_renamed_text(feature.text, rename),
+                                   _renamed_text(feature.instead, rename), feature.attr)
+                  for feature in subject.features],
         seeded=subject.seeded,
         replaces=[pick(h) for h in subject.replaces],
-        replaces_what=subject.replaces_what,
+        replaces_what=_renamed_text(subject.replaces_what, rename),
+        replacement_reference_only=subject.replacement_reference_only,
         marker=subject.marker,
         loras=subject.loras,
         wears=subject.wears,
@@ -3899,6 +4516,8 @@ def _subject_dict(subject):
     # carries, but nothing writes one any more.
     if subject.replaces:
         out["replaces"] = list(subject.replaces)
+    if subject.replacement_reference_only:
+        out["replacement_reference_only"] = True
     if subject.motion:
         out["motion"] = list(subject.motion)
     if subject.notes:
@@ -3913,6 +4532,7 @@ def _subject_dict(subject):
                                  **({"loras": [dict(e) for e in row["loras"]]} if row.get("loras") else {})}
                         for family, row in subject.wears.items()}
     for key, value in (("description", subject.description),
+                       ("usage_rules", subject.usage_rules),
                        ("voice", subject.voice),
                        ("replaces_what", subject.replaces_what),
                        ("relationship", subject.marker)):
@@ -3947,7 +4567,8 @@ def _asset_identity(asset):
     return (asset.kind, asset.role, asset.filename, asset.track, asset.ref_size,
             asset.trim, asset.crop, asset.takes, asset.cut, asset.op, asset.rect,
             tuple(_asset_identity(panel) for panel in asset.panels),
-            tuple(sorted(asset.mods.items())))
+            tuple(sorted(asset.mods.items())),
+            tuple(sorted((key, str(value)) for key, value in asset.replacement_origin.items())))
 
 
 def group_payload(data, start=0, end=None):
@@ -3978,8 +4599,13 @@ def group_payload(data, start=0, end=None):
     front of the run, which is `timeline_payloads`' business — and inside a run
     there are no seams at all, which is what merging means.
     """
+    return _group_payload(data, start, end)
+
+
+def _group_payload(data, start=0, end=None, reference_bindings=None):
     segments = timeline_segments(data)
-    group = segments[start:len(segments) if end is None else end]
+    group = [apply_field_refinement(segment)
+             for segment in segments[start:len(segments) if end is None else end]]
     if not group:
         raise CompileError("a pass needs at least one segment")
     # Absolute card numbers throughout: every refusal below names a segment the
@@ -3987,21 +4613,53 @@ def group_payload(data, start=0, end=None):
     first_number = start + 1
     last_number = start + len(group)
     global_prompt = str(data.get("prompt") or "").strip()
+    family_grammar = grammar.of(piece_family(data))
+    sectioned = "retention_analysis" in family_grammar.written_sections
+    group_sections = {}
+    group_blocks = []
+    standing_blocks_seen = set()
+    subject_scopes, reference_scopes, target_windows = {}, {}, {}
+    reference_annotations = []
+    next_shot = 1
+    global_prompt, global_sections = contextir.split_sections(global_prompt)
+    _, standing_sections = prompt_parts({**data, "prompt": "",
+                                         "refined": {"enabled": False}}, family_grammar)
+    # Owned standing retention is carried by the live block layout below,
+    # including the plain-text layout promoted by inheritance.
+    standing_sections.pop("retention_analysis", None)
+    for name, value in standing_sections.items():
+        global_sections[name] = contextir.join_paragraphs(global_sections.get(name), value)
+    if sectioned:
+        group_sections = global_sections
+    else:
+        global_prompt = contextir.join_paragraphs(global_prompt, *global_sections.values())
     pool = timeline_pool(data)
     pool_identities = {asset.handle: _asset_identity(asset) for asset in pool}
     cast = timeline_cast(data)
-    # A card's own assets are renamed onto the merged list, so a subject built
-    # out of one has to be renamed with them. Accumulated across the shots and
-    # first-appearance-wins, which is the same rule the merged list itself
-    # follows — and a pool asset keeps its handle, so a cast attached where a
-    # cast belongs passes through untouched.
+    # Local file aliases may mean different identities on different cards.
     cast_rename = {}
+    cast_bindings, merged_cast = {}, {}
     # The global prompt opens the pass's first shot and the global audio fields
     # are merged into its one request, so a pool citation in any of them is that
     # shot's to carry — the merge below then owns it for the whole pass.
     global_texts = (global_prompt,
                     str(data.get("soundscape") or ""),
-                    str(data.get("music") or ""))
+                    str(data.get("music") or ""), *group_sections.values(),
+                    *_cited_texts({key: data[key] for key in ("prompt_sections", "retention_blocks")
+                                  if key in data}))
+    standing_pool = cited_pool(pool, {key: data[key] for key in
+        ("prompt_sections", "retention_blocks", "retention_overrides") if key in data})
+
+    def binding(subject):
+        return subject.sources, subject.motion, subject.voice, subject.replaces
+
+    standing_cast = subjects.cited(cast, global_texts)
+    pool_handles = {h for asset in pool if not asset.cut
+                    for h in (asset.handle, *(p.handle for p in asset.panels if not p.cut))}
+    for subject in standing_cast:
+        if set((*subject.files, *subject.replaces)) <= pool_handles:
+            cast_bindings[subject.handle] = {binding(subject): subject.handle}
+            merged_cast[subject.handle] = subject
 
     assets = []          # the merged reference list, in first-appearance order
     position_of = {}     # dedup key -> index into `assets`
@@ -4047,10 +4705,20 @@ def group_payload(data, start=0, end=None):
             position = position_of[key] = len(assets)
             handle = allocate(asset.kind, asset.handle if pooled else None, pooled)
             assets.append(replace(
-                asset, handle=handle,
-                panels=tuple(replace(panel, handle=allocate(panel.kind, panel.handle, pooled))
+                asset, handle=handle, description="", usage_rules="",
+                panels=tuple(replace(panel, handle=allocate(panel.kind, panel.handle, pooled),
+                                     description="", usage_rules="")
                              for panel in asset.panels)))
         return assets[position]
+
+    def remember_asset(asset, target):
+        if reference_bindings is None:
+            return
+        for part, merged in zip((asset, *asset.panels), (target, *target.panels)):
+            entries = reference_bindings["assets"].setdefault(merged.handle, [])
+            if not any(old.handle == part.handle and _asset_identity(old) == _asset_identity(part)
+                       for old in entries):
+                entries.append(part)
 
     shots = []           # (cut time in seconds, text) per shot
     audio_fields = {key: [str(data.get(key) or "")] for key in ("soundscape", "music")}
@@ -4068,6 +4736,8 @@ def group_payload(data, start=0, end=None):
         else None)
 
     for number, segment in enumerate(group, start=first_number):
+        seeded_notes = []
+        inherited = inherited_prompt_inputs(data, segment)
         try:
             # A cited pool reference joins this shot exactly as it joins a
             # chained segment — the global texts count as the pass's first
@@ -4076,7 +4746,7 @@ def group_payload(data, start=0, end=None):
             # the pool once and takes one <Picture N> — which is the point of
             # citing it twice.
             parsed = _parse_assets(_inject_pool(
-                pool, segment, extra_texts=global_texts if number == first_number else (),
+                pool, inherited, extra_texts=global_texts if number == first_number else (),
                 cast=cast))
         except CompileError as exc:
             raise CompileError(f"shot {number}: {exc}") from exc
@@ -4089,11 +4759,16 @@ def group_payload(data, start=0, end=None):
             for asset in cited_pool(pool, {}, extra_texts=global_texts, cast=cast):
                 if not any(a.handle == asset.handle and _asset_identity(a) == _asset_identity(asset)
                            for a in parsed):
-                    merged_asset(asset)
+                    seeded = merged_asset(asset)
+                    remember_asset(asset, seeded)
+                    seeded_notes.extend((part, target) for part, target in
+                        zip((asset, *asset.panels), (seeded, *seeded.panels))
+                        if part.description or part.usage_rules)
                     for handle in (asset.handle, *(panel.handle for panel in asset.panels)):
                         cast_rename.setdefault(handle, handle)
 
         rename = {}
+        original_assets = {asset.handle: asset for asset in parsed} if reference_bindings is not None else {}
         for asset in parsed:
             if asset.role == "first_frame" and number != first_number:
                 raise CompileError(
@@ -4109,6 +4784,15 @@ def group_payload(data, start=0, end=None):
                     f"makes, so it can only be that shot's. Split the pass after shot "
                     f"{number} to give it one of its own."
                 )
+            if asset.replacement_origin:
+                origin = asset.replacement_origin
+                source = next((a for a in parsed if a.handle == origin.get("handle")
+                               and a.kind == "video"), None)
+                if source:
+                    # Bind before deduplication: the same marked picture on two
+                    # cards may identify two different local source videos.
+                    source_handle = rename.get(source.handle) or merged_asset(source).handle
+                    asset = replace(asset, replacement_origin={**origin, "handle": source_handle})
             target_asset = merged_asset(asset)
             rename[asset.handle] = target_asset.handle
             cast_rename.setdefault(asset.handle, target_asset.handle)
@@ -4125,6 +4809,51 @@ def group_payload(data, start=0, end=None):
                     and piece_aspect_source.get("handle") == asset.handle):
                 merged_aspect_source = target_asset.handle
 
+        local_texts = _cited_texts(inherited, global_texts if number == first_number else ())
+        local_cast = subjects.cited(cast, local_texts)
+        note_texts = local_texts + _usage_texts(inherited, local_cast)
+        dormant_files = subjects.claimed(cast) - subjects.awake(local_cast, note_texts)
+        dormant_files -= {handle for text in note_texts for handle in HANDLE_RE.findall(text)}
+        noted_parts = [part for asset in parsed
+                       if asset.role == "reference" and asset.handle not in dormant_files
+                       for part in (asset, *asset.panels)]
+        _reference_subjects([
+            {"handle": part.handle, "description": part.description, "usage_rules": part.usage_rules}
+            for part in (*noted_parts, *(part for part, _ in seeded_notes))],
+            cast, local_cast)
+        for subject in local_cast:
+            rebound = _renamed(subject, {**cast_rename, **rename})
+            variants = cast_bindings.setdefault(subject.handle, {})
+            key = binding(rebound)
+            if key not in variants:
+                handle = subject.handle
+                suffix = 2
+                while variants and handle in used:
+                    tail = f"_{suffix}"
+                    handle = subject.handle[:32 - len(tail)] + tail
+                    suffix += 1
+                used.add(handle)
+                variants[key] = handle
+            rename[subject.handle] = variants[key]
+        for subject in local_cast:
+            rebound = _renamed(subject, {**cast_rename, **rename})
+            merged_cast.setdefault(rebound.handle, rebound)
+        if reference_bindings is not None:
+            for asset in parsed:
+                if asset.role != "reference" or asset.handle not in dormant_files:
+                    original = original_assets[asset.handle]
+                    target = next(a for a in assets if a.handle == rename[asset.handle])
+                    remember_asset(original, target)
+            for subject in local_cast:
+                handles = reference_bindings["subjects"].setdefault(rename[subject.handle], [])
+                if subject.handle not in handles:
+                    handles.append(subject.handle)
+            if number == first_number:
+                for subject in standing_cast:
+                    handles = reference_bindings["subjects"].setdefault(subject.handle, [])
+                    if subject.handle not in handles:
+                        handles.append(subject.handle)
+
         # A refined shot replaces the typed one here rather than downstream,
         # because the merged request is a single generation and `compile_request`
         # would otherwise see one `refined` blob standing for the whole strip.
@@ -4132,16 +4861,116 @@ def group_payload(data, start=0, end=None):
 
         # One pass, single-pass substitution: a rename map applied in two passes
         # could turn this shot's img-1 into img-2 and then that into img-3.
-        text = HANDLE_RE.sub(
-            lambda m: "@" + rename.get(m.group(1), m.group(1)),
-            written or str(segment.get("prompt") or ""),
-        ).strip()
+        section_source = ({**segment, "retention_blocks": inherited["retention_blocks"]}
+                          if isinstance(inherited.get("retention_blocks"), list) else segment)
+        source_text, local_sections = prompt_parts(section_source, family_grammar)
+        if sectioned:
+            for name, value in (refined_sections(segment, family_grammar) or {}).items():
+                if value != local_sections.get(name):
+                    local_sections[name] = contextir.join_paragraphs(local_sections.get(name), value)
+        text = _renamed_text(source_text, rename).strip()
+        if sectioned:
+            count = max(1, len(contextir.SHOT_RE.findall(text)))
+            scope = list(range(next_shot, next_shot + count))
+            next_shot += count
+            for n in scope:
+                target_windows[n] = [at, at + float(segment.get("duration_s", 6) or 0)]
+            for part, target in seeded_notes:
+                reference_annotations.append({"handle": target.handle,
+                    "description": _renamed_text(part.description, {part.handle: target.handle}),
+                    "usage_rules": _renamed_text(part.usage_rules, {part.handle: target.handle}),
+                    **({"shots": scope} if len(group) > 1 else {})})
+            for part in noted_parts:
+                if part.description or part.usage_rules:
+                    reference_annotations.append({"handle": rename[part.handle],
+                        "description": _renamed_text(part.description, rename),
+                        "usage_rules": _renamed_text(part.usage_rules, rename),
+                        **({"shots": scope} if len(group) > 1 else {})})
+            for name, value in local_sections.items():
+                value = _renamed_text(value, rename)
+                if name == "retention_analysis":
+                    group_blocks.append({"type": "text", "text": value, "shots": scope})
+                elif name in (contextir.SOUNDSCAPE_FIELD, contextir.MUSIC_FIELD):
+                    key = "soundscape" if name == contextir.SOUNDSCAPE_FIELD else "music"
+                    audio_fields[key].append(value)
+                else:
+                    group_sections[name] = contextir.join_paragraphs(group_sections.get(name), value)
+            for subject in local_cast:
+                subject_scopes.setdefault(rename[subject.handle], []).extend(scope)
+            if number == first_number:
+                for subject in standing_cast:
+                    subject_scopes.setdefault(subject.handle, []).extend(scope)
+            for asset in parsed:
+                if asset.role == "reference":
+                    reference_scopes.setdefault(rename[asset.handle], []).extend(scope)
+            for asset in standing_pool:
+                reference_scopes.setdefault(asset.handle, []).extend(scope)
+            for block in retention_blocks(inherited, local_cast):
+                standing = block.get("_source_scope") == "piece"
+                if standing and block["type"] == "text":
+                    index = block.get("_source_index")
+                    if index in standing_blocks_seen:
+                        continue
+                    standing_blocks_seen.add(index)
+                    # Standing text names pool handles, not the first card's
+                    # possibly shadowed local aliases. It applies across the
+                    # pass and is emitted once, not once per card.
+                    group_blocks.append({"type": "text", "text": block["text"]})
+                    continue
+                block = {**block, "shots": scope}
+                if block["type"] == "text":
+                    block["text"] = _renamed_text(block["text"], rename)
+                else:
+                    subject = next(s for s in local_cast if s.handle == block["handle"])
+                    block["handle"] = rename[subject.handle]
+                    block["rules"] = _renamed_text(str(block.get("rules") or subject.usage_rules), rename)
+                previous = next((old for old in group_blocks
+                    if standing and old.get("_source_scope") == "piece"
+                    and old.get("type") == "subject" and old.get("handle") == block.get("handle")
+                    and old.get("rules") == block.get("rules")
+                    and old.get("override") == block.get("override")), None)
+                if previous is not None:
+                    previous["shots"].extend(scope)
+                else:
+                    siblings = [i for i, old in enumerate(group_blocks)
+                        if standing and old.get("_source_scope") == "piece"
+                        and old.get("type") == "subject" and old.get("handle") == block.get("handle")]
+                    if siblings:
+                        group_blocks.insert(siblings[-1] + 1, block)
+                    else:
+                        group_blocks.append(block)
+        else:
+            for part, target in seeded_notes:
+                reference_annotations.append({"handle": target.handle,
+                    "description": _renamed_text(part.description, {part.handle: target.handle}),
+                    "usage_rules": _renamed_text(part.usage_rules, {part.handle: target.handle}),
+                    "intervals": [[at, at + float(segment.get("duration_s", 6) or 0)]]})
+            for part in noted_parts:
+                if part.description or part.usage_rules:
+                    reference_annotations.append({"handle": rename[part.handle],
+                        "description": _renamed_text(part.description, rename),
+                        "usage_rules": _renamed_text(part.usage_rules, rename),
+                        "intervals": [[at, at + float(segment.get("duration_s", 6) or 0)]]})
+            if number != first_number and isinstance(inherited.get("retention_blocks"), list):
+                inherited = {**inherited, "retention_blocks": [block
+                    for block in inherited["retention_blocks"]
+                    if block.get("type") != "text" or block.get("_source_scope") != "piece"]}
+            rules_input = {**inherited,
+                "retention_overrides": [rename.get(h, h) for h in inherited.get("retention_overrides") or ()]}
+            if isinstance(inherited.get("retention_blocks"), list):
+                rules_input["retention_blocks"] = [
+                    {**b, "handle": rename.get(b.get("handle"), b.get("handle"))}
+                    if b.get("type") == "subject" else b for b in inherited["retention_blocks"]]
+            rules = _retention_text(rules_input, [_renamed(s, {**cast_rename, **rename}) for s in local_cast],
+                                   text, structured=False)
+            text = contextir.join_paragraphs(text,
+                *(_renamed_text(value, rename) for value in local_sections.values()), rules)
+            group_blocks.extend({"type": "subject", "handle": rename[s.handle], "override": True}
+                                for s in local_cast if s.usage_rules)
         # Audio prose can cite these same references. Compare/join it only
         # after the shot's aliases have been mapped to the merged namespace.
         for key, values in audio_fields.items():
-            values.append(HANDLE_RE.sub(
-                lambda m: "@" + rename.get(m.group(1), m.group(1)),
-                str(segment.get(key) or "")))
+            values.append(_renamed_text(str(segment.get(key) or ""), rename))
         # The standing description of the piece opens the description, which is
         # where the guide puts the style and the initial composition — in front
         # of typed text, and in front of a shot-scoped rewrite, which stands in
@@ -4152,14 +4981,13 @@ def group_payload(data, start=0, end=None):
         # neither of them is.
         if number == first_number and global_prompt and (not written
                                                          or refined_scope(segment) == "shot"):
-            joiner = "" if global_prompt[-1] in ".!?,;:—" else "."
-            text = f"{global_prompt}{joiner} {text}".strip()
+            text = contextir.join_paragraphs(global_prompt, text)
         shots.append((at, text))
         at += float(segment.get("duration_s", 6) or 0)
 
         stack = merge_loras(
             merge_loras(stack, cast_loras(
-                cast, segment,
+                cast, inherited,
                 extra_texts=global_texts if number == first_number else ())),
             segment.get("loras"))
 
@@ -4167,7 +4995,6 @@ def group_payload(data, start=0, end=None):
     # see `Grammar.join_shots`. The same grammar that composes the finished
     # prompt, so a family cannot join its shots one way and be described the
     # other.
-    family_grammar = grammar.of(piece_family(data))
     try:
         body = family_grammar.join_shots(shots)
     except ValueError as exc:
@@ -4225,10 +5052,38 @@ def group_payload(data, start=0, end=None):
                 if len(group) == len(segments) else None)
     if sections:
         request["refined"] = {"sections": sections}
+    if group_sections:
+        # The public per-segment inputs cover summary and retention. Other
+        # hand-written H3 fields remain explicit, so none is lost in a merge.
+        owned = {name: value for name, value in group_sections.items()
+                 if name in ("summary", "retention_analysis")}
+        extras = {name: value for name, value in group_sections.items() if name not in owned}
+        if owned:
+            request["prompt_sections"] = owned
+        if extras:
+            request["prompt"] = contextir.join_paragraphs(
+                *(f"{name}: {value}" for name, value in extras.items()),
+                f"detailed_description: {body}")
+    if group_blocks:
+        if group_sections.get("retention_analysis"):
+            group_blocks.insert(0, {"type": "text", "text": group_sections["retention_analysis"]})
+        request["retention_blocks"] = group_blocks
+    if subject_scopes:
+        request["subject_scopes"] = {handle: sorted(set(values))
+                                     for handle, values in subject_scopes.items()}
+    if reference_scopes:
+        request["reference_scopes"] = {handle: sorted(set(values))
+                                       for handle, values in reference_scopes.items()}
+    if len(group) > 1 and target_windows:
+        request["target_windows"] = target_windows
+    if reference_annotations:
+        request["reference_annotations"] = reference_annotations
     # One pass is one generation, so it carries the whole cast and
     # `compile_request` cuts it down to whoever the assembled description cites.
     if cast:
-        request["subjects"] = [_subject_dict(_renamed(s, cast_rename)) for s in cast]
+        ordered = [merged_cast[h] for s in cast for h in cast_bindings.get(s.handle, {}).values()]
+        ordered += [_renamed(s, cast_rename) for s in cast if s.handle not in cast_bindings]
+        request["subjects"] = [_subject_dict(s) for s in ordered]
     pin = _agree([s.get("checkpoint") for s in group], "the checkpoint", blank="auto")
     if pin != "auto":
         request["checkpoint"] = pin
@@ -4246,7 +5101,8 @@ def group_payload(data, start=0, end=None):
     # `contextir.instruction` says which); it rides on the payload either way so
     # the pass can describe itself.
     return {"request": request,
-            "shots": family_grammar.count_shots(body, len(group)),
+            "shots": max(next_shot - 1, family_grammar.count_shots(body, len(group)))
+                     if sectioned else family_grammar.count_shots(body, len(group)),
             "continue": False, "continue_audio": False}
 
 
@@ -4260,6 +5116,31 @@ def single_payload(data):
     return group_payload(data)
 
 
+def prompt_binding(compiled):
+    """Exact model-label/media binding, independent of freeform source prose."""
+    def reference(asset):
+        row = _asset_dict(asset)
+        for key in ("description", "usage_rules", "replacement_annotation"):
+            row.pop(key, None)
+        for panel in row.get("panels", []):
+            for key in ("description", "usage_rules"):
+                panel.pop(key, None)
+        return row
+    value = {
+        "mode": compiled.mode, "checkpoint": compiled.checkpoint,
+        "labels": compiled.labels, "subject_labels": compiled.subject_labels,
+        "references": [reference(asset) for asset in [
+            *compiled.ref_images, *compiled.ref_videos, *compiled.ref_audios,
+            *[item for item in (compiled.first_frame, compiled.last_frame) if item is not None]]],
+        "subjects": [{"handle": subject.handle, "from": list(subject.sources),
+            "motion": list(subject.motion), "voice": subject.voice,
+            "replaces": list(subject.replaces), "takes": subject.takes} for subject in compiled.cast],
+        "continues": compiled.continues, "ends_on": compiled.ends_on,
+        "storyboard": compiled.storyboard,
+    }
+    return json.loads(json.dumps(value))
+
+
 def compile_segment(payload, image_size_lookup=None, family=registry.DEFAULT_VIDEO):
     """One payload from `timeline_payloads` or `single_payload` -> `Compiled`.
 
@@ -4271,7 +5152,7 @@ def compile_segment(payload, image_size_lookup=None, family=registry.DEFAULT_VID
     default.
     """
     spec = payload.get("canvas")
-    return compile_request(
+    compiled = compile_request(
         payload["request"], image_size_lookup, family=family,
         continues=bool(payload.get("continue")),
         continues_audio=bool(payload.get("continue_audio")),
@@ -4291,6 +5172,10 @@ def compile_segment(payload, image_size_lookup=None, family=registry.DEFAULT_VID
         # with how firmly it holds where the piece said.
         storyboard=payload.get("storyboard") if (payload.get("storyboard") or {}).get("cells") else None,
         canvas_spec=CanvasSpec(**spec) if spec else None)
+    expected = payload.get("prompt_override_binding")
+    if expected is not None and expected != prompt_binding(compiled):
+        raise CompileError("final-prompt draft references changed; reopen What the model reads and enable Force edit again")
+    return compiled
 
 
 def compile_single(data, image_size_lookup=None):

@@ -85,6 +85,25 @@ CASES = {
         "version": 2, "prompt": "", "models": {}, "aspect": "16:9",
         "segments": [{"prompt": "a kite", "duration_s": 4}],
     },
+    "legacy global/card Face switches": {
+        "version": 2, "face": {"on": True, "canvas": 640, "denoise": .6},
+        "segments": [{"prompt": "one", "face": "on"},
+                     {"prompt": "two", "face": {"on": True, "canvas": 512}},
+                     {"kind": "clip", "filename": "saved.mp4"}],
+    },
+    "current independent Face choices": {
+        "version": 2, "face_schema": 1,
+        "segments": [{"prompt": "one", "face": {"on": True, "canvas": 640, "denoise": .6}},
+                     {"prompt": "two", "face": {"on": False, "canvas": 512, "denoise": .4}}],
+    },
+    "invalid boolean Face marker": {
+        "version": 2, "face_schema": True,
+        "segments": [{"prompt": "old", "face": {"on": True}}],
+    },
+    "current lone-shot Face choice": {
+        "version": 1, "face_schema": 1, "prompt": "one",
+        "face": {"on": True, "canvas": 640, "denoise": .6},
+    },
 }
 
 SCRIPT = """
@@ -151,9 +170,17 @@ check("a weightless blob is still given a models block",
 
 check("a fresh node stays an empty object", compiler.as_piece({}), {})
 check("an empty strip is left alone",
-      compiler.as_piece(CASES["an empty strip"]), CASES["an empty strip"])
+      compiler.as_piece({**CASES["an empty strip"], "face_schema": 1}),
+      {**CASES["an empty strip"], "face_schema": 1})
 check("a written timeline is left alone",
-      compiler.as_piece(CASES["a written timeline"]), CASES["a written timeline"])
+      compiler.as_piece({**CASES["a written timeline"], "face_schema": 1}),
+      {**CASES["a written timeline"], "face_schema": 1})
+legacy = CASES["legacy global/card Face switches"]
+check("migration does not mutate a legacy caller",
+      legacy["segments"][0]["face"], "on")
+current = CASES["current independent Face choices"]
+check("current-schema lifting retains the original owner identity",
+      compiler.as_piece(current) is current, True)
 check("lifting twice is lifting once",
       compiler.as_piece(compiler.as_piece(CASES["a written creator"])), written)
 check("a non-dict is handed back rather than refused here",

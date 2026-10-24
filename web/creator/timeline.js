@@ -11,30 +11,39 @@ import { api } from "../../../scripts/api.js";
 import { compiledPrompt, probe, viewUrl, primeSettings, buildPlate, stillUrl } from "./api.js";
 import { openRestyle } from "./restyle.js";
 import { CastShelf, CAST_REFERENCE_TAKES } from "./cast.js";
+import { pieceReferenceFields } from "./reference-fields.js";
 import { castFamilies, keepAsMod } from "./refmod.js";
 import { clearButton } from "./clear.js";
-import { el, icon, mountOverlay, swappable, closeOwnedPopovers } from "./dom.js";
+import { el, icon, svg, mountOverlay, swappable, closeOwnedPopovers, dismissable, placeNear } from "./dom.js";
 import { createDisclosure } from "./disclosure.js";
+import { mediaCountPills } from "./media-counts.js";
 import { CreatorEditor, pickTakes, takesHelp } from "./editor.js";
 import { t } from "./i18n.js";
-import { openLoras, loraBlock, loraBase, settlePins } from "./loras.js";
+import { openLoras, globalLoraOptions, loraBlock, loraBase, settlePins } from "./loras.js";
 import { openPicker } from "./picker.js";
 import { openPresetLibrary, styleCastMember } from "./presetlib.js";
 import * as P from "./presets.js";
 import { PromptBox, openEditorSheet } from "./prompt.js";
+import { openCompiledPrompt, refineSources } from "./prompt-sections.js";
+import { passDraft, clearRuntimePrompts } from "./prompt-overrides.js";
 import { openSettings } from "./settings.js";
 import { SoundLane } from "./soundlane.js";
 import { openTrim, trimLabel } from "./trim.js";
 import { openPicture, editPicture, asPick, cropLabel } from "./picture.js";
 import { isVisualReference, previewable, openReferencePreview } from "./reference-preview.js";
+import { cardPreviewSource, createCardPreview, pauseCardPreviews } from "./card-preview.js";
+import { createTimelineScrollbars } from "./timeline-scrollbars.js";
+import { readViewPrefs, patchViewPrefs } from "./viewprefs.js";
 import { openAspectPopover, openResolutionPopover, openChoicePopover, facesPill, neuralPill, guideLoraPill, stepperPill,
          aspectGlyph, resolutionPillText, PILL_GLYPH } from "./pills.js";
-import { refine, refineButton, chosenModel as refineModel } from "./refine.js";
+import { refine, refineField, withRefineOwner, refineButton, chosenModel as refineModel } from "./refine.js";
 import { adopted, blobIO, samplingBar, segmentSeedPill } from "./sampling.js";
 import { Stage, stageSource } from "./stage.js";
 import { watchSubmittedPrompts, submittedPrompt } from "./queue.js";
 import { familyPill, weightsPill, loadCatalog, adoptWeights, rememberedWeights } from "./models.js";
 import * as S from "./state.js";
+import { timelineSummary, observeTimelineSummary } from "./timeline-summary.js";
+import { confirmStoryboardChange, storyboardGuidance } from "./storyboard-notice.js";
 import * as Turbo from "./turbo.js";
 import * as Guide from "./guide.js";
 import {
@@ -284,14 +293,9 @@ export function openTimeline(options) {
   return new Promise((resolve) => new Timeline(options, resolve).mount());
 }
 
-/**
- * Card width from duration. Compressed rather than linear: durations run 1 s to
- * 60 s, and at any scale that keeps a 1-second card wide enough for its own
- * buttons a 60-second one would be most of a metre. Square root keeps the
- * ordering legible — a longer shot is visibly a wider card — without that.
- * The lane in the node body stays strictly proportional; that is its whole job.
- */
-const cardWidth = (seconds) => 132 + Math.round(Math.sqrt(seconds) * 26);
+// Card controls have a stable base. Ready media uses the shared aspect-class
+// widths in CSS; only the sound lane and duration readouts represent time.
+const cardWidth = () => 358;
 
 /** What a card or a pass looks like when it is not in the next render: solid
  *  because the film already exists, perforated because it does not. Empty for
@@ -325,8 +329,13 @@ const holdSkin = (head, gone) => (S.isHeld(head)
  * @param {number} card      which card's pass to answer for
  * @param {number} seed      the piece's seed, the number the node will queue
  */
-async function compiledFor(timeline, card, seed) {
-  const answer = await compiledPrompt(JSON.parse(S.serializeTimeline(timeline)), seed);
+async function compiledFor(timeline, card, seed, changed = () => {}) {
+  const source = JSON.parse(S.serializeTimeline(timeline));
+  let answer = await compiledPrompt(source, seed), draftReset = false;
+  if (answer.problem && source.prompt_overrides && /final-prompt draft/i.test(answer.problem)) {
+    clearRuntimePrompts(timeline); delete source.prompt_overrides; changed();
+    draftReset = true; answer = await compiledPrompt(source, seed);
+  }
   if (answer.problem) return { problem: answer.problem };
 
   const index = answer.cards?.[card] ?? 0;
@@ -344,19 +353,48 @@ async function compiledFor(timeline, card, seed) {
   const total = answer.passes.length;
   const held = Object.keys(answer.cards ?? {})
     .filter((key) => answer.cards[key] === index).length;
+  // Pass count is not the workflow mode: a chain with one segment still has
+  // only one compiled pass. Keep the saved/selected mode distinct from this
+  // prompt's actual pass position, using the same source snapshot we compiled.
+  const single = S.isSingle(source);
+  const mixed = !single && total < source.segments.length;
   const note = [
-    total > 1 ? t("pass {n} of {total}", { n: index + 1, total }) : t("one pass"),
+    single ? t("one pass") : mixed ? t("Mixed") : t("chained"),
+    !single || total > 1 ? t("pass {n} of {total}", { n: index + 1, total }) : null,
     held > 1 ? t("{n} shots merged", { n: held }) : null,
     pass.mode,
     pass.overridden ? t("replaced by hand") : null,
   ].filter(Boolean).join(" · ");
-  return { note, text: pass.prompt };
+  const warnings = (pass.warnings ?? []).map((warning) => {
+    const match = String(warning).match(/^The usage rule for @([A-Za-z0-9_]+) mentions @([A-Za-z0-9_]+), but @\2 is not cited in this shot\. Cite @\2 in a segment field to send that reference\.$/);
+    if (match) return t("@{owner}'s rule mentions @{handle}, which is not used in this segment. To send that reference, cite @{handle} in a segment field.",
+      { owner: match[1], handle: match[2] });
+    const stale = String(warning).match(/^Replacement reference @([A-Za-z0-9_-]+) was captured from an earlier file attached as @([A-Za-z0-9_-]+)\. Re-capture it to identify the target in the current video; its original capture is unchanged\.$/);
+    if (stale) return t("Replacement reference @{handle} was captured from an earlier file attached as @{source}. Re-capture it to identify the target in the current video; its original capture is unchanged.",
+      { handle: stale[1], source: stale[2] });
+    const missing = String(warning).match(/^The source video for replacement reference @([A-Za-z0-9_-]+) is not attached here\. Attach the source or re-capture the replacement target\.$/);
+    if (missing) return t("The source video for replacement reference @{handle} is not attached here. Attach the source or re-capture the replacement target.",
+      { handle: missing[1] });
+    const trimmed = String(warning).match(/^Replacement reference @([A-Za-z0-9_-]+) is outside the current trim of @([A-Za-z0-9_-]+)\. Re-capture a frame inside the selected portion\.$/);
+    if (trimmed) return t("Replacement reference @{handle} is outside the current trim of @{source}. Re-capture a frame inside the selected portion.",
+      { handle: trimmed[1], source: trimmed[2] });
+    return warning;
+  });
+  if (draftReset) warnings.unshift(t("The final-prompt draft was disabled because its reference binding changed. Review the current prompt before enabling Force edit again."));
+  const cards = Object.keys(answer.cards ?? {}).filter((key) => answer.cards[key] === index)
+    .map((key) => source.segments[Number(key)]?.card_id);
+  const override = cards.every(Boolean) ? passDraft(timeline, source, cards, pass.base_prompt ?? pass.prompt, changed, pass.prompt_binding) : null;
+  return { text: pass.prompt, tags: pass.tags ?? [], note, warnings, override, loras: pass.loras ?? [],
+    scope: held > 1 ? t("Force edit affects this entire merged pass ({count} segments).", { count: held })
+      : t("Force edit affects only this segment's generation."),
+  };
 }
 
 class Timeline {
-  constructor({ timeline, onCommit, edit = null, io = null, sections = null, soundSnaps = null }, resolve) {
+  constructor({ timeline, onCommit, onPromptCommit = null, edit = null, io = null, sections = null, soundSnaps = null }, resolve) {
     this.timeline = timeline;
     this.onCommit = onCommit;
+    this.onPromptCommit = onPromptCommit ?? onCommit;
     this.sections = sections;
     this.soundSnaps = soundSnaps;
     this.resolve = resolve;
@@ -382,7 +420,16 @@ class Timeline {
     // answer, once per filename for the life of the strip — a file put back
     // shows on the next open, and the refusal reads the disk either way.
     this.gone = new Set();
+    this.storyboardClosed = false;
     this.asked = new Set();
+    // View-only state: never part of creator_data or the generation request.
+    this.audioVersions = { soundscape: 0, music: 0 };
+    this.promptVersion = 0;
+    this.previewMode = readViewPrefs("timeline:preview").preview !== "off";
+    this.cardPreviews = new Set();
+    this.cardPreviewClose = null;
+    this.editors = new Map();
+    this.segmentEditors = new Map();
   }
 
   /**
@@ -411,10 +458,33 @@ class Timeline {
     S.syncTimeline(this.timeline);
     this.onCommit?.();
     this.render();
-    // A handle whose asset just left the pool is no longer a chip, and one
-    // whose asset just joined it becomes one. Skipped while the box has the
-    // caret, which is exactly when nothing here can have changed.
+  }
+
+  refreshReferences(options) {
     this.promptBox?.refresh();
+    this.renderReferenceWarnings();
+    for (const editor of this.editors?.keys() ?? []) editor.refreshReferences(options);
+  }
+
+  renderReferenceWarnings() {
+    if (!this.referenceWarnings) return;
+    const cast = this.timeline.subjects ?? [];
+    const texts = (state) => [state.prompt, state.soundscape, state.music,
+      ...S.promptSectionTexts(state), ...(state.refined?.enabled !== false
+        ? [state.refined?.body, ...Object.values(state.refined?.sections ?? {})] : [])];
+    const missing = new Set(S.missingPromptHandles(texts(this.timeline),
+      S.castAssets(this.timeline), cast));
+    for (const segment of this.timeline.segments) {
+      if (S.isClip(segment)) continue;
+      for (const handle of S.missingPromptHandles(texts(segment),
+        [...(segment.assets ?? []), ...(this.timeline.assets ?? [])], cast, segment.screens ?? [])) {
+        missing.add(handle);
+      }
+    }
+    this.referenceWarnings.hidden = !missing.size;
+    this.referenceWarnings.textContent = missing.size
+      ? t("Unconnected tags: {handles}. Your text is kept. Attach a reference or cast member with the same handle to reconnect automatically.",
+        { handles: [...missing].map((handle) => `@${handle}`).join(", ") }) : "";
   }
 
   /**
@@ -430,7 +500,9 @@ class Timeline {
       placeholder,
       ...(rows ? { rows: String(rows) } : {}),
       oninput: (event) => {
+        this.audioEdited(key);
         this.timeline[key] = event.target.value;
+        this.updateSectionSummaries();
         this.onCommit?.();
         this.renderBar();
         // The pool shelf reads these fields — a citation typed into the global
@@ -438,6 +510,7 @@ class Timeline {
         // shelf holds no caret, so rebuilding it here loses nothing.
         this.renderPool();
         this.renderCast();
+        this.renderReferenceWarnings();
       },
     });
     box.value = this.timeline[key] ?? "";
@@ -475,7 +548,9 @@ class Timeline {
     const box = new PromptBox({
       getState: () => this.timeline,
       onInput: (text) => {
+        this.promptVersion = (this.promptVersion ?? 0) + 1;
         this.timeline.prompt = text;
+        this.updateSectionSummaries();
         this.onCommit?.();
         this.renderBar();
         // A citation typed here flips a pool chip from idle to "everywhere" as
@@ -483,6 +558,7 @@ class Timeline {
         // nothing — and `renderPool` is why this cannot be a full `render`.
         this.renderPool();
         this.renderCast();
+        this.renderReferenceWarnings();
       },
       attachBlocked: () => null,
       attachedLabel: () => t("Piece references"),
@@ -542,8 +618,10 @@ class Timeline {
   /** The global prompt, in the state and in the box that shows it. The refiner
    *  and the pool shelf both write it from outside the box. */
   setGlobalPrompt(text) {
+    this.promptVersion = (this.promptVersion ?? 0) + 1;
     this.timeline.prompt = text;
     this.promptBox?.setValue(text);
+    this.updateSectionSummaries();
   }
 
   sectionOptions(key) {
@@ -553,18 +631,283 @@ class Timeline {
     };
   }
 
+  /** A collapsed header reads its actual input, not generated audio or a
+   *  prediction about what a model will produce. Plain text only. */
+  sectionPreview(key) {
+    const value = String(this.timeline[key] ?? "").replace(/\s+/g, " ").trim();
+    if (!value) return t(key === "prompt" ? "Empty" : "Empty · model chooses");
+    if (value.toUpperCase() === "N/A") return "N/A";
+    const chars = Array.from(value);
+    return chars.length > 84 ? `${chars.slice(0, 84).join("")}…` : value;
+  }
+
+  updateSectionSummaries() {
+    this.promptSection?.setHint("");
+    this.soundscapeSection?.setHint("");
+    this.musicSection?.setHint("");
+  }
+
+  /** Each plain Refine owns one input; only Refine all owns the whole piece. */
+  fieldRefineButton(key, input) {
+    const label = key === "prompt" ? "global_prompt"
+      : key === "soundscape" ? "overall_soundscape" : "non_diegetic_music";
+    const control = refineButton({
+      run: (options) => this.refineTimelineField(key, input, options),
+      family: () => S.pieceFamily(this.timeline),
+      label: "Refine", className: "mmc-pill mmc-tl-field-refine",
+      title: t("Refine only {field}. Other fields stay unchanged.", { field: label }),
+    });
+    control.setAttribute("data-mmc-refine-field", key);
+    control.firstElementChild.setAttribute("data-mmc-refine-field", key);
+    control.firstElementChild.setAttribute("aria-label", `${label}: ${t("Refine")}`);
+    return control;
+  }
+
+  fieldValue(key, input) {
+    return key === "prompt" ? (this.promptBox?.getValue?.() ?? this.timeline.prompt ?? "")
+      : input.value;
+  }
+
+  /** Two presses clear only the global input. Confirmation never survives a
+   *  changed value, replaced owner, focus loss or leaving this header. */
+  globalPromptClearButton() {
+    const label = t("Clear prompt");
+    const warning = t("Confirm clearing content");
+    const title = t("Clear only the global prompt. Other fields stay unchanged.");
+    let armed = null;
+    let head = null;
+    const cancel = () => {
+      head?.removeEventListener("pointerleave", cancel);
+      head = null;
+      armed = null;
+      button.classList.remove("armed");
+      button.textContent = label;
+      button.title = title;
+      button.setAttribute("aria-label", `global_prompt: ${label}`);
+    };
+    const button = el("button", {
+      type: "button", class: "mmc-pill mmc-tl-prompt-clear", text: label,
+      title, "aria-label": `global_prompt: ${label}`,
+      "data-mmc-clear-field": "prompt",
+      onblur: cancel,
+      onpointerleave: (event) => {
+        if (armed && head?.contains(event.relatedTarget)) return;
+        cancel();
+      },
+      onkeydown: (event) => {
+        if (event.repeat && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault(); event.stopPropagation(); return;
+        }
+      },
+      onclick: async (event) => {
+        event.stopPropagation();
+        const input = this.promptBox;
+        if (!armed) {
+          if (!button.isConnected || !input?.root.isConnected || !this.modal?.isConnected) return;
+          armed = { owner: this.timeline, box: input, value: this.timeline.prompt,
+            owned: Object.hasOwn(this.timeline, "prompt"), visible: input.getValue(), version: this.promptVersion };
+          head = button.closest(".mmc-tl-section-head");
+          head?.addEventListener("pointerleave", cancel);
+          button.classList.add("armed");
+          button.textContent = warning;
+          button.title = warning;
+          button.setAttribute("aria-label", `global_prompt: ${warning}`);
+          return;
+        }
+        const saved = armed;
+        const fresh = button.isConnected && input?.root.isConnected && this.modal?.isConnected
+          && this.timeline === saved.owner && input === saved.box
+          && this.timeline.prompt === saved.value && input.getValue() === saved.visible
+          && Object.hasOwn(this.timeline, "prompt") === saved.owned && this.promptVersion === saved.version;
+        cancel();
+        if (!fresh || (!saved.value && !saved.visible)) return;
+        try {
+          // The same live-owner lock as Refine all prevents its late reply from
+          // replacing a just-cleared field. No refiner/API job runs here.
+          await withRefineOwner(saved.owner, () => {
+            this.setGlobalPrompt("");
+            this.onPromptCommit?.();
+            this.renderBar(); this.renderPool(); this.renderCast();
+            const status = this.fieldRefineStatus?.prompt;
+            if (status) { status.textContent = ""; status.hidden = true; }
+          });
+        } catch (error) {
+          const status = this.fieldRefineStatus?.prompt;
+          if (this.timeline === saved.owner && status?.isConnected) {
+            status.textContent = String(error.message || error); status.hidden = false;
+          }
+        }
+      },
+    });
+    this.cancelGlobalPromptClear = cancel;
+    return button;
+  }
+
+  async refineTimelineField(key, input, options) {
+    if (!["prompt", "soundscape", "music"].includes(key)
+        || !input.isConnected || !this.modal?.isConnected) return;
+    const owner = this.timeline;
+    const value = owner[key], owned = Object.hasOwn(owner, key);
+    const visible = this.fieldValue(key, input);
+    const version = key === "prompt" ? this.promptVersion : this.audioVersions[key];
+    const fresh = () => this.timeline === owner && this.modal?.isConnected && input.isConnected
+      && input === (key === "prompt" ? this.promptBox?.root
+        : key === "soundscape" ? this.soundscapeBox : this.musicBox)
+      && owner[key] === value && Object.hasOwn(owner, key) === owned
+      && this.fieldValue(key, input) === visible
+      && (key === "prompt" ? this.promptVersion : this.audioVersions[key]) === version;
+    const status = this.fieldRefineStatus?.[key];
+    const say = (message) => {
+      if (!status?.isConnected) return;
+      status.textContent = message;
+      status.hidden = !message;
+    };
+    say("");
+    try {
+      await withRefineOwner(owner, async () => {
+        const result = await refineField({ kind: "timeline",
+          data: JSON.parse(S.serializeTimeline(owner)) }, key, options);
+        if (!fresh()) {
+          say(t("The field changed while refining. No fields were changed."));
+          return;
+        }
+        if (result?.scope !== "field" || result.target_scope !== "timeline" || result.field !== key
+            || typeof result.body !== "string" || !result.body.trim()) {
+          throw new Error(t("the refiner returned an invalid result for this field"));
+        }
+        // No takePiece/commit: neither sibling fields nor rewrite/LoRA/strip
+        // metadata belong to this operation, even if a reply contains extras.
+        if (key === "prompt") this.setGlobalPrompt(result.body);
+        else {
+          this.audioEdited(key);
+          owner[key] = result.body;
+          input.value = result.body;
+        }
+        this.updateSectionSummaries();
+        this.onPromptCommit?.();
+        this.renderBar();
+        this.renderPool();
+        this.renderCast();
+        say((Array.isArray(result.problems) ? result.problems : []).map(String).join("\n"));
+      });
+    } catch (error) {
+      if (this.timeline === owner && this.modal?.isConnected) say(String(error.message || error));
+    }
+  }
+
+  audioEdited(key) {
+    if (key !== "soundscape" && key !== "music") return;
+    this.audioVersions ??= { soundscape: 0, music: 0 };
+    this.audioVersions[key]++;
+    this.clearAudioUndo(key);
+  }
+
+  clearAudioUndo(key) {
+    if (key && this.audioUndo?.key !== key) return;
+    clearTimeout(this.audioUndoTimer);
+    if (this.audioUndoHost?.contains(document.activeElement)) this.audioUndoAnchor?.focus();
+    this.audioUndo = null;
+    this.audioUndoHost?.replaceChildren();
+    if (this.audioUndoHost) this.audioUndoHost.hidden = true;
+  }
+
+  showAudioUndo(record, anchor) {
+    if (!this.audioUndoHost) return;
+    this.clearAudioUndo();
+    this.audioUndo = record;
+    this.audioUndoAnchor = anchor;
+    this.audioUndoHost.hidden = false;
+    this.audioUndoHost.replaceChildren(
+      el("span", { text: t("{field} set to N/A", { field: record.label }) }),
+      el("button", { type: "button", class: "mmc-pill mmc-tl-na-undo", text: t("Undo"),
+        title: t("Restore only this field's previous text"), onclick: () => this.undoAudioField() }),
+      el("button", { type: "button", class: "mmc-ghost mmc-tl-na-dismiss", text: "✕",
+        title: t("Dismiss"), "aria-label": t("Dismiss"), onclick: () => this.clearAudioUndo() }),
+    );
+    const expire = () => {
+      if (!this.audioUndo) return;
+      // Do not remove the button while a keyboard user is reading/focusing it.
+      if (this.audioUndoHost.contains(document.activeElement)) {
+        this.audioUndoTimer = setTimeout(expire, 1000);
+      } else this.clearAudioUndo();
+    };
+    this.audioUndoTimer = setTimeout(expire, 8000);
+  }
+
+  undoAudioField() {
+    const saved = this.audioUndo;
+    const input = saved?.key === "soundscape" ? this.soundscapeBox : this.musicBox;
+    if (!saved || saved.owner !== this.timeline || this.timeline[saved.key] !== "N/A"
+        || input?.value !== "N/A" || this.audioVersions[saved.key] !== saved.version
+        || this.timeline.refined !== saved.refined) {
+      this.clearAudioUndo();
+      return false;
+    }
+    if (saved.owned) this.timeline[saved.key] = saved.value;
+    else delete this.timeline[saved.key];
+    input.value = saved.value ?? "";
+    this.audioEdited(saved.key);
+    this.commit();
+    return true;
+  }
+
   noAudioButton(key, input, label) {
     const title = t("Set {field} to N/A", { field: label });
-    return el("button", {
+    const warning = t("Entered content will be deleted and replaced with N/A");
+    // Transient, field-local confirmation. Nothing is written to the piece
+    // until a second press still refers to the same field contents/version.
+    let armed = null;
+    let confirmationHead = null;
+    const cancel = () => {
+      confirmationHead?.removeEventListener("pointerleave", cancel);
+      confirmationHead = null;
+      armed = null;
+      button.classList.remove("armed");
+      button.textContent = "N/A";
+      button.title = title;
+      button.setAttribute("aria-label", title);
+    };
+    const button = el("button", {
       type: "button", class: "mmc-pill mmc-tl-na", text: "N/A",
       title, "aria-label": title,
+      onpointerleave: (event) => {
+        // A wrapped warning can move away from the pointer on narrow headers.
+        // Allow reaching it within this header; leaving the header still cancels.
+        if (armed && confirmationHead?.contains(event.relatedTarget)) return;
+        cancel();
+      },
+      onblur: cancel,
       onclick: (event) => {
         event.stopPropagation();
+        if (!armed) {
+          armed = { owner: this.timeline, value: this.timeline[key], input: input.value,
+            owned: Object.hasOwn(this.timeline, key), version: this.audioVersions?.[key] };
+          confirmationHead = button.closest(".mmc-tl-section-head");
+          confirmationHead?.addEventListener("pointerleave", cancel);
+          button.classList.add("armed");
+          button.textContent = warning;
+          button.title = warning;
+          button.setAttribute("aria-label", `${label}: ${warning}`);
+          return;
+        }
+        const fresh = button.isConnected && input.isConnected && this.timeline === armed.owner
+          && this.timeline[key] === armed.value && input.value === armed.input
+          && Object.hasOwn(this.timeline, key) === armed.owned
+          && this.audioVersions?.[key] === armed.version;
+        cancel();
+        if (!fresh) return;
+        if (this.timeline[key] === "N/A" && input.value === "N/A") return;
+        const previous = { owner: this.timeline, key, label, value: this.timeline[key],
+          owned: Object.hasOwn(this.timeline, key), refined: this.timeline.refined };
+        this.audioEdited(key);
         this.timeline[key] = "N/A";
         input.value = "N/A";
         this.commit();
+        this.showAudioUndo({ ...previous, refined: this.timeline.refined,
+          version: this.audioVersions[key] }, event.currentTarget);
       },
     });
+    return button;
   }
 
   mount() {
@@ -574,6 +917,8 @@ class Timeline {
       ...this.sectionOptions("global_prompt"),
       // Display label only. The serialized key remains `prompt`.
       title: "global_prompt", content: this.promptBox.frame,
+      summary: true, inlineActions: true, actionsBeforeHint: true,
+      actions: [this.globalPromptClearButton(), this.fieldRefineButton("prompt", this.promptBox.root)],
       onBeforeCollapse: () => this.promptBox.closeMenu(),
     });
     this.promptBox.root.setAttribute("aria-labelledby", this.promptSection.titleId);
@@ -596,20 +941,37 @@ class Timeline {
     });
 
     this.soundscapeSection = createDisclosure({ ...this.sectionOptions("overall_soundscape"),
-      title: t("overall_soundscape"), content: this.soundscapeBox, inlineActions: true,
-      actions: [this.noAudioButton("soundscape", this.soundscapeBox, t("overall_soundscape"))] });
+      title: t("overall_soundscape"), content: this.soundscapeBox, inlineActions: true, actionsBeforeHint: true,
+      summary: true,
+      actions: [this.noAudioButton("soundscape", this.soundscapeBox, t("overall_soundscape")),
+        this.fieldRefineButton("soundscape", this.soundscapeBox)] });
     this.musicSection = createDisclosure({ ...this.sectionOptions("non_diegetic_music"),
-      title: t("non_diegetic_music"), content: this.musicBox, inlineActions: true,
-      actions: [this.noAudioButton("music", this.musicBox, t("non_diegetic_music"))] });
+      title: t("non_diegetic_music"), content: this.musicBox, inlineActions: true, actionsBeforeHint: true,
+      summary: true,
+      actions: [this.noAudioButton("music", this.musicBox, t("non_diegetic_music")),
+        this.fieldRefineButton("music", this.musicBox)] });
+    this.fieldRefineStatus = {};
+    for (const [key, section] of [["prompt", this.promptSection],
+      ["soundscape", this.soundscapeSection], ["music", this.musicSection]]) {
+      const status = el("div", { class: "mmc-tl-field-refine-status", role: "status",
+        "aria-live": "polite", hidden: true });
+      this.fieldRefineStatus[key] = status;
+      section.root.append(status);
+    }
     this.soundscapeBox.setAttribute("aria-labelledby", this.soundscapeSection.titleId);
     this.musicBox.setAttribute("aria-labelledby", this.musicSection.titleId);
     this.audioHost = el("div", { class: "mmc-tl-audio" }, [
       this.soundscapeSection.root, this.musicSection.root,
     ]);
+    this.audioUndoHost = el("div", { class: "mmc-tl-audio-undo", hidden: true,
+      role: "status", "aria-live": "polite" });
+    this.referenceWarnings = el("div", { class: "mmc-warn mmc-tl-reference-warnings",
+      role: "status", "aria-live": "polite", hidden: true });
 
     this.poolHost = el("div", { class: "mmc-tl-pool" });
     this.poolSection = createDisclosure({
       ...this.sectionOptions("references"),
+      actionsBeforeHint: true,
       title: t("Piece references"),
       onBeforeCollapse: () => closeOwnedPopovers(this.poolSection.body),
     });
@@ -618,14 +980,25 @@ class Timeline {
     this.poolHost.append(this.poolSection.root, this.poolWarning);
     this.castHost = el("div", { class: "mmc-tl-cast" });
     this.barHost = el("div", { class: "mmc-tl-bar" });
+    this.summaryHost = el("div", { class: "mmc-tl-summary-row" });
     this.loraHost = el("div", { class: "mmc-tl-loras" });
+    this.navigationHost = el("div", { class: "mmc-tl-navigation" });
     this.stripHost = el("div", { class: "mmc-tl-strip" });
-    // A trackpad swipes sideways on its own; a wheel only ever sends deltaY,
-    // and without this the strip is unreachable for anyone using one.
+    // Cards scroll the Timeline vertically. The 32px band above the horizontal
+    // scrollbar is the intentional, forgiving place to wheel along the strip.
     this.stripHost.addEventListener("wheel", (event) => {
-      if (event.deltaX || !event.deltaY) return;
+      if (event.ctrlKey || (!event.deltaX && !event.deltaY)) return;
+      const body = this.stripHost.closest(".mmc-tl-body");
+      if (!body) return;
+      const bounds = this.stripHost.getBoundingClientRect();
+      const sideways = event.clientY >= bounds.bottom - 32
+        && this.stripHost.scrollWidth > this.stripHost.clientWidth + 1;
+      const unit = event.deltaMode === 1 ? 16
+        : event.deltaMode === 2 ? (sideways ? this.stripHost.clientWidth : body.clientHeight) : 1;
       event.preventDefault();
-      this.stripHost.scrollLeft += event.deltaY;
+      if (sideways) {
+        this.stripHost.scrollLeft += (Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY) * unit;
+      } else body.scrollTop += event.deltaY * unit;
     }, { passive: false });
     // Under the strip, because it is under the strip in what it describes: the
     // cards are what the piece is made of and the lane is what it is cut to.
@@ -633,28 +1006,32 @@ class Timeline {
     // strip's.
     this.sound = new SoundLane({
       read: () => this.timeline,
+      sectionOptions: this.sectionOptions("sound"),
       snaps: this.soundSnaps,
       onCommit: () => this.commit(),
       flash: (message) => this.flash?.(message),
     });
 
     this.modal = el("div", { class: "mmc-modal mmc-tl-modal" }, [
-      el("div", { class: "mmc-modal-head" }, [
-        el("span", { class: "mmc-tab", "aria-selected": "true", text: t("Timeline") }),
+      el("div", { class: "mmc-modal-head mmc-tl-header" }, [
+        el("span", { class: "mmc-tab mmc-tl-heading", "aria-selected": "true", text: t("Timeline") }),
+        el("span", { class: "mmc-tl-header-divider", "aria-hidden": "true" }),
+        this.barHost,
         el("button", { class: "mmc-close", text: "✕", title: t("Close"), onclick: () => this.close() }),
       ]),
       el("div", { class: "mmc-tl-body" }, [
-        this.promptSection.root, this.audioHost, this.poolHost, this.castHost,
-        this.barHost, this.loraHost, this.stripHost, this.sound.host,
+        this.promptSection.root, this.audioHost, this.audioUndoHost, this.referenceWarnings, this.poolHost, this.castHost,
+        this.summaryHost, this.loraHost, this.navigationHost, this.stripHost, this.sound.host,
       ]),
     ]);
 
     this.overlay = el("div", {
-      class: "mmc-overlay",
+      class: "mmc-overlay mmc-tl-overlay",
       onpointerdown: (event) => { if (event.target === this.overlay) this.close(); },
     }, [this.modal]);
 
-    this.unmount = mountOverlay(this.overlay, () => this.close());
+    this.unmount = mountOverlay(this.overlay, () => this.onEscape());
+    this.scrollbars = createTimelineScrollbars(this.modal.querySelector(":scope > .mmc-tl-body"), this.stripHost);
     this.render();
     if (this.openOnMount != null && this.timeline.segments[this.openOnMount]) {
       this.edit(this.openOnMount);
@@ -663,13 +1040,53 @@ class Timeline {
   }
 
   close() {
+    this.compiledView?.close();
+    this.storyboardClosed = true;
+    this.disposePoolNamePress();
+    for (const close of this.editors?.values() ?? []) close();
+    this.editors?.clear();
+    for (const editor of this.segmentEditors?.values() ?? []) editor.destroy();
+    this.segmentEditors?.clear();
+    closeOwnedPopovers(this.modal);
+    this.storyboardNoticeClose?.();
+    this.storyboardNoticeClose = null;
+    this.storyboardNoticeCurrent = null;
+    this.cancelGlobalPromptClear?.();
+    this.summaryFit?.disconnect();
+    this.poolFieldFit?.disconnect();
+    if (this.poolFitFrame != null) cancelAnimationFrame(this.poolFitFrame);
+    this.poolFitFrame = null;
+    this.sound?.destroy?.();
+    this.scrollbars?.destroy();
+    this.scrollbars = null;
+    this.clearCardPreviews();
+    this.clearAudioUndo();
+    this.jumpMenu?.close();
+    clearTimeout(this.jumpTimer);
+    this.jumpTarget?.classList.remove("mmc-tl-jump-target");
     this.unmount();
     this.resolve();
+  }
+
+  onEscape() {
+    // The document capture listener runs before Sound's local tool listener.
+    // Leave Zoom mode first; an ordinary second Escape still closes Timeline.
+    if (this.sound?.dismissZoomTool?.()) return;
+    this.close();
   }
 
   // ---- render ---------------------------------------------------------------
 
   render() {
+    if (this.storyboardNoticeCurrent && !this.storyboardNoticeCurrent()) {
+      this.storyboardNoticeClose?.();
+      this.storyboardNoticeClose = null;
+      this.storyboardNoticeCurrent = null;
+    }
+    this.updateSectionSummaries();
+    if (this.audioUndo && (this.audioUndo.owner !== this.timeline
+        || this.timeline[this.audioUndo.key] !== "N/A"
+        || this.timeline.refined !== this.audioUndo.refined)) this.clearAudioUndo();
     // The global prompt is the same field either way but lands in a different
     // place: in front of every segment when chained, at the head of Shot 1's
     // description when not — which is where the guide puts the style and the
@@ -689,45 +1106,20 @@ class Timeline {
     // not something every family a later version adds will have.
     this.sound.host.hidden = !S.familyOf(this.timeline).capabilities?.audio?.supplied;
     if (!this.sound.host.hidden) this.sound.render();
+    this.refreshReferences();
   }
 
   /**
-   * The global stack, named, under the pill that counts it.
-   *
-   * The pill has always said "2 LoRAs" and opened the manager, which meant the
-   * only way to see *which* two — or to take one out of the run for a
-   * comparison — was to open a modal over this one and read the lit cards.
-   * The chips are the same ones the Creator face wears, doing the same four
-   * things, so a stack looks and behaves the same wherever the piece is being
-   * written. Nothing is drawn when the stack is empty: the pill is where the
-   * feature is introduced.
+   * The global stack is edited inside the timeline's unified LoRA manager.
+   * Hiding the inline rail gives the timeline room without dropping the existing
+   * family-pin initialization or changing the LoRA pill's count.
    */
   renderLoras() {
-    // The family's pins go on before the stack is read; see loras.js.
+    // Keep the existing pin initialization even though the inline rail is hidden.
     this.timeline.loras ??= [];
     if (settlePins(this.timeline, S.pieceFamily(this.timeline), () => this.commit())) this.onCommit?.();
-    const entries = this.timeline.loras;
-    this.loraHost.replaceChildren(...(entries.length ? [loraBlock(this.timeline, {
-      family: S.pieceFamily(this.timeline),
-      pinTo: S.pieceFamily(this.timeline),
-      onPinChange: () => this.commit(),
-      targets: S.timelineCheckpoints(this.timeline),
-      // Which of these the turbo switch put there. It is drawn as the switch's
-      // rather than as a file somebody picked — see `loraChip`. The shot face
-      // never had to say this: its rail is the *segment's* stack, and turbo's
-      // LoRA is the piece's, so it only comes into view here.
-      turbo: this.timeline.turbo?.lora || null,
-      // Not the trigger note: a global LoRA's words are prefixed onto each
-      // segment's own prompt, so one line here would have to say "in front of
-      // which" and cannot.
-      triggers: false,
-      // `commit` re-renders, which redraws these chips and the pill counting
-      // them: a mute changes both.
-      onToggle: (entry) => { S.toggleLora(this.timeline, entry.name); this.commit(); },
-      onManage: (entry) => this.openLoras(entry),
-      onSwap: (entry) => this.swapLora(entry),
-      onRemove: (entry) => { S.removeLora(this.timeline, entry.name); this.commit(); },
-    })] : []));
+    this.loraHost.replaceChildren();
+    this.loraHost.hidden = true;
   }
 
   /** Try another file in this LoRA's slot. See `state.replaceLora`. */
@@ -753,7 +1145,8 @@ class Timeline {
    * and every citing segment gets the same reference under the same handle.
    */
   renderPool() {
-    const assets = this.timeline.assets ?? [];
+    this.watchPoolNamePress();
+    const assets = S.sortByHandle(this.timeline.assets ?? []);
     // The shelf is references, so on a family that reads none there is nothing
     // to offer — the same answer the rails give, for the same reason. The head
     // and any chips already on it stay: a piece carried over from a family that
@@ -763,11 +1156,8 @@ class Timeline {
     const takesRefs = S.takesReferences(this.timeline);
     this.poolHost.hidden = !takesRefs && !assets.length;
     if (this.poolHost.hidden) return;
-    this.poolSection.setText(t("Piece references"), takesRefs
-      ? t("Attached once. Cite the @handle in the global prompt to use it in every "
-        + "segment, or in a segment's own prompt to use it just there.")
-      : t("{family} reads no attached references — detach these, or put the piece "
-        + "back on a model that reads them.", { family: S.familyOf(this.timeline).label }));
+    this.poolSection.setText(t("Piece references"));
+    this.poolSection.setHintNodes(mediaCountPills(assets));
     this.poolSection.root.classList.toggle("mmc-tl-section-warning", !takesRefs);
     this.poolAdd ??= el("button", {
           type: "button",
@@ -777,13 +1167,241 @@ class Timeline {
           onclick: () => this.addPoolAssets(),
         }, [el("span", { text: "+" }), el("span", { text: t("Add") })]);
     // Mount action once too: a background refresh must not steal its focus.
-    if (takesRefs && !this.poolAdd.isConnected) this.poolSection.setActions(this.poolAdd);
-    else if (!takesRefs) this.poolSection.setActions();
-    this.poolWarning.textContent = this.poolError || "";
-    this.poolWarning.hidden = !this.poolError;
-    this.poolSection.body.replaceChildren(
-      ...(assets.length ? [el("div", { class: "mmc-assets" }, assets.map((a) => this.poolChip(a)))] : []),
-    );
+    this.poolClear ??= clearButton({ written: true, compact: true,
+      what: t("Clear all piece references. Prompt text stays; missing handles show a warning until reconnected."),
+      getOwner: () => this.timeline, getValue: () => S.serializeTimeline(this.timeline),
+      run: () => {
+        const handles = (this.timeline.assets ?? []).map((asset) => asset.handle);
+        closeOwnedPopovers(this.poolSection.body);
+        this.timeline.assets = [];
+        for (const handle of handles) S.releaseFromPiece(this.timeline, handle);
+        this.commit();
+      },
+    });
+    this.poolClear.disabled = !assets.length;
+    if (this.poolClear.disabled) this.poolClear.cancelClear?.();
+    if (!this.poolClear.isConnected || (takesRefs && !this.poolAdd.isConnected)) {
+      this.poolSection.setActions(...(takesRefs ? [this.poolAdd] : []), this.poolClear);
+    }
+    const warnings = [
+      !takesRefs ? t("{family} reads no attached references — detach these, or put the piece "
+        + "back on a model that reads them.", { family: S.familyOf(this.timeline).label }) : "",
+      this.poolError || "",
+      ...S.staleReplacementReferences(assets).map(asset => t(
+        "Replacement reference @{handle} was captured from an earlier file. Re-capture the target in the current video; the original capture is unchanged.",
+        { handle: asset.handle })),
+    ].filter(Boolean);
+    this.poolWarning.textContent = warnings.join("\n");
+    this.poolWarning.hidden = !warnings.length;
+    this.poolRows ??= new Map();
+    for (const asset of this.poolRows.keys()) if (!assets.includes(asset)) this.poolRows.delete(asset);
+    if (!this.poolRowsHost) {
+      this.poolRowsHost = el("div", { class: "mmc-tl-pool-references" });
+      let width = 0;
+      this.poolFieldFit = new ResizeObserver(([entry]) => {
+        if (!entry || !this.poolRowsHost.isConnected) return;
+        const next = entry.contentRect.width;
+        if (next === width) return;
+        width = next;
+        if (next <= 0 || this.poolFitFrame != null) return;
+        // Refit after the grid has changed columns, without replacing fields
+        // or touching their values/carets. Height-only changes (including a
+        // user's manual resize) must not refit or feed back into this observer.
+        this.poolFitFrame = requestAnimationFrame(() => {
+          this.poolFitFrame = null;
+          if (!this.poolRowsHost.isConnected || !this.poolRowsHost.clientWidth) return;
+          for (const row of this.poolRowsHost.children) row.referenceFields.refresh();
+        });
+      });
+      this.poolFieldFit.observe(this.poolRowsHost);
+    }
+    const rows = assets.map((asset) => {
+      let row = this.poolRows.get(asset);
+      if (!row) {
+        const header = el("div", { class: "mmc-assets mmc-piece-reference-head" });
+        const fields = pieceReferenceFields(asset, {
+          available: () => this.poolSection.root.isConnected && (this.timeline.assets ?? []).includes(asset),
+          onChange: () => { this.updatePoolReferenceNotes(row, asset); this.onCommit?.(); },
+          restoreFocus: (namespace, kind) => {
+            if (!row.isConnected || !this.poolSection.isOpen()) return this.poolSection.toggle.focus();
+            const target = row.referenceExtra.isOpen() ? row.querySelector(
+              `.mmc-cast-${kind === "help" ? "help" : "preset-label"}[data-field="${namespace}"]`) : row.referenceExtra.toggle;
+            target?.focus();
+          },
+        });
+        const copy = el("span", { class: "mmc-piece-reference-cast-copy" });
+        const actions = el("div", { class: "mmc-piece-reference-cast-actions" });
+        const notice = el("div", { class: "mmc-piece-reference-cast-note", hidden: true }, [copy, actions]);
+        const extra = createDisclosure({
+          title: t("File-specific settings"), content: fields, initialOpen: false,
+          onBeforeCollapse: () => closeOwnedPopovers(fields),
+          onOpenChange: (opened) => { if (opened) fields.refresh(); },
+        });
+        extra.root.classList.add("mmc-piece-reference-extra");
+        extra.toggle.title = t("Additional instructions for this file only. Shared cast instructions stay in the cast tab.");
+        row = el("div", { class: "mmc-piece-reference-row" }, [header, notice, extra.root]);
+        row.referenceHeader = header;
+        row.referenceFields = fields;
+        row.referenceNotice = notice;
+        row.referenceCopy = copy;
+        row.referenceActions = actions;
+        row.referenceButtons = new Map();
+        row.referenceExtra = extra;
+        row.referenceExtraCount = el("span", { class: "mmc-piece-reference-extra-count",
+          text: t("Additional settings present"),
+          title: t("Open file-specific settings to edit existing instructions; they still apply while folded.") });
+        this.poolRows.set(asset, row);
+      }
+      row.dataset.referenceHandle = asset.handle;
+      this.updatePoolReferenceNotes(row, asset);
+      // File readouts may change after probing; text controls stay mounted.
+      if (!row.referenceHeader.contains(document.activeElement)) row.referenceHeader.replaceChildren(this.poolChip(asset));
+      return row;
+    });
+    const current = [...this.poolRowsHost.children];
+    if (current.length !== rows.length || current.some((row, index) => row !== rows[index])) {
+      // Insert only the rows whose order actually changed. Moving every child
+      // through replaceChildren would discard a focused textarea's caret.
+      for (const row of [...this.poolRowsHost.children]) if (!rows.includes(row)) row.remove();
+      rows.forEach((row, index) => {
+        if (this.poolRowsHost.children[index] !== row) this.poolRowsHost.insertBefore(row, this.poolRowsHost.children[index] ?? null);
+      });
+    }
+    if (this.poolRowsHost.parentElement !== this.poolSection.body) this.poolSection.body.replaceChildren(this.poolRowsHost);
+    for (const row of rows) row.referenceFields.refresh();
+  }
+
+  updatePoolReferenceNotes(row, asset) {
+    const owners = S.assetOwners(this.timeline, asset);
+    const linked = owners.length > 0;
+    const extra = row.referenceExtra;
+    row.referenceNotice.hidden = !linked;
+    extra.head.hidden = !linked;
+    extra.root.classList.toggle("mmc-piece-reference-extra-linked", linked);
+    // Linking must not interrupt an edit already in progress. Unlinking
+    // restores the ordinary file fields without replacing their DOM nodes.
+    if (row.referenceLinked !== linked) {
+      extra.setOpen(!linked || row.referenceFields.contains(document.activeElement));
+      if (!linked && row.referenceNotice.contains(document.activeElement)) {
+        row.referenceFields.querySelector("textarea")?.focus();
+      }
+      row.referenceLinked = linked;
+    }
+    const noted = ["description", "usage_rules"].some(key => String(asset[key] ?? "").trim());
+    const panelNoted = (asset.panels ?? []).some(part =>
+      ["description", "usage_rules"].some(key => String(part[key] ?? "").trim()));
+    extra.setText(t("File-specific settings"));
+    extra.toggle.title = t("Additional instructions for this file only. Shared cast instructions stay in the cast tab.");
+    row.referenceExtraCount.textContent = t(!noted && panelNoted ? "Sheet panel settings present" : "Additional settings present");
+    row.referenceExtraCount.title = t(!noted && panelNoted
+      ? "These instructions belong to individual sheet panels. Edit them in the sheet editor; they still apply while folded."
+      : "Open file-specific settings to edit existing instructions; they still apply while folded.");
+    if (noted || panelNoted) extra.setHintNodes(row.referenceExtraCount);
+    else extra.setHint("");
+    row.referenceCopy.textContent = t("This reference is linked to {who}. Set shared descriptions and usage rules in the cast tab.",
+      { who: owners.map(subject => `@${subject.handle}`).join(", ") });
+    let lostFocus = false;
+    for (const [subject, button] of row.referenceButtons) {
+      if (!owners.includes(subject)) {
+        lostFocus ||= button === document.activeElement;
+        button.remove(); row.referenceButtons.delete(subject);
+      }
+    }
+    for (const subject of owners) {
+      let button = row.referenceButtons.get(subject);
+      if (!button) {
+        button = el("button", {
+          type: "button", class: "mmc-pill mmc-piece-reference-cast-go",
+          onclick: () => {
+            if (!row.isConnected || !(this.timeline.assets ?? []).includes(asset)
+                || !S.assetOwners(this.timeline, asset).includes(subject)) return;
+            this.openCastMember(subject.handle, { forceOpen: true });
+          },
+        });
+        row.referenceButtons.set(subject, button);
+        row.referenceActions.append(button);
+      }
+      button.textContent = owners.length === 1 ? t("Go to cast") : t("Go to @{handle}", { handle: subject.handle });
+      button.title = t("Go to @{handle}", { handle: subject.handle });
+      button.dataset.subjectHandle = subject.handle;
+    }
+    owners.forEach((subject, index) => {
+      const button = row.referenceButtons.get(subject);
+      if (row.referenceActions.children[index] !== button) {
+        row.referenceActions.insertBefore(button, row.referenceActions.children[index] ?? null);
+      }
+    });
+    if (lostFocus && row.isConnected) row.referenceButtons.get(owners[0])?.focus();
+  }
+
+  /** Keep a restored name from moving a pool button under an active press. */
+  watchPoolNamePress() {
+    if (this.poolNamePressRoot === this.poolHost) return;
+    this.disposePoolNamePress();
+    this.pendingPoolNames = new Set();
+    this.poolNamePressEnd = (event) => {
+      if (event && event.pointerId !== this.poolNamePress) return;
+      this.poolNamePress = null;
+      document.removeEventListener("pointerup", this.poolNamePressEnd, true);
+      document.removeEventListener("pointercancel", this.poolNamePressEnd, true);
+      window.removeEventListener("blur", this.poolNamePressBlur);
+      clearTimeout(this.poolNameTimer);
+      this.poolNameTimer = setTimeout(() => {
+        this.poolNameTimer = null;
+        if (this.storyboardClosed) return;
+        const subjects = [...this.pendingPoolNames];
+        this.pendingPoolNames.clear();
+        for (const subject of subjects) this.updatePoolNames(subject);
+      }, 0);
+    };
+    this.poolNamePressBlur = () => this.poolNamePressEnd();
+    this.poolNamePressDown = (event) => {
+      if (this.storyboardClosed || event.button !== 0
+          || !event.target.closest?.("[data-reference-handle]")) return;
+      this.poolNamePress = event.pointerId;
+      document.addEventListener("pointerup", this.poolNamePressEnd, true);
+      document.addEventListener("pointercancel", this.poolNamePressEnd, true);
+      window.addEventListener("blur", this.poolNamePressBlur);
+    };
+    this.poolNamePressRoot = this.poolHost;
+    this.poolNamePressRoot.addEventListener("pointerdown", this.poolNamePressDown, true);
+  }
+
+  disposePoolNamePress() {
+    this.poolNamePressRoot?.removeEventListener("pointerdown", this.poolNamePressDown, true);
+    document.removeEventListener("pointerup", this.poolNamePressEnd, true);
+    document.removeEventListener("pointercancel", this.poolNamePressEnd, true);
+    window.removeEventListener("blur", this.poolNamePressBlur);
+    clearTimeout(this.poolNameTimer);
+    this.poolNamePressRoot = null;
+    this.poolNamePress = null;
+    this.poolNameTimer = null;
+    this.pendingPoolNames?.clear();
+  }
+
+  updatePoolNames(subject) {
+    if (this.poolNamePress != null || this.poolNameTimer != null) {
+      // The linked notice and warnings can change row height too. Defer the
+      // whole passive repaint until after click; the actual name is saved now.
+      this.pendingPoolNames.add(subject);
+      return;
+    }
+    for (const [asset, row] of this.poolRows ?? []) {
+      if (!S.assetOwners(this.timeline, asset).includes(subject)) continue;
+      this.updatePoolReferenceNotes(row, asset);
+      // Keep file buttons mounted: restoring an empty name on blur can be
+      // part of the pointer press that is about to click one of them.
+      const current = row.referenceHeader.firstElementChild;
+      if (!current) continue;
+      const next = this.poolChip(asset);
+      current.className = next.className;
+      current.title = next.title;
+      current.querySelector(".mmc-tl-pool-owners")?.replaceChildren(
+        ...next.querySelector(".mmc-tl-pool-owners").childNodes);
+      const remove = current.querySelector(".mmc-asset-x");
+      if (remove) remove.title = next.querySelector(".mmc-asset-x").title;
+    }
+    this.refreshReferences({ namesOnly: true });
   }
 
   /**
@@ -887,27 +1505,26 @@ class Timeline {
           : t("{file} — no segment cites @{handle} yet, so it rides into none of them.",
               { file: asset.filename, handle: asset.handle }),
     }, [
-      thumb,
-      el("button", {
+      el("div", { class: "mmc-tl-pool-group mmc-tl-pool-identity" }, [thumb, el("button", {
         type: "button",
         class: `mmc-asset-handle mmc-tl-pool-cite mmc-tag-${S.tagIndex(asset.handle)}`,
         text: `@${asset.handle}`,
         title: t("Swap the file behind @{handle} — the handle stays, so every citation still fits.",
                  { handle: asset.handle }),
         onclick: () => this.replacePoolAsset(asset),
-      }),
+      })]),
       // Whose it is, in their own hue — the one the shelf below draws them in,
       // and the one their name wears mid-sentence. The chip is then readable as
       // what it is at a glance: not a second reference, a member's picture.
-      ...owners.map((subject) => el("span", {
+      el("div", { class: "mmc-tl-pool-group mmc-tl-pool-owners" }, [...owners.map((subject) => el("span", {
         class: `mmc-asset-handle mmc-tag-${S.tagIndex(subject.handle || "x")}`,
         text: `@${subject.handle}`,
       })),
-      el("span", { class: "mmc-tl-pool-where", text: where }),
+      el("span", { class: "mmc-tl-pool-where", text: where })]),
       // What a plate is, in the one number that says it — and the pen where
       // the picture can be edited at all: the door itself, right on the chip,
       // same as the card's.
-      ...(S.isPlate(asset) && asset.panels.length > 1
+      el("div", { class: "mmc-tl-pool-group" }, [...(S.isPlate(asset) && asset.panels.length > 1
         ? [el("span", { class: "mmc-asset-panels",
                         text: t("{count} panels", { count: asset.panels.length }) })]
         : S.croppable(asset)
@@ -939,12 +1556,12 @@ class Timeline {
               ? t("Edit sheet…") : t("Combine…"),
             onclick: () => this.editPoolSheet(asset),
           })]
-        : []),
+        : [])]),
       // What of the file is the reference — a character sheet is usually the
       // person, not the sheet's background, a clip is as often borrowed for its
       // camera as for what it shows, and a voice is borrowed for its timbre and
       // not its words. The editor's own chip, same menu.
-      ...(S.takeable(asset) && !(S.isPlate(asset) && asset.panels.length > 1)
+      el("div", { class: "mmc-tl-pool-group" }, [...(S.takeable(asset) && !(S.isPlate(asset) && asset.panels.length > 1)
         ? [el("button", {
         class: "mmc-ghost",
         style: { fontSize: "11px" },
@@ -966,20 +1583,21 @@ class Timeline {
           : t("match: scale to the generation's pixel area. max: 2048 short edge — better identity, "
             + "several times slower, because reference tokens ride through every sampling step."),
         text: t(S.refSize(asset)),
-        onclick: () => {
+        onclick: (event) => {
           asset.ref_size = S.refSize(asset) === "max" ? "match" : "max";
+          event.currentTarget.textContent = t(S.refSize(asset));
           this.commit();
         },
-      })] : []),
-      el("button", {
+      })] : [])]),
+      el("div", { class: "mmc-tl-pool-group" }, [el("button", {
         class: "mmc-asset-x", text: "✕",
         title: owners.length
           ? t("Remove @{handle} — {who} is built out of this file and loses it. Take them "
             + "off the cast shelf instead to remove both at once.",
               { handle: asset.handle, who: owners.map((s) => `@${s.handle}`).join(", ") })
           : cited.length
-            ? t("Remove @{handle} — segments {list} still cite it and will refuse to queue "
-              + "until the mentions are edited out.", { handle: asset.handle, list: cited.join(", ") })
+            ? t("Remove @{handle} — segments {list} still cite it. Their text is kept; "
+              + "reconnect the same handle to clear the warning.", { handle: asset.handle, list: cited.join(", ") })
             : t("Remove @{handle}", { handle: asset.handle }),
         onclick: () => {
           this.timeline.assets = (this.timeline.assets ?? []).filter((a) => a !== asset);
@@ -988,7 +1606,7 @@ class Timeline {
           S.releaseFromPiece(this.timeline, asset.handle);
           this.commit();
         },
-      }),
+      })]),
     ]);
   }
 
@@ -1015,26 +1633,35 @@ class Timeline {
    * mounted here (`renderCast` mounts it once), so this only has to open and
    * scroll.
    */
-  openCastMember(handle) {
+  openCastMember(handle, { forceOpen = false } = {}) {
     this.renderCast();
     // Pressing the name of whoever is already open shuts them — the press is
     // its own undo. Nothing to scroll to in that case: what was being pointed
     // at has just gone.
-    const forceOpen = !this.castShelf?.isExpanded();
-    if (this.castShelf?.openMember(handle, { forceOpen }) !== "opened") return;
+    if (this.castShelf?.openMember(handle, { forceOpen: forceOpen || !this.castShelf.isExpanded() }) !== "opened") return;
     this.castShelf.reveal();
-    this.castHost.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    const target = forceOpen ? this.castShelf.root.querySelector(".mmc-cast-card.open") : this.castHost;
+    target?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    if (forceOpen) target?.querySelector(".mmc-cast-desc")?.focus({ preventScroll: true });
   }
 
   renderCast() {
     this.castShelf ??= new CastShelf({
       disclosure: true,
+      actionsBeforeHint: true,
       ...this.sectionOptions("cast"),
       getCast: () => this.timeline.subjects ?? [],
       setCast: (list) => { this.timeline.subjects = list; },
       family: () => S.pieceFamily(this.timeline),
       getAssets: () => S.castAssets(this.timeline),
-      addAsset: (subject) => this.attachOneCastAsset(subject),
+      addAsset: (subject, options) => this.attachOneCastAsset(subject, options),
+      addReplacementAsset: async (saved, options = {}) => {
+        if (options.isCurrent?.() === false) return null;
+        const entry = this.poolEntry(saved);
+        this.timeline.assets.push(entry);
+        this.commit();
+        return entry;
+      },
       whereCited: (subject) => {
         if (S.subjectCitedGlobally(this.timeline, subject)) {
           return { cited: true, text: t("in every shot") };
@@ -1090,23 +1717,21 @@ class Timeline {
       // reason `setGlobalPrompt` exists. A card's own prompt is drawn by the
       // strip, which `commit` redraws.
       rename: (from, to) => {
+        this.promptVersion = (this.promptVersion ?? 0) + 1;
+        this.audioEdited("soundscape");
+        this.audioEdited("music");
         S.renameSubjectCitations(
           [this.timeline, ...(this.timeline.segments ?? [])], from, to);
         this.promptBox?.setValue(this.timeline.prompt ?? "");
         if (this.soundscapeBox) this.soundscapeBox.value = this.timeline.soundscape ?? "";
         if (this.musicBox) this.musicBox.value = this.timeline.music ?? "";
+        this.updateSectionSummaries();
       },
-      // The pool loses what the departing member alone was built out of. Not a
-      // file another shot writes by hand — a pool asset can be cited straight
-      // from a prompt without any subject in between, and dropping one would
-      // break that sentence.
-      //
-      // The lone shot's row on the same terms, since that is the other half of
-      // what the shelf was built out of.
+      // Remove their sole files even if prose still names them. Written tags
+      // stay in the prompt and are reported as unconnected until reattached.
+      // The lone shot's own files are the other half of this shelf's scope.
       dropAssets: (handles) => {
-        const texts = S.allTexts(this.timeline);
-        const keep = (asset) =>
-          !handles.includes(asset.handle) || S.handleWritten(texts, asset.handle);
+        const keep = (asset) => !handles.includes(asset.handle);
         this.timeline.assets = (this.timeline.assets ?? []).filter(keep);
         const segments = this.timeline.segments ?? [];
         if (segments.length === 1 && segments[0].assets) {
@@ -1116,6 +1741,7 @@ class Timeline {
       // A keystroke in a name or a description: written through, nothing
       // redrawn. The card holds the caret.
       touch: () => this.onCommit?.(),
+      onNameChange: (subject) => this.updatePoolNames(subject),
       commit: () => this.commit(),
     });
     // Mounted once. `replaceChildren` with the same node still detaches and
@@ -1192,11 +1818,14 @@ class Timeline {
    *  same reason: a piece with a pool is not a lone shot any more, so putting a
    *  member's first picture in one would fold the node's face into the strip
    *  summary as the answer to hanging a photograph on somebody. */
-  async attachOneCastAsset() {
+  async attachOneCastAsset(subject = null, { replacement = false, isCurrent = () => true } = {}) {
+    const owner = this.timeline;
     const single = this.timeline.segments.length === 1;
     const host = single ? this.timeline.segments[0] : this.timeline;
     const chosen = await openPicker({
-      kinds: ["image", "video", "audio", "renders", "refmods"],
+      selectionPurpose: "timeline-cast-files",
+      rememberSelection: false,
+      kinds: replacement ? ["image", "video", "renders"] : ["image", "video", "audio", "renders", "refmods"],
       kind: "image",
       referenceOptions: { allowedTakes: CAST_REFERENCE_TAKES },
       capacity: (kind) => {
@@ -1210,7 +1839,8 @@ class Timeline {
       // the background is dropped, and the chip makes the pixels agree.
       plate: this.poolPlate(),
     });
-    if (!chosen?.length) return null;
+    if (!chosen?.length || this.timeline !== owner || !isCurrent()
+        || (host !== owner && !owner.segments.includes(host))) return null;
     if (!Array.isArray(host.assets)) host.assets = [];
     const entries = [];
     for (const picked of chosen) {
@@ -1231,6 +1861,8 @@ class Timeline {
       };
       if (picked.trim) entry.trim = picked.trim;
       if (picked.crop) entry.crop = picked.crop;
+      if (picked.replacement_origin) entry.replacement_origin = { ...picked.replacement_origin };
+      if (picked.replacement_annotation) entry.replacement_annotation = structuredClone(picked.replacement_annotation);
       if (entry.kind === "video") entry.track = S.trackFor(picked);
       if (picked.takes) entry.takes = S.takes({ ...entry, takes: picked.takes });
       host.assets.push(entry);
@@ -1276,6 +1908,7 @@ class Timeline {
   /** The same picker the segments use, filling the pool instead of a card. */
   async addPoolAssets() {
     const chosen = await openPicker({
+      selectionPurpose: "timeline-pool-files",
       kinds: ["image", "video", "audio", "renders", "refmods"],
       kind: "image",
       referenceOptions: {},
@@ -1315,6 +1948,8 @@ class Timeline {
     if (picked.takes) entry.takes = S.takes({ ...entry, takes: picked.takes });
     if (picked.trim) entry.trim = picked.trim;
     if (picked.crop) entry.crop = picked.crop;
+    if (picked.replacement_origin) entry.replacement_origin = { ...picked.replacement_origin };
+    if (picked.replacement_annotation) entry.replacement_annotation = structuredClone(picked.replacement_annotation);
     return entry;
   }
 
@@ -1343,6 +1978,7 @@ class Timeline {
     const spec = this.poolPlate({ edit: true });
     if (!spec) return;
     const chosen = await openPicker({
+      selectionPurpose: "timeline-edit-pool-sheet",
       kinds: ["image", "renders"],
       kind: "image",
       referenceOptions: { takes: S.takes(asset), ref_size: S.refSize(asset) },
@@ -1372,10 +2008,12 @@ class Timeline {
     if (!asset.panels?.length) kept.set(asset.filename, asset);
     this.timeline.assets.splice(at, 1);
     if (sheet) {
-      this.timeline.assets.splice(at, 0, S.plateEntry(
+      const replacement = S.plateEntry(
         { ...sheet, takes: sheet.takes ?? asset.takes, ref_size: sheet.ref_size ?? asset.ref_size },
         S.takenHandles(this.timeline),
-        { plate: "ref", panel: "ref", handle: asset.handle, kept }));
+        { plate: "ref", panel: "ref", handle: asset.handle, kept });
+      for (const key of ["description", "usage_rules"]) if (typeof asset[key] === "string") replacement[key] = asset[key];
+      this.timeline.assets.splice(at, 0, replacement);
     } else {
       // Narrowed to one, or taken apart: the first pick that was a panel steps
       // into the sheet's place and its handle — same rule as the card's.
@@ -1386,6 +2024,8 @@ class Timeline {
         this.timeline.assets.splice(at, 0, {
           handle: asset.handle, kind: "image", role: "reference",
           filename: heir.path, ref_size: heir.ref_size ?? asset.ref_size ?? "max",
+          ...(typeof asset.description === "string" ? { description: asset.description } : {}),
+          ...(typeof asset.usage_rules === "string" ? { usage_rules: asset.usage_rules } : {}),
           ...((heir.takes ?? before?.takes ?? asset.takes)
             ? { takes: heir.takes ?? before?.takes ?? asset.takes } : {}),
           ...(("crop" in heir ? heir.crop : before?.crop)
@@ -1445,6 +2085,7 @@ class Timeline {
    *  editor's `replaceAsset`, which this is the pool-side twin of. */
   async replacePoolAsset(asset) {
     const chosen = await openPicker({
+      selectionPurpose: "timeline-replace-pool-file",
       kinds: [asset.kind, "renders"],
       kind: asset.kind,
       only: asset.kind,
@@ -1572,6 +2213,126 @@ class Timeline {
    * came out the same size. compile.py enforces it by compiling every segment
    * against the geometry the first one resolved; this is where the user sets it.
    */
+  /** A view shortcut, separate from the display-only number badge. The
+   *  selection never writes a shot, opens its editor or starts playback. */
+  segmentNavigator() {
+    const segments = this.timeline.segments ?? [];
+    if (segments.length < 2) return null;
+    const button = el("button", {
+      class: "mmc-tl-jump-select", type: "button", "aria-label": t("Go to segment"),
+      "aria-haspopup": "menu", "aria-expanded": "false",
+      title: t("Find a card without changing its settings"),
+      onclick: (event) => this.openSegmentNavigator(event.currentTarget),
+      onkeydown: (event) => {
+        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+        event.preventDefault(); event.stopPropagation();
+        this.openSegmentNavigator(event.currentTarget, event.key === "ArrowUp");
+      },
+      onpointerdown: (event) => event.stopPropagation(),
+    }, [el("span", { text: t("Go to segment") }),
+        el("span", { text: "⌄", "aria-hidden": "true" })]);
+    this.jumpStatus = el("span", { class: "mmc-tl-jump-status", role: "status", "aria-live": "polite" });
+    return el("div", { class: "mmc-tl-jump" }, [button, this.jumpStatus]);
+  }
+
+  /** A rounded, view-only menu instead of the OS's rectangular select popup. */
+  openSegmentNavigator(anchor, last = false) {
+    const previous = this.jumpMenu;
+    if (previous) {
+      previous.close();
+      if (previous.anchor === anchor) return;
+    }
+    const segments = this.timeline.segments ?? [];
+    if (segments.length < 2 || !anchor.isConnected) return;
+    const menu = el("div", {
+      class: "mmc-pop mmc-tl-jump-menu", role: "menu",
+      "aria-label": t("Go to segment"), "data-capture-wheel": "true",
+    });
+    let close = () => {};
+    const rows = segments.map((segment, index) => el("button", {
+      class: "mmc-tl-jump-option", type: "button", role: "menuitem", tabindex: "-1",
+      text: `${index + 1} · ${this.cardLabel(segment)}`,
+      title: `${index + 1} · ${this.cardLabel(segment)}`,
+      onclick: () => {
+        close();
+        // A raw state replacement must not make a stale label target a new card.
+        if (this.timeline.segments?.[index] === segment) this.jumpToSegment(index);
+      },
+    }));
+    menu.replaceChildren(...rows);
+    const focusRow = (index) => {
+      const row = rows[(index + rows.length) % rows.length];
+      row.focus({ preventScroll: true });
+      row.scrollIntoView({ block: "nearest" });
+    };
+    menu.addEventListener("keydown", (event) => {
+      const index = rows.indexOf(document.activeElement);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault(); event.stopPropagation();
+        focusRow(index + (event.key === "ArrowDown" ? 1 : -1));
+      } else if (event.key === "Home" || event.key === "End") {
+        event.preventDefault(); event.stopPropagation();
+        focusRow(event.key === "Home" ? 0 : rows.length - 1);
+      } else if (event.key === "Escape") {
+        event.preventDefault(); event.stopPropagation(); close();
+      } else if (event.key === "Tab") close();
+    });
+    document.body.appendChild(menu);
+    placeNear(menu, anchor, { above: false });
+    close = dismissable(menu, () => {
+      anchor.setAttribute("aria-expanded", "false");
+      if (this.jumpMenu?.menu === menu) this.jumpMenu = null;
+      if (anchor.isConnected && (document.activeElement === document.body || rows.includes(document.activeElement))) {
+        anchor.focus({ preventScroll: true });
+      }
+    });
+    this.jumpMenu = { anchor, menu, close };
+    anchor.setAttribute("aria-expanded", "true");
+    focusRow(last ? rows.length - 1 : 0);
+  }
+
+  /** Navigation and whole-strip locks belong by the cards, not the settings. */
+  renderNavigation() {
+    this.jumpMenu?.close();
+    const navigation = this.segmentNavigator();
+    const locks = this.holdAllPills();
+    const preview = this.timeline.segments.length ? el("button", {
+      class: `mmc-pill mmc-tl-individual-preview${this.previewMode ? " on" : ""}`,
+      type: "button", "aria-pressed": this.previewMode,
+      title: t("Expand ready cards with hover previews. This does not render or export."),
+      onclick: (event) => {
+        const focused = document.activeElement === event.currentTarget;
+        this.previewMode = !this.previewMode;
+        patchViewPrefs("timeline:preview", { preview: this.previewMode ? "on" : "off" });
+        this.renderNavigation();
+        this.renderStrip();
+        if (focused && this.navigationHost.isConnected) this.navigationHost.querySelector(".mmc-tl-individual-preview")?.focus({ preventScroll: true });
+      },
+    }, [svg('<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>', 13),
+      el("span", { text: t("Ready preview") })]) : null;
+    this.navigationHost.replaceChildren(...(navigation ? [navigation] : []), ...(preview ? [preview] : []), ...locks,
+      ...(locks.length ? [el("span", { class: "mmc-tl-navigation-divider", "aria-hidden": true })] : []));
+    this.navigationHost.hidden = !navigation && !preview && !locks.length;
+  }
+
+  jumpToSegment(index) {
+    if (!Number.isInteger(index) || !this.timeline.segments?.[index]) return false;
+    const card = this.stripHost?.querySelector(`[data-mmc-segment-index="${index}"]`);
+    if (!card) return false;
+    clearTimeout(this.jumpTimer);
+    this.jumpTarget?.classList.remove("mmc-tl-jump-target");
+    this.jumpTarget = card;
+    const reduced = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    card.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "nearest", inline: "center" });
+    card.classList.add("mmc-tl-jump-target");
+    if (this.jumpStatus) this.jumpStatus.textContent = t("Segment {number} is in view", { number: index + 1 });
+    this.jumpTimer = setTimeout(() => {
+      card.classList.remove("mmc-tl-jump-target");
+      if (this.jumpTarget === card) this.jumpTarget = null;
+    }, 1800);
+    return true;
+  }
+
   renderBar() {
     const single = S.isSingle(this.timeline);
     probeAspectSizes(this.timeline, () => this.renderBar(), { all: true });
@@ -1579,17 +2340,16 @@ class Timeline {
     const { width, height, ratio, fromInput } = geometry;
     const rules = rulesFor(S.pieceFamily(this.timeline));
     const res = resolutionPillText(this.timeline, geometry);
-    const seconds = S.timelineSeconds(this.timeline);
-    const frames = S.timelineFrames(this.timeline);
-    const auto = S.hasAutoDuration(this.timeline);
     const count = this.timeline.segments.length;
     // What the queue costs and what a seam sits between: the generations, not
     // the cards. They are the same number until a pass holds more than one.
     const passes = S.passes(this.timeline);
     const active = S.activeGlobalLoras(this.timeline).length;
     const idle = (this.timeline.loras?.length ?? 0) - active;
-    const refined = this.timeline.segments.some((segment) => segment.refined?.body);
+    const refined = this.timeline.segments.some((segment) => segment.refined?.body
+      || Object.keys(segment.refined?.sections ?? {}).length);
     const problem = S.stripProblem(this.timeline);
+    this.renderNavigation();
 
     this.barHost.replaceChildren(
       // Ahead of the mode, which leads everything else: the family decides what
@@ -1669,9 +2429,17 @@ class Timeline {
       // One call for the whole strip, not one per card: continuity across a cut
       // is only kept by a rewrite that wrote both sides of it.
       refineButton({
-        run: (options) => this.refineAll(options),
+        run: async (options) => {
+          try {
+            await withRefineOwner(this.timeline, () => this.refineAll(options));
+          } catch (error) {
+            this.refineError = String(error.message || error);
+            this.renderBar();
+          }
+        },
         family: () => S.pieceFamily(this.timeline),
-        label: refined ? t("Refine again") : t("Refine all"),
+        // Keep the broad operation explicit even after an individual rewrite.
+        label: t("Refine all"),
         className: "mmc-pill mmc-tl-refine",
         title: t("Rewrite {what} into the "
              + "description this piece's model was trained to read, in one pass so the later "
@@ -1689,56 +2457,11 @@ class Timeline {
              + "prompt, soundscape and score the refiner wrote go with them."),
         onclick: () => this.revertAll(),
       }, [el("span", { text: t("Revert all") })])] : []),
-      // The two ends of shooting a piece in parts. Neither is reachable by
-      // going card to card, which always leaves one of them out: locking the
-      // last one is how a shoot *finishes*, and putting the whole strip back is
-      // how it starts over. Drawn only once the strip is shooting in parts, the
-      // same gate the "{s} s next" readout below uses — a strip nobody has held
-      // anything on is not in this mode yet, and the way into it is to click a
-      // card's number.
-      ...this.holdAllPills(),
-      el("div", { class: "mmc-tl-total" }, [
-        // What this queue will actually make, when that is not the whole piece.
-        // The one number that says what holding a card back bought: a strip of
-        // eight cards with seven of them held is six seconds of sampling, not
-        // forty-eight, and nothing else on this bar would say so. Absent while
-        // the two are the same, which they are on every strip that has never
-        // held anything.
-        ...(S.shotInParts(this.timeline) ? [el("b", {
-          class: "mmc-tl-next",
-          text: t("{s} s next", { s: S.sampledSeconds(this.timeline).toFixed(1) }),
-          title: t("The next render generates {s} s of the {total} s this piece runs to. "
-                 + "The rest is either film it already has or cards you are holding back.",
-                   { s: S.sampledSeconds(this.timeline).toFixed(1),
-                     total: seconds.toFixed(1) }),
-        })] : []),
-        el("b", {
-          text: auto ? `~${seconds.toFixed(1)} s` : `${seconds.toFixed(1)} s`,
-          ...(auto ? { title: t("An estimate: a shot on auto is measured by the model "
-                              + "while it renders, so the finished length is not known "
-                              + "until it has.") } : {}),
-        }),
-        el("span", { text: single
-          ? t(count === 1 ? "{count} shot · {frames} frames" : "{count} shots · {frames} frames",
-              { count, frames })
-          : t(count === 1 ? "{count} segment" : "{count} segments", { count }) }),
-      ]),
-      // How many sampler passes this queue costs, which is not obvious from the
-      // strip: a row of cards looks like several small edits, and a merged run
-      // of them is the whole stretch riding on a single denoise.
-      el("div", {
-        class: "mmc-note",
-        title: single
-          ? t("The whole timeline is generated at once, so the shots cost no more than one clip of the same length.")
-          : passes.length === count
-            ? t("Each segment is generated separately and they run one after another.")
-            : t("One generation per pass, run one after another. A pass holding several "
-              + "shots costs no more than one clip of the same length."),
-      }, [
-        el("span", { class: "mmc-note-key", text: t("cost") }),
-        el("span", { text: t(passes.length === 1 ? "{count} generation per queue"
-          : "{count} generations per queue", { count: passes.length }) }),
-      ]),
+    );
+    // The header owns shared settings; the strip keeps its queue facts and
+    // warnings here. Whole-strip locks are rendered beside card navigation.
+    this.summaryHost.replaceChildren(
+      timelineSummary(this.timeline),
       // A refusal the queue would raise, about the strip rather than about one
       // pass. Said here for the same reason the pass's own problems are said
       // under their rail: while the cards are still in front of you and it is
@@ -1752,6 +2475,8 @@ class Timeline {
       // because the call was about all of them.
       ...(this.refineError ? [el("div", { class: "mmc-warn", text: this.refineError })] : []),
     );
+    this.summaryFit?.disconnect();
+    this.summaryFit = observeTimelineSummary(this.summaryHost.querySelector(".mmc-tl-total"));
   }
 
   /**
@@ -1765,6 +2490,8 @@ class Timeline {
    * pass in it at all.
    */
   renderStrip() {
+    this.clearCardPreviews();
+    this.stripHost.classList.toggle("individual-preview", this.previewMode);
     const parts = [];
     const passes = S.passes(this.timeline);
     // Which kept takes have stopped describing their cards. Asked once for the
@@ -1806,6 +2533,36 @@ class Timeline {
     this.stripHost.classList.toggle(
       "has-pass", passes.some((pass) => pass.segments.length > 1));
     this.stripHost.replaceChildren(...parts);
+    // BEGIN looping card titles
+    const fitTitle = (title) => {
+      const track = title.firstElementChild;
+      if (!track?.classList.contains("mmc-tl-title-track")) return;
+      const width = track.getBoundingClientRect().width;
+      title.classList.toggle("scrolling", width > title.clientWidth + 1);
+      title.style.setProperty("--mmc-title-distance", `${width + 48}px`);
+      title.style.setProperty("--mmc-title-duration", `${Math.max(10, (width + 48) / 28)}s`);
+    };
+    this.cardTitleFit = new ResizeObserver((entries) => {
+      for (const { target } of entries) {
+        const title = target.classList.contains("mmc-tl-title-track") ? target.parentElement : target;
+        if (title?.isConnected) fitTitle(title);
+      }
+    });
+    for (const title of this.stripHost.querySelectorAll(".mmc-tl-card-name-button, .mmc-tl-clip-name")) {
+      if (title.classList.contains("mmc-tl-card-name-button")
+          && !S.cardName(this.timeline.segments[Number(title.closest(".mmc-tl-card").dataset.mmcSegmentIndex)])) continue;
+      const text = title.textContent;
+      if (!title.hasAttribute("aria-label")) title.setAttribute("aria-label", text);
+      const track = el("span", {
+        class: "mmc-tl-title-track", text, "aria-hidden": true, "data-mmc-loop-title": text,
+      });
+      title.classList.add("mmc-tl-title-loop");
+      title.replaceChildren(track);
+      this.cardTitleFit.observe(title);
+      this.cardTitleFit.observe(track);
+      fitTitle(title);
+    }
+    // END looping card titles
   }
 
   /**
@@ -2120,7 +2877,8 @@ class Timeline {
         const shown = sheet.length > 0;
         return el("button", {
           class: `mmc-tl-join mmc-tl-join-board${shown ? " on" : ""}`,
-          title: shown
+          "data-storyboard-scope": S.storyboardCards(segment, index) === null ? "global" : "individual",
+          title: this.storyboardScopeLines(index).join("\n") + "\n" + (shown
             ? t("Segment {n} is shown a storyboard of {which}: nine of their frames on one "
               + "sheet, in order, cited as a picture reference so the room, the light and "
               + "where things stand carry across this cut. It runs on the reference "
@@ -2129,7 +2887,7 @@ class Timeline {
                 { n: index + 1, which: passNumbers(sheet) })
             : t("Segment {n} is shown nothing of the shots before it. Click to show it a "
               + "storyboard of them — nine of their frames on one sheet, cited as a "
-              + "picture reference.", { n: index + 1 }),
+              + "picture reference.", { n: index + 1 })),
           onclick: (event) => this.pickStoryboard(event.currentTarget, segment, index),
         }, [icon("storyboard", 13),
             el("span", { text: shown ? t("sees {which}", { which: passNumbers(sheet) })
@@ -2236,6 +2994,7 @@ class Timeline {
     const sub = { previous: t("previous shot"), all: t("piece so far") }[policy];
     return el("button", {
       class: `mmc-pill${policy ? " on" : ""}`,
+      "data-storyboard-policy": policy ?? "off",
       title: t("Whether each shot is shown a storyboard of the shots before it: nine of "
              + "their frames on one sheet, cited as a picture reference, so the room, the "
              + "light and where things stand carry across a cut. Made when the earlier "
@@ -2245,12 +3004,21 @@ class Timeline {
       onclick: (event) => this.pickStoryboardPolicy(event.currentTarget),
     }, [
       icon("storyboard", 16),
-      el("span", { text: t("Storyboard") }),
+      el("span", { text: t("Global storyboard") }),
       ...(sub ? [el("span", { class: "mmc-pill-sub", text: sub })] : []),
     ]);
   }
 
   pickStoryboardPolicy(anchor) {
+    if (this.storyboardClosed || this.overlay?.isConnected === false
+        || !S.canDo(this.timeline, "storyboard")) return;
+    const owner = this.timeline;
+    // These two shared controls intentionally edit the same open menu. Their
+    // latest values are retained; changes to policy, sources or cards still
+    // invalidate its snapshot. The subsequent confirmation guards all fields.
+    const menuStamp = () => S.serializeTimeline({ ...owner,
+      storyboard_hold: undefined, storyboard_carries: undefined });
+    const stamp = menuStamp();
     const options = [null, "previous", "all"];
     const label = (policy) => ({
       previous: t("Each shot sees the shot before it"),
@@ -2258,18 +3026,128 @@ class Timeline {
     }[policy] ?? t("No storyboard"));
     const sub = (policy) => ({
       previous: t("Nine frames of the previous shot. What the eye just saw."),
-      all: t("Nine frames spread over every earlier shot, by length. Shot 1 stays in "
-           + "view as the tone the piece opened on."),
+      all: t("Nine frames spread over earlier source passes by length; when there are more than nine, the most recent nine are used."),
     }[policy] ?? t("Each shot is described by its prompt, its seam and its own references."));
     openChoicePopover(anchor, {
       title: t("What each shot is shown of the shots before it"),
       options, label, sub,
       value: S.storyboardPolicy(this.timeline),
-      extra: () => this.storyboardHold(),
+      extra: () => el("div", {}, [storyboardGuidance([
+        t("This is the global storyboard default. Segments without an individual setting follow it."),
+        t("Changing the global setting does not reset segments with individual settings."),
+        t("The storyboard uses nine frames from earlier rendered videos as a picture reference. It does not combine their audio or edit the final cut."),
+      ]), this.storyboardHold()]),
       onPick: (policy) => {
-        if (policy) this.timeline.storyboard = policy; else delete this.timeline.storyboard;
-        this.commit();
+        if (this.storyboardClosed || this.overlay?.isConnected === false) return;
+        if (this.timeline !== owner || menuStamp() !== stamp) {
+          this.showStoryboardInfo(anchor, [t("Storyboard settings changed while this menu was open. Open it again to choose from the current sources.")]);
+          return;
+        }
+        if (policy === S.storyboardPolicy(this.timeline)) return;
+        const own = this.timeline.segments.filter((segment, index) =>
+          S.storyboardCards(segment, index) !== null).length;
+        const candidate = { ...this.timeline, storyboard: policy };
+        const affected = S.passes(candidate).filter(pass => pass.start > 0
+          && !S.isClip(pass.segments[0]) && S.storyboardCards(pass.segments[0], pass.start) === null)
+          .map(pass => pass.start);
+        this.confirmStoryboardEdit(anchor, [
+          t("Global storyboard default: {setting}.", { setting: label(policy) }),
+          t("This change applies to {count} generated pass heads that follow the global default.", { count: affected.length }),
+          ...(own ? [t("The {count} cards with individual settings keep their settings.", { count: own })] : []),
+          ...(policy ? [] : [t("Turning off the global default does not turn off individually enabled storyboards.")]),
+          ...this.storyboardEffectLines(candidate, affected),
+        ], () => {
+          if (policy) this.timeline.storyboard = policy; else delete this.timeline.storyboard;
+          this.commit();
+        });
       },
+    });
+  }
+
+  storyboardScopeLines(index) {
+    const segment = this.timeline.segments[index];
+    const policy = S.storyboardPolicy(this.timeline);
+    const setting = policy === "all" ? t("piece so far") : policy === "previous" ? t("previous shot") : t("off");
+    const own = S.storyboardCards(segment, index);
+    return [
+      t("Global storyboard default: {setting}.", { setting }),
+      own === null
+        ? t("This segment follows the global storyboard default, including future changes.")
+        : own.length
+        ? t("This segment uses an individual storyboard setting. It takes priority over the global default.")
+        : t("The storyboard is off only for this segment. Future global changes will not enable it."),
+    ];
+  }
+
+  storyboardEffectLines(piece, indices) {
+    const lines = [t("Settings are saved now; this button does not render a video.")];
+    const sheets = indices.map(index => ({ index, sheet: S.storyboardSheet(piece, index) }));
+    if (sheets.some(row => row.sheet.length)) lines.push(
+      t("The storyboard uses nine frames from earlier rendered videos as a picture reference. It does not combine their audio or edit the final cut."),
+      t("A storyboard uses one image reference slot. Automatic routing normally uses reference-generation weights."),
+    );
+    lines.push(t("Changing storyboard references can require the affected generated pass to render again."));
+    if (indices.some(index => S.isHeld(piece.segments[index]))) lines.push(
+      t("A locked target is not regenerated. Unlock it and render again to use the new storyboard setting."));
+    const unavailable = new Set(), pending = new Set();
+    let skipsUnavailable = false, heldReady = false;
+    for (const { index, sheet } of sheets) {
+      for (const { pass } of sheet) {
+        const head = pass.segments[0];
+        if (S.isHeld(head)) {
+          const take = S.takeOn(head);
+          if (!take || this.gone?.has(take.filename)) {
+            unavailable.add(pass.end);
+            skipsUnavailable ||= S.storyboardCards(piece.segments[index], index) === null
+              && S.storyboardPolicy(piece) === "all";
+          } else heldReady = true;
+        } else if (!S.isClip(head)) pending.add(pass.end);
+      }
+      const runs = S.passes(piece);
+      const sourcePasses = new Set(S.storyboardIndices(piece, index).map(card =>
+        runs.findIndex(pass => card >= pass.start && card < pass.end)));
+      sourcePasses.delete(-1);
+      if (sourcePasses.size > S.STORYBOARD_CELLS) lines.push(
+        t("More than nine source passes were selected. The sheet uses the most recent nine source passes."));
+    }
+    if (pending.size) lines.push(t("Unlocked source passes render first; the storyboard is built from their new results afterward."));
+    if (heldReady) lines.push(t("Locked source passes use their saved results. Editing their prompts does not update the storyboard until those sources are unlocked and rendered again."));
+    if (unavailable.size) lines.push(t("Locked source passes {which} have no available result. Render or restore their source videos first.",
+      { which: [...unavailable].map(number => `#${number}`).join(", ") }));
+    if (skipsUnavailable) lines.push(t("The global piece-so-far setting skips locked sources without a result. An individual source selection can instead prevent generation until its sources are available."));
+    return [...new Set(lines)];
+  }
+
+  confirmStoryboardEdit(anchor, lines, apply, segment = null, index = null) {
+    if (this.storyboardClosed || this.overlay?.isConnected === false
+        || !S.canDo(this.timeline, "storyboard")) return;
+    this.storyboardNoticeClose?.();
+    const owner = this.timeline, stamp = S.serializeTimeline(owner);
+    const current = () => !this.storyboardClosed && this.overlay?.isConnected !== false
+      && this.timeline === owner && S.serializeTimeline(owner) === stamp
+      && (!segment || owner.segments[index] === segment && !S.isClip(segment)
+        && S.canDo(owner, "storyboard") && S.passOf(owner, index)?.start === index);
+    this.storyboardNoticeCurrent = current;
+    this.storyboardNoticeClose = confirmStoryboardChange({ lines }, {
+      returnFocus: anchor,
+      onClose: () => { this.storyboardNoticeClose = null; this.storyboardNoticeCurrent = null; },
+      onApply: () => {
+        if (!current()) {
+          this.showStoryboardInfo(anchor, [t("Storyboard settings changed while this window was open. Review the current settings and try again.")]);
+          return;
+        }
+        apply();
+      },
+    });
+  }
+
+  showStoryboardInfo(anchor, lines) {
+    if (this.storyboardClosed || this.overlay?.isConnected === false) return;
+    this.storyboardNoticeClose?.();
+    this.storyboardNoticeCurrent = null;
+    this.storyboardNoticeClose = confirmStoryboardChange({ lines, confirmText: t("Close") }, {
+      returnFocus: anchor,
+      onClose: () => { this.storyboardNoticeClose = null; this.storyboardNoticeCurrent = null; },
     });
   }
 
@@ -2326,6 +3204,7 @@ class Timeline {
     const note = el("span", { class: "mmc-opt-sub mmc-board-hold-note" });
     const reset = el("button", {
       class: "mmc-board-line-reset", text: t("Use the default"),
+      title: t("Restore only the carry-over wording. The global policy, individual source selections and retention strength stay unchanged."),
       onclick: () => {
         delete this.timeline.storyboard_carries;
         draw();
@@ -2376,6 +3255,7 @@ class Timeline {
 
     draw();
     return el("div", { class: "mmc-twopass mmc-board-hold-sect" }, [
+      storyboardGuidance([t("Retention strength and carry-over wording are shared by all enabled storyboards, including individual source selections. Individual settings override only the source selection or on/off state.")]),
       el("div", { class: "mmc-opt-label mmc-opt-col mmc-board-hold-head" }, [
         el("span", { text: t("How firmly the sheet holds") }),
         note,
@@ -2389,73 +3269,180 @@ class Timeline {
   /**
    * The storyboard a card is shown, chosen on its seam.
    *
-   * Three answers and a fourth: nothing, the shot in front, everything so far
-   * — and any set of earlier passes, on the row of toggles. Choosing what the
-   * piece is already set to is choosing to store nothing, which is what a
-   * seam's source does too: a card with no answer of its own follows the
-   * piece, and stays following it if the piece changes its mind.
+   * The main switch controls inheritance, not exclusion. Explicit source sets
+   * remain individual even when they happen to match the global default. The
+   * existing false sentinel is reserved for the advanced exclusion control.
    */
   pickStoryboard(anchor, segment, index) {
+    if (this.storyboardClosed || this.overlay?.isConnected === false) return;
+    if (!S.canDo(this.timeline, "storyboard") || !index || S.isClip(segment)
+        || this.timeline.segments[index] !== segment || S.passOf(this.timeline, index)?.start !== index) {
+      this.showStoryboardInfo(anchor, [t("An individual storyboard applies only to a generated pass head with earlier source videos. The first card, supplied clips and interior cards of a merged pass do not use a separate storyboard.")]);
+      return;
+    }
     const earlier = this.earlierPasses(index);
+    if (!earlier.length) return;
+    const owner = this.timeline, stamp = S.serializeTimeline(owner);
     const policy = S.storyboardPolicy(this.timeline);
     const previous = earlier[earlier.length - 1];
     const all = earlier.map((pass) => pass.end);
-    const options = ["none", "previous", ...(earlier.length > 1 ? ["all"] : [])];
+    const own = S.storyboardCards(segment, index);
+    const individual = own !== null;
+    const excluded = individual && !own.length;
+    const defaults = () => policy === "all" ? [...all] : [previous.end];
+    // Use the requested sources, not just the most recent nine shown cells.
+    // Older sources must remain selected even when the sheet cannot fit them.
+    const runs = S.passes(owner);
+    const selected = new Set((individual ? own : S.storyboardIndices(owner, index))
+      .map(card => runs.find(pass => card >= pass.start && card < pass.end)?.end)
+      .filter(number => number !== undefined));
+    const options = ["previous", ...(earlier.length > 1 ? ["all"] : [])];
     const label = (choice) => ({
-      none: t("Nothing"),
       previous: t("The shot before it (#{n})", { n: previous.end }),
       all: t("Every shot so far (#1–{n})", { n: previous.end }),
     }[choice]);
-    const sub = (choice) => (
-      choice === (policy ?? "none") || (choice === "previous" && policy === "all" && earlier.length === 1)
-        ? t("As the piece is set") : null);
+    const sub = (choice) => choice === policy || (choice === "previous" && policy === "all" && earlier.length === 1)
+      ? t("Matches the global default, but remains an individual setting.")
+      : t("Overrides the global default only for this segment.");
     const current = () => {
-      const shown = S.storyboardSheet(this.timeline, index).map(({ pass }) => pass.end);
-      if (!shown.length) return "none";
-      if (shown.length === earlier.length && earlier.length > 1) return "all";
-      if (shown.length === 1 && shown[0] === previous.end) return "previous";
+      if (!individual || excluded) return null;
+      if (selected.size === earlier.length && earlier.length > 1) return "all";
+      if (selected.size === 1 && selected.has(previous.end)) return "previous";
       return null;
     };
-    const write = (cards) => {
-      // The piece's own answer is stored as no answer.
-      const resolved = policy === "all" ? all : policy === "previous" ? [previous.end] : [];
-      const same = cards.length === resolved.length && cards.every((n, i) => n === resolved[i]);
-      if (same) delete segment.storyboard;
-      else segment.storyboard = cards.length ? cards : false;
-      this.commit();
+    const write = (next) => {
+      if (this.storyboardClosed || this.overlay?.isConnected === false) return;
+      if (this.timeline !== owner || S.serializeTimeline(owner) !== stamp
+          || owner.segments[index] !== segment || S.passOf(owner, index)?.start !== index) {
+        this.showStoryboardInfo(anchor, [t("Storyboard settings changed while this menu was open. Open it again to choose from the current sources.")]);
+        return;
+      }
+      const inherit = next === undefined;
+      if (JSON.stringify(segment.storyboard) === JSON.stringify(next)) return;
+      const candidateSegment = { ...segment };
+      if (inherit) delete candidateSegment.storyboard;
+      else candidateSegment.storyboard = next;
+      const candidate = { ...owner, segments: owner.segments.map((row, position) =>
+        position === index ? candidateSegment : row) };
+      const sourceNumbers = S.storyboardSheet(candidate, index).map(({ pass }) => `#${pass.end}`);
+      const [globalScope, currentScope] = this.storyboardScopeLines(index);
+      this.confirmStoryboardEdit(anchor, [
+        t("Change storyboard setting for segment #{n}.", { n: index + 1 }),
+        globalScope,
+        t("Current segment setting: {setting}", { setting: currentScope }),
+        inherit
+          ? t("Removing the individual setting makes this segment follow the global storyboard setting again.")
+          : next !== false
+          ? t("Individual settings take priority over the global default.")
+          : t("Turning the storyboard off only for this segment does not turn off the global setting."),
+        sourceNumbers.length
+          ? t("After this change, storyboard source videos: {which}.", { which: sourceNumbers.join(", ") })
+          : t("After this change, the storyboard is off for this segment."),
+        ...(inherit ? [] : [t("Future global changes will not change this segment’s individual setting.")]),
+        ...this.storyboardEffectLines(candidate, [index]),
+      ], () => {
+        if (inherit) delete segment.storyboard;
+        else segment.storyboard = next;
+        this.commit();
+      }, segment, index);
     };
-    // The toggles: one per earlier pass, lit where the sheet draws on it.
-    const toggles = (close) => {
-      const shown = new Set(S.storyboardSheet(this.timeline, index).map(({ pass }) => pass.end));
-      return el("div", { class: "mmc-twopass" }, [
-        el("div", { class: "mmc-opt-label mmc-opt-col" }, [
-          el("span", { text: t("Or choose the shots") }),
-          el("span", { class: "mmc-opt-sub",
-                       text: t("Nine cells, shared out by how long each shot plays.") }),
+    let close = () => {};
+    const change = next => { close(); write(next); };
+    const enabled = individual && !excluded;
+    // A legal timeline can have 239 earlier sources. Page the source pills,
+    // never the selected set, so even the largest picker needs no scrollbar.
+    const typeScale = Number.parseFloat(window.getComputedStyle?.(document.documentElement)
+      ?.getPropertyValue?.("--mmc-type")) || 1;
+    const pageSize = typeScale > 1.25 ? 8 : 24;
+    let sourcePage = Math.floor(Math.max(0, earlier.map(pass => selected.has(pass.end)).lastIndexOf(true)) / pageSize);
+    const sourcePicks = el("div", { class: "mmc-board-picks" });
+    const pageLabel = el("span");
+    const previousPage = el("button", { class: "mmc-pill mmc-board-source-prev", text: t("Previous"),
+      onclick: () => { if (sourcePage > 0) { sourcePage--; drawSources(); } } });
+    const nextPage = el("button", { class: "mmc-pill mmc-board-source-next", text: t("Next"),
+      onclick: () => { if ((sourcePage + 1) * pageSize < earlier.length) { sourcePage++; drawSources(); } } });
+    const drawSources = () => {
+      sourcePicks.replaceChildren(...earlier.slice(sourcePage * pageSize, (sourcePage + 1) * pageSize).map(pass => el("button", {
+        class: "mmc-board-pick", role: "checkbox", "aria-checked": selected.has(pass.end),
+        "data-storyboard-source": pass.end, disabled: !enabled,
+        title: pass.segments.length > 1
+          ? t("segments {first}-{last}, one pass", { first: pass.start + 1, last: pass.end })
+          : t("segment {n}", { n: pass.end }),
+        onclick: () => {
+          if (!enabled) return;
+          const next = new Set(selected);
+          if (next.has(pass.end)) next.delete(pass.end); else next.add(pass.end);
+          close();
+          if (!next.size) {
+            this.showStoryboardInfo(anchor, [t("Choose at least one source. To exclude this segment, use Advanced settings.")]);
+            return;
+          }
+          write(all.filter(number => next.has(number)));
+        },
+      }, [el("span", { text: `#${pass.end}` })])));
+      previousPage.disabled = sourcePage === 0;
+      nextPage.disabled = (sourcePage + 1) * pageSize >= earlier.length;
+      pageLabel.textContent = `${sourcePage + 1} / ${Math.ceil(earlier.length / pageSize)}`;
+    };
+    drawSources();
+    const pop = el("div", { class: "mmc-pop mmc-board-local-pop", "data-capture-wheel": "true" }, [
+      el("div", { class: "mmc-board-local-titlebar" }, [
+        el("span", { text: t("This segment’s storyboard") + ` · #${index + 1}` }),
+        el("button", { class: "mmc-close", "aria-label": t("Close"), onclick: () => close() }, [icon("close", 16)]),
+      ]),
+      el("div", { class: "mmc-board-local-header" }, [
+        el("button", {
+          class: "mmc-pill mmc-board-local-toggle mmc-board-individual-toggle",
+          role: "switch", "aria-checked": individual,
+          title: t("Turn off to follow the global storyboard. Turn on to choose sources only for this segment.")
+            + "\n" + t("Turning on individual settings keeps these sources fixed even when the global setting changes."),
+          onclick: () => change(individual ? undefined : defaults()),
+        }, [el("span", { text: t("Individual setting") })]),
+        el("p", { class: "mmc-board-local-status", text: excluded
+          ? t("This segment is excluded in Advanced settings. Turn exclusion off to choose its sources.")
+          : individual
+          ? t("This segment uses an individual storyboard setting. It takes priority over the global default.")
+          : t("This segment follows the global storyboard default, including future changes.") }),
+      ]),
+      el("div", { class: "mmc-board-local-layout" }, [
+        el("div", { class: "mmc-board-local-sources" }, [
+          el("div", { class: "mmc-opt-label", text: t("Storyboard sources") }),
+          el("div", { class: "mmc-board-local-presets", role: "radiogroup", "aria-label": t("Storyboard sources") }, options.map(choice => el("button", {
+            class: "mmc-opt", role: "radio", "aria-checked": current() === choice,
+            "data-storyboard-choice": choice, disabled: !enabled,
+            onclick: () => { if (enabled) change(choice === "all" ? [...all] : [previous.end]); },
+          }, [el("span", { class: "mmc-opt-col" }, [
+            el("span", { class: "mmc-opt-label", text: label(choice) }),
+            el("span", { class: "mmc-opt-sub", text: sub(choice) }),
+          ]), el("span", { class: "mmc-radio" })]))),
+          el("div", { class: "mmc-board-local-custom" }, [
+            el("div", { class: "mmc-opt-label", text: t("Or choose the shots") }),
+            sourcePicks,
+            ...(earlier.length > pageSize ? [el("div", { class: "mmc-board-local-pages" }, [previousPage, pageLabel, nextPage])] : []),
+            ...(!individual ? [el("p", { class: "mmc-opt-sub", text: t("Individual setting is off. Source choices are available when it is on.") })] : []),
+          ]),
         ]),
-        el("div", { class: "mmc-board-picks" }, earlier.map((pass) => el("button", {
-          class: "mmc-board-pick",
-          "aria-checked": shown.has(pass.end),
-          title: pass.segments.length > 1
-            ? t("segments {first}-{last}, one pass", { first: pass.start + 1, last: pass.end })
-            : t("segment {n}", { n: pass.end }),
-          onclick: () => {
-            const next = new Set(shown);
-            if (next.has(pass.end)) next.delete(pass.end); else next.add(pass.end);
-            write(all.filter((n) => next.has(n)));
-            close();
-          },
-        }, [el("span", { text: `#${pass.end}` })]))),
-        ...(shown.size ? [sheetDiagram(S.storyboardSheet(this.timeline, index))] : []),
-      ]);
-    };
-    openChoicePopover(anchor, {
-      title: t("What segment {n} is shown of the piece so far", { n: index + 1 }),
-      options, label, sub,
-      value: current(),
-      extra: toggles,
-      onPick: (choice) => write(choice === "all" ? all : choice === "previous" ? [previous.end] : []),
-    });
+        el("div", { class: "mmc-board-local-detail" }, [
+          ...(selected.size && !excluded ? [sheetDiagram(S.storyboardSheet(owner, index))] : []),
+          storyboardGuidance([
+            this.storyboardScopeLines(index)[0],
+            t("Nine cells, shared out by how long each shot plays."),
+            t("This setting only chooses source videos. Storyboard retention strength and carry-over wording remain shared for the whole piece."),
+          ]),
+        ]),
+      ]),
+      ...(individual ? [el("details", { class: "mmc-board-local-advanced", open: excluded }, [
+        el("summary", { text: t("Advanced settings") }),
+        el("button", {
+          class: "mmc-pill mmc-board-exclude-toggle", role: "switch", "aria-checked": excluded,
+          onclick: () => change(excluded ? defaults() : false),
+        }, [el("span", { text: t("Exclude this segment regardless of the global setting") })]),
+        el("p", { class: "mmc-opt-sub", text: t("Keep this segment off even if the global default changes later.") }),
+      ])] : []),
+    ]);
+    document.body.appendChild(pop);
+    placeNear(pop, anchor);
+    close = dismissable(pop);
   }
 
   /**
@@ -2499,6 +3486,75 @@ class Timeline {
     });
   }
 
+  /** The same localized view label is used on the card and its jump option. */
+  cardLabel(segment) {
+    return S.cardName(segment) || t(S.isClip(segment) ? "Clip" : "Segment");
+  }
+
+  /** Renaming writes only this card's view metadata, never its editor or prompt. */
+  cardNameControl(segment, index) {
+    const label = this.cardLabel(segment);
+    const button = el("button", {
+      class: "mmc-tl-card-name-button", type: "button", text: label,
+      title: `${label}\n${t("Rename {name}", { name: label })}`,
+      "aria-label": t("Rename {name}", { name: label }),
+      onclick: (event) => {
+        event.stopPropagation();
+        if (this.timeline.segments?.[index] !== segment) return;
+        let finished = false;
+        const finish = (save, focus = false) => {
+          if (finished) return;
+          finished = true;
+          const name = S.cardName({ extended_card_name: input.value });
+          const current = host.isConnected && this.timeline.segments?.[index] === segment;
+          if (save && current && name !== S.cardName(segment)) {
+            if (name) segment.extended_card_name = name;
+            else delete segment.extended_card_name;
+            this.commit();
+          } else host.replaceChildren(button);
+          if (focus) {
+            const target = this.stripHost?.querySelector(
+              `[data-mmc-segment-index="${index}"] .mmc-tl-card-name-button`)
+              ?? (host.isConnected ? button : null);
+            target?.focus({ preventScroll: true });
+          }
+        };
+        const input = el("input", {
+          class: "mmc-tl-card-name-input", type: "text", maxlength: "80",
+          value: S.cardName(segment), placeholder: t(S.isClip(segment) ? "Clip" : "Segment"),
+          "aria-label": t("Rename {name}", { name: label }),
+          // Removal can blur before the browser marks the host disconnected.
+          // After this turn, the same identity/connection gate is authoritative.
+          onblur: () => queueMicrotask(() => finish(true)),
+          onkeydown: (key) => {
+            key.stopPropagation();
+            if (key.isComposing) return;
+            if (key.key === "Enter" || key.key === "Escape") {
+              key.preventDefault();
+              finish(key.key === "Enter", true);
+            }
+          },
+        });
+        // The overlay already yields Escape to transient editing. This hidden
+        // gate shares the input's lifetime, so no global listener can outlive it.
+        const guard = el("span", {
+          class: "mmc-pop mmc-tl-card-name-guard", "aria-hidden": "true",
+          style: { display: "none" },
+        });
+        host.replaceChildren(input, guard);
+        input.focus({ preventScroll: true });
+        input.select();
+      },
+    });
+    const host = el("span", {
+      class: "mmc-tl-card-name",
+      onpointerdown: (event) => event.stopPropagation(),
+      onclick: (event) => event.stopPropagation(),
+      ondblclick: (event) => event.stopPropagation(),
+    }, [button]);
+    return host;
+  }
+
   /**
    * A supplied clip, as a card.
    *
@@ -2515,12 +3571,28 @@ class Timeline {
 
     return el("div", {
       class: "mmc-tl-card mmc-tl-clip",
-      style: { width: `${cardWidth(seconds)}px` },
+      "data-mmc-segment-index": String(index),
+      style: { width: `${cardWidth()}px` },
       ondblclick: () => this.editClip(index),
       onpointerleave: () => this.disarm(index),
     }, [
       el("div", { class: "mmc-tl-card-head" }, [
         el("span", { class: "mmc-tl-index", text: String(index + 1) }),
+        this.cardNameControl(segment, index),
+        el("button", { class: "mmc-tl-card-compiled mmc-pill",
+          title: t("What the model reads"), "aria-label": t("What the model reads"),
+          onclick: (event) => {
+            event.stopPropagation();
+            if (this.compiledView) return;
+            this.compiledView = openCompiledPrompt(
+              () => compiledFor(this.timeline, this.timeline.segments.indexOf(segment), this.pieceSeed(), () => this.onPromptCommit?.()),
+              () => { this.compiledView = null; });
+          },
+        }, [icon("speech", 13)]),
+        el("span", { class: "mmc-tl-mode mmc-tl-clip-tag", text: t("clip") }),
+      ]),
+      el("div", { class: "mmc-tl-card-prompt mmc-tl-clip-name", text: name, title: segment.filename }),
+      el("div", { class: "mmc-tl-card-refs" }, [
         el("span", {
           class: "mmc-tl-dur",
           text: `${seconds.toFixed(1)} s`,
@@ -2531,9 +3603,7 @@ class Timeline {
                 { s: seconds.toFixed(1), file: name, start: segment.trim.start.toFixed(2) })
             : t("All {s} s of {file}.", { s: seconds.toFixed(1), file: name }),
         }),
-        el("span", { class: "mmc-tl-mode mmc-tl-clip-tag", text: t("clip") }),
       ]),
-      el("div", { class: "mmc-tl-card-prompt mmc-tl-clip-name", text: name, title: segment.filename }),
       el("div", {
         class: "mmc-tl-card-meta",
         title: t("Supplied footage is played as it is — scaled to the render's size and "
@@ -2545,21 +3615,10 @@ class Timeline {
         ].filter(Boolean).join(" · "),
       }),
       el("div", { class: "mmc-tl-card-foot" }, [
-        el("button", { class: "mmc-tl-edit", text: t("Trim"), onclick: () => this.editClip(index) }),
+        el("div", { class: "mmc-tl-card-transport" }, [
         el("button", {
-          class: "mmc-tl-edit", text: t("Replace"),
-          title: t("Put another file on this card. It keeps its place in the strip and its seams; "
-                 + "the trim and crop go with the old file."),
-          onclick: () => this.replaceClip(index),
-        }),
-        el("button", {
-          class: `mmc-tl-edit${segment.crop ? " on" : ""}`, text: t("Crop"),
-          title: cropLabel(segment.crop)
-            || t("Crop the footage to part of the frame, or turn and mirror it, before it is scaled to the canvas"),
-          onclick: () => this.editClipCrop(index),
-        }),
-        el("button", {
-          class: `mmc-ghost${S.clipSound(segment) ? " on" : ""}`,
+          class: `mmc-ghost mmc-tl-clip-sound${segment.has_audio !== false && S.clipSound(segment) ? " on" : ""}`,
+          "aria-pressed": segment.has_audio !== false && S.clipSound(segment),
           title: segment.has_audio === false
             ? t("This clip has no soundtrack.")
             : S.clipSound(segment) ? t("Playing with its own sound. Click to mute it.")
@@ -2581,7 +3640,24 @@ class Timeline {
           onclick: () => this.move(index, 1),
         }),
         this.removeButton(index, t("Remove this clip")),
+        ]),
+        el("div", { class: "mmc-tl-card-edit-tools" }, [
+          el("button", { class: "mmc-tl-edit", text: t("Trim"), onclick: () => this.editClip(index) }),
+          el("button", {
+            class: "mmc-tl-edit", text: t("Replace"),
+            title: t("Put another file on this card. It keeps its place in the strip and its seams; "
+                   + "the trim and crop go with the old file."),
+            onclick: () => this.replaceClip(index),
+          }),
+          el("button", {
+            class: `mmc-tl-edit${segment.crop ? " on" : ""}`, text: t("Crop"),
+            title: cropLabel(segment.crop)
+              || t("Crop the footage to part of the frame, or turn and mirror it, before it is scaled to the canvas"),
+            onclick: () => this.editClipCrop(index),
+          }),
+        ]),
       ]),
+      this.cardPreview(segment, index),
     ]);
   }
 
@@ -2634,8 +3710,8 @@ class Timeline {
    *
    * Two buttons rather than one that toggles: on a part-shot strip neither
    * "locked" nor "unlocked" is the state it is in, so a switch would have to
-   * pick a side and would read as a lie half the time. Each is offered when it
-   * has something to do and absent when it does not.
+   * pick a side and would read as a lie half the time. Both stay in place and
+   * go dead when they have nothing to do.
    *
    * Locking everything is how a shoot ends — nothing is generated and the
    * render writes the piece out of the takes it already has — so it goes dead
@@ -2643,23 +3719,28 @@ class Timeline {
    * strip would otherwise refuse a moment later.
    */
   holdAllPills() {
-    if (!S.shotInParts(this.timeline)) return [];
-    const passes = S.passes(this.timeline).filter((pass) => !S.isClip(pass.segments[0]));
+    const all = S.passes(this.timeline);
+    const passes = all.filter((pass) => !S.isClip(pass.segments[0]));
     const loose = passes.filter((pass) => !S.isHeld(pass.segments[0]));
+    const held = passes.length - loose.length;
     const nothingLeft = !passes.some((pass) => S.takeOn(pass.segments[0]))
-      && !S.passes(this.timeline).some((pass) => S.isClip(pass.segments[0]));
+      && !all.some((pass) => S.isClip(pass.segments[0]));
     return [
-      ...(loose.length ? [el("button", {
+      el("button", {
         class: "mmc-pill mmc-tl-holdall",
-        disabled: nothingLeft || undefined,
-        title: nothingLeft
+        disabled: !loose.length || nothingLeft || undefined,
+        title: !passes.length
+          ? t("No generated cards to lock or unlock.")
+          : !loose.length
+          ? t("Every generated card is already locked.")
+          : nothingLeft
           ? t("Nothing has been shot yet, so locking the strip would leave the next "
             + "render with nothing to make.")
           : t("Lock every card. Nothing is generated and the next render writes the "
             + "piece out of the takes it already has — which is how a piece shot a "
             + "card at a time is finished."),
         onclick: () => { if (S.holdAll(this.timeline, true)) this.commit(); },
-      }, [icon("lock", 13), el("span", { text: t("Lock all") })])] : []),
+      }, [icon("lock", 13), el("span", { text: t("Lock all") })]),
       // Every take whose file is gone, forgotten in one click: the strip a
       // cleared-out takes/ folder leaves behind is dead takes on every card.
       ...(passes.some((pass) => this.gone.has(S.takeOn(pass.segments[0])?.filename)) ? [el("button", {
@@ -2669,59 +3750,24 @@ class Timeline {
                + "locked one stays out of the render until you unlock it."),
         onclick: () => { if (S.dropMissingTakes(this.timeline, this.gone)) this.commit(); },
       }, [el("span", { text: t("Forget missing takes") })])] : []),
-      ...(loose.length < passes.length ? [el("button", {
+      el("button", {
         class: "mmc-pill mmc-tl-holdall",
-        title: t("Put every card back in the render. Takes are kept — a card that is "
+        disabled: !held || undefined,
+        title: !passes.length
+          ? t("No generated cards to lock or unlock.")
+          : !held
+          ? t("No generated cards are locked.")
+          : t("Put every card back in the render. Takes are kept — a card that is "
                + "unlocked is simply shot again, and its take stands until the new "
                + "one lands."),
         onclick: () => { if (S.holdAll(this.timeline, false)) this.commit(); },
-      }, [icon("lockOpen", 13), el("span", { text: t("Unlock all") })])] : []),
+      }, [icon("lockOpen", 13), el("span", { text: t("Unlock all") })]),
     ];
   }
 
-  /**
-   * The card's number, and the way to shoot that number and nothing else.
-   *
-   * A piece is built one expensive generation at a time, and doing that by hand
-   * means locking five cards to shoot the sixth — then unlocking one and
-   * locking another for every step after it. Said in one click it is the whole
-   * workflow: shoot a card, look at it, and click the next card's number, which
-   * locks the one you just shot. A card locked with a take is a card playing
-   * its take, so the strip walks itself forward and nothing is generated twice.
-   *
-   * The number rather than a control of its own, because there is no room for
-   * one — a five-second card's head is 26 px from full — and because the number
-   * is already what a card is called. "Shoot only 4" is the sentence, and the
-   * badge is the 4 in it. It goes quiet on a strip of one pass, where there is
-   * no "only" to ask for.
-   *
-   * The pass's, like the lock beside it: a pass is one generation and there is
-   * no half of one to shoot, so a number inside a merged run shoots the run.
-   */
+  /** The card's number is a readout. The explicit lock remains the control. */
   soloBadge(index) {
-    const number = String(index + 1);
-    const runs = S.passes(this.timeline);
-    // Nothing to ask for on a strip that is one generation: "only this" and
-    // "all of it" are the same request there.
-    if (runs.length < 2) return el("span", { class: "mmc-tl-index", text: number });
-    const shared = runs.some((pass) => pass.segments.length > 1
-      && pass.start <= index && index < pass.start + pass.segments.length);
-    return el("button", {
-      class: "mmc-tl-index mmc-tl-solo",
-      text: number,
-      title: shared
-        ? t("Shoot only this pass. The shots merged with this one are generated "
-          + "with it — a pass is one generation — and every other card is locked "
-          + "and stays as it is.")
-        : t("Shoot only this one. Every other card is locked and stays as it "
-          + "is — the ones that already have takes go on playing them, and "
-          + "nothing else is generated. Click the next card's number when "
-          + "this one is good."),
-      onclick: (event) => {
-        event.stopPropagation();
-        if (S.soloPass(this.timeline, index)) this.commit();
-      },
-    });
+    return el("span", { class: "mmc-tl-index", text: String(index + 1) });
   }
 
   /**
@@ -2807,16 +3853,10 @@ class Timeline {
     const predicts = !shared && S.canDo(this.timeline, "duration");
     const autoLength = predicts && segment.auto_duration === true;
     const refs = S.references(segment).length + S.citedPool(segment).length;
-    const loras = S.activeLoras(segment, S.pieceFamily(this.timeline)).length;
-    const typed = (segment.prompt || "").trim();
-    const rewrite = segment.refined?.body?.trim();
+    const loras = S.activeLoras(segment, S.pieceFamily(this.timeline),
+      S.effectiveCheckpoints(segment, this.timeline)).length;
+    const rewrite = segment.refined?.body?.trim() || Object.keys(segment.refined?.sections ?? {}).length;
     const using = rewrite && segment.refined.enabled !== false;
-    // The typed sentence is what the user recognises the card by, so it stays
-    // the caption and the rewrite is only marked — a paragraph of generated
-    // prose on a 160 px card says less about which shot this is, not more. A
-    // card refined from nothing falls back to the rewrite, which is then the
-    // only description it has.
-    const prompt = typed || rewrite || "";
 
     const meta = [];
     // The sheet this card is shown counts as one of its pictures, and the
@@ -2829,23 +3869,11 @@ class Timeline {
     if (screens) meta.push(t(screens === 1 ? "{count} screen" : "{count} screens", { count: screens }));
     if (rewrite) meta.push(using ? t("refined") : t("refined (off)"));
 
-    // The card's half of the face pass, and only while the piece is running
-    // one: a switch for something that is not happening is a switch that lies.
-    // Two states, because with the piece on, "on" and "inherit" are the same
-    // thing — what a card gets to say is that *this* shot does not need it.
-    const repaired = S.faceOn(this.timeline, segment);
-    const faceChip = this.timeline.face?.on ? el("button", {
-      class: `mmc-tl-card-face${repaired ? " on" : ""}`,
-      text: repaired ? t("face") : t("no face"),
-      title: repaired
-        ? t("This shot's face is re-drawn after it renders. Click to leave it alone.")
-        : t("This shot is left as it renders. Click to have its face re-drawn."),
-      onclick: (event) => {
-        event.stopPropagation();
-        if (repaired) segment.face = "off";
-        else delete segment.face;
-        this.commit();
-      },
+    // Complete settings belong to this canonical generated card alone.
+    const faceChip = S.canDo(this.timeline, "face") ? facesPill({
+      target: segment, piece: this.timeline, className: "mmc-tl-card-face",
+      valid: () => this.modal?.isConnected && this.timeline.segments?.includes(segment),
+      commit: () => this.commit(),
     }) : null;
     // The card's motion fix: its own switch, not the piece's, because which
     // shots have a burst in them is a fact about the shots. Only a generated
@@ -2877,14 +3905,55 @@ class Timeline {
 
     return el("div", {
       class: `mmc-tl-card${skin}`,
-      style: { width: `${cardWidth(seconds)}px` },
-      // Double-click anywhere on the card, because "Edit" is a small target and
-      // opening a segment is the thing you do most in here.
-      ondblclick: () => this.edit(index),
+      "data-mmc-segment-index": String(index),
+      style: { width: `${cardWidth()}px` },
+      // Opening this editor is an explicit Edit action, never a background
+      // double-click that can follow a missed status/delete control.
       onpointerleave: () => this.disarm(index),
     }, [
       el("div", { class: "mmc-tl-card-head" }, [
         this.soloBadge(index),
+        this.cardNameControl(segment, index),
+        // A text icon opens the actual generation prompt, not the raw card.
+        el("button", { class: "mmc-tl-card-compiled mmc-pill", title: t("What the model reads"),
+          "aria-label": t("What the model reads"), onclick: (event) => {
+            event.stopPropagation();
+            if (this.compiledView) return;
+            this.compiledView = openCompiledPrompt(
+              () => compiledFor(this.timeline, this.timeline.segments.indexOf(segment), this.pieceSeed(), () => this.onPromptCommit?.()),
+              () => { this.compiledView = null; });
+          } }, [icon("speech", 13)]),
+        // The mode belongs to the generation; merged shots share their rail.
+        ...(shared ? [] : [el("span", { class: "mmc-tl-mode",
+                                       text: S.mode(segment, this.timeline) })]),
+        // Whether this card is in the next render. On the head rather than in
+        // the foot because it says what the card *is* to this queue, which is
+        // the question the rest of this row answers — and because a pass of
+        // several shots answers it once, on its rail, where a per-card switch
+        // would be offering half a generation.
+        ...(shared ? [] : [this.holdSwitch(index)]),
+      ]),
+      // Read-only size of the raw input, including all whitespace. Do not
+      // expose a prompt excerpt or substitute an active generated rewrite.
+      el("div", {
+        class: "mmc-tl-card-count",
+        text: t("{count} chars incl. spaces", {
+          count: Array.from(String(segment.prompt ?? "")).length.toLocaleString("en-US"),
+        }),
+      }),
+      el("div", { class: "mmc-tl-card-refs" }, [
+        el("span", {
+          class: "mmc-tl-card-ref-count",
+          text: t(refs === 1 ? "{count} ref" : "{count} refs", { count: refs }),
+        }),
+        el("span", { class: "mmc-tl-card-frame-fact",
+          text: `${shared || autoLength ? "~" : ""}${t("{fps} fps · {frames} frames", {
+            fps: cardRules.fps,
+            frames: (shared ? Math.round(seconds * cardRules.fps) : frames).toLocaleString("en-US"),
+          })}`,
+          ...(shared ? { title: t("{s} s of this pass — the frame count is the pass's.",
+            { s: S.showSeconds(segment.duration_s) }) } : {}),
+        }),
         // The off-distribution mark belongs to whatever is actually generated in
         // one go. Alone, that is this card; in a pass it is the pass, and
         // marking every card would say it about the wrong thing — the rail
@@ -2926,35 +3995,15 @@ class Timeline {
             },
           } : {}),
         }),
-        // The mode is a property of the generation, and a pass holding several
-        // shots has one of those for all of them — so it moves to the rail.
-        ...(shared ? [] : [el("span", { class: "mmc-tl-mode",
-                                       text: S.mode(segment, this.timeline) })]),
-        // Whether this card is in the next render. On the head rather than in
-        // the foot because it says what the card *is* to this queue, which is
-        // the question the rest of this row answers — and because a pass of
-        // several shots answers it once, on its rail, where a per-card switch
-        // would be offering half a generation.
-        ...(shared ? [] : [this.holdSwitch(index)]),
       ]),
-      // Dimmed while a rewrite stands in for it, the same way the editor dims the
-      // box this caption is showing: the card would otherwise read as if the
-      // sentence under it were what this shot queues.
-      el("div", {
-        class: `mmc-tl-card-prompt${prompt ? "" : " empty"}${using && typed ? " superseded" : ""}`,
-        text: prompt || t("No prompt yet"),
-        title: using && typed ? t("Not queued — this card's rewrite is. Open it to read or revert.") : "",
-      }),
-      ...(refs ? [el("div", {
-        class: "mmc-tl-card-refs",
-        text: t(refs === 1 ? "{count} ref" : "{count} refs", { count: refs }),
-      })] : []),
       ...(meta.length || faceChip || motionChip || chip
         ? [el("div", { class: "mmc-tl-card-meta" }, [
             ...meta.map((text) => el("span", { text })),
-            ...(chip ? [chip] : []),
-            ...(motionChip ? [motionChip] : []),
-            ...(faceChip ? [faceChip] : []),
+            ...(chip || motionChip || faceChip ? [el("div", { class: "mmc-tl-card-status" }, [
+              ...(chip ? [chip] : []),
+              ...(motionChip ? [motionChip] : []),
+              ...(faceChip ? [faceChip] : []),
+            ])] : []),
           ])]
         : []),
       // The same per-shot override the editor exposed, now reachable from the
@@ -2975,29 +4024,76 @@ class Timeline {
         },
       })]),
       el("div", { class: "mmc-tl-card-foot" }, [
-        el("button", { class: "mmc-tl-edit", text: t("Edit"), onclick: () => this.edit(index) }),
-        ...(shared ? [] : this.takeTools(index, "mmc-tl-edit")),
-        el("button", {
-          class: "mmc-ghost", text: "◀", title: t("Move earlier"),
-          disabled: index === 0 || undefined,
-          onclick: () => this.move(index, -1),
-        }),
-        el("button", {
-          class: "mmc-ghost", text: "▶", title: t("Move later"),
-          disabled: index === this.timeline.segments.length - 1 || undefined,
-          onclick: () => this.move(index, 1),
-        }),
-        // Weighed against this card's own length, not a fresh card's: a copy of
-        // a twenty-second shot costs twenty seconds of the budget.
-        el("button", {
-          class: "mmc-ghost", text: "⧉",
-          title: S.addSegmentRefusal(this.timeline, segment.duration_s) ?? t("Duplicate"),
-          disabled: S.addSegmentRefusal(this.timeline, segment.duration_s) ? true : undefined,
-          onclick: () => this.duplicate(index),
-        }),
-        this.removeButton(index, t("Remove this segment")),
+        el("div", { class: "mmc-tl-card-transport" }, [
+          el("button", {
+            class: "mmc-ghost", text: "◀", title: t("Move earlier"),
+            disabled: index === 0 || undefined,
+            onclick: () => this.move(index, -1),
+          }),
+          el("button", {
+            class: "mmc-ghost", text: "▶", title: t("Move later"),
+            disabled: index === this.timeline.segments.length - 1 || undefined,
+            onclick: () => this.move(index, 1),
+          }),
+          // Weighed against this card's own length, not a fresh card's: a copy of
+          // a twenty-second shot costs twenty seconds of the budget.
+          el("button", {
+            class: "mmc-ghost", text: "⧉",
+            title: S.addSegmentRefusal(this.timeline, segment.duration_s) ?? t("Duplicate"),
+            disabled: S.addSegmentRefusal(this.timeline, segment.duration_s) ? true : undefined,
+            onclick: () => this.duplicate(index),
+          }),
+          this.removeButton(index, t("Remove this segment")),
+        ]),
+        // The DOM follows the transport row / editing row layout so native
+        // keyboard navigation visits controls in the same order as the eye.
+        // Temporal Trim and spatial Crop remain in the same group, with the
+        // explicit card editor last at its stable rightmost edge.
+        el("div", { class: "mmc-tl-card-edit-tools" }, [
+          ...(shared ? [] : this.takeTools(index, "mmc-tl-edit")),
+          el("button", { class: "mmc-tl-edit mmc-tl-card-edit-action", text: t("Edit"), onclick: () => this.edit(index) }),
+        ]),
       ]),
+      this.cardPreview(segment, index, pass),
     ]);
+  }
+
+  /** Players are UI resources, not takes. Every rebuild/close releases them. */
+  clearCardPreviews() {
+    this.cardTitleFit?.disconnect();
+    this.cardTitleFit = null;
+    this.cardPreviewClose?.();
+    this.cardPreviewClose = null;
+    for (const player of this.cardPreviews ?? []) player.destroy();
+    this.cardPreviews?.clear();
+  }
+
+  cardPreview(segment, index, pass = null) {
+    if (!this.previewMode) return null;
+    const source = cardPreviewSource({ timeline: this.timeline, segment, index, pass, gone: this.gone });
+    if (!source) return el("div", { class: "mmc-card-preview-unavailable", role: "status",
+      text: t("No ready video for this card.") });
+    const label = this.cardLabel(segment);
+    const player = createCardPreview(source, {
+      key: segment.card_id || segment,
+      label: t("Card preview — {name}", { name: label }),
+      onOpen: (controller) => {
+        this.cardPreviewClose?.();
+        pauseCardPreviews();
+        for (const inline of this.cardPreviews) inline.suspend();
+        this.cardPreviewClose = openReferencePreview([{ kind: "video", filename: source.filename }], {
+          caption: t("Card preview — {name}", { name: label }),
+          returnFocus: controller.root.querySelector(".mmc-card-preview-stage"),
+          playback: { source, key: segment.card_id || segment, label },
+          onClose: () => {
+            this.cardPreviewClose = null;
+            for (const inline of this.cardPreviews) inline.resume();
+          },
+        });
+      },
+    });
+    this.cardPreviews.add(player);
+    return player.root;
   }
 
   // ---- actions ---------------------------------------------------------------
@@ -3065,6 +4161,7 @@ class Timeline {
    */
   async pickClip(budget) {
     const chosen = await openPicker({
+      selectionPurpose: "timeline-clip-source",
       kinds: ["video", "renders"], kind: "video", single: true,
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
     });
@@ -3208,16 +4305,21 @@ class Timeline {
    * puts the ✕ back, so a card is never left standing armed.
    */
   removeButton(index, title) {
+    const stop = (event) => event.stopPropagation();
     if (this.armed === index) {
       return el("button", {
-        class: "mmc-asset-x armed", text: t("Really remove?"),
+        class: "mmc-asset-x armed", type: "button", text: t("Really remove?"),
         title: t("Press again to remove it. Leave the card to keep it."),
-        onclick: () => this.remove(index),
+        onpointerdown: stop,
+        ondblclick: stop,
+        onclick: (event) => { event.stopPropagation(); this.remove(index); },
       });
     }
     return el("button", {
-      class: "mmc-asset-x", text: "✕", title,
-      onclick: () => { this.armed = index; this.renderStrip(); },
+      class: "mmc-asset-x", type: "button", text: "✕", title,
+      onpointerdown: stop,
+      ondblclick: stop,
+      onclick: (event) => { event.stopPropagation(); this.armed = index; this.renderStrip(); },
     });
   }
 
@@ -3266,11 +4368,8 @@ class Timeline {
    */
   async openLoras(entry = null) {
     await openLoras({
-      state: this.timeline,
-      family: S.pieceFamily(this.timeline),
-      targets: S.timelineCheckpoints(this.timeline),
-      scope: "piece",
-      // The chip that asked, so the grid opens on it. See `loras.revealNow`.
+      ...globalLoraOptions(this.timeline),
+      // A legacy caller can still ask for one entry in the manager.
       reveal: entry?.name ?? null,
       onChange: () => this.commit(),
     });
@@ -3304,8 +4403,14 @@ class Timeline {
       if (replaced.prompt === undefined) replaced.prompt = this.timeline.prompt ?? "";
       this.setGlobalPrompt(result.piece);
     }
-    if (result.soundscape) this.timeline.soundscape = result.soundscape;
-    if (result.music) this.timeline.music = result.music;
+    if (result.soundscape) {
+      this.audioEdited("soundscape");
+      this.timeline.soundscape = result.soundscape;
+    }
+    if (result.music) {
+      this.audioEdited("music");
+      this.timeline.music = result.music;
+    }
     this.timeline.refined = {
       ...(this.timeline.refined || {}),
       replaced,
@@ -3314,8 +4419,10 @@ class Timeline {
       // card carries its own set and they live on the card instead.
       ...(result.sections && S.isSingle(this.timeline) ? { sections: result.sections } : {}),
     };
+    if (result.field === "all") delete this.timeline.refined.sections;
     this.soundscapeBox.value = this.timeline.soundscape ?? "";
     this.musicBox.value = this.timeline.music ?? "";
+    this.updateSectionSummaries();
     this.onCommit?.();
   }
 
@@ -3343,9 +4450,12 @@ class Timeline {
    * reverted while others stay refined leaves them exactly as they are.
    */
   dropTimelineRewrite() {
-    if (this.timeline.segments.some((segment) => segment.refined?.body)) return;
+    if (this.timeline.segments.some((segment) => segment.refined?.body
+        || Object.keys(segment.refined?.sections ?? {}).length)) return;
     const replaced = this.timeline.refined?.replaced;
     if (replaced) {
+      this.audioEdited("soundscape");
+      this.audioEdited("music");
       this.timeline.soundscape = replaced.soundscape ?? "";
       this.timeline.music = replaced.music ?? "";
       // Only when a rewrite actually moved it — see `takePiece` — so reverting
@@ -3355,6 +4465,7 @@ class Timeline {
       if (this.musicBox) this.musicBox.value = this.timeline.music;
     }
     this.timeline.refined = null;
+    this.updateSectionSummaries();
   }
 
   /**
@@ -3367,14 +4478,49 @@ class Timeline {
    */
   async refineAll(options) {
     this.refineError = null;
+    const owner = this.timeline;
+    const snapshot = S.serializeTimeline(owner);
+    const structured = S.hasPromptSections(owner);
+    const modal = this.modal;
+    const fresh = () => this.timeline === owner && this.modal === modal
+      && (!modal || modal.isConnected) && S.serializeTimeline(owner) === snapshot;
     try {
       const result = await refine({
-        kind: "timeline",
-        data: JSON.parse(S.serializeTimeline(this.timeline)),
+        ...(structured ? { kind: "field", scope: "timeline", field: "all" } : { kind: "timeline" }),
+        data: JSON.parse(snapshot),
       }, options);
+      if (!fresh()) {
+        if (this.timeline === owner && this.modal === modal && (!modal || modal.isConnected)) {
+          this.refineError = t("The prompt changed while refining. No fields were changed.");
+          this.renderBar();
+        }
+        return;
+      }
+      const seen = new Set();
+      if (structured && (result.target_scope !== "timeline" || result.field !== "all" || result.scope !== "shot"
+          || !Array.isArray(result.shots) || Object.hasOwn(result, "sections")
+          || ["piece", "soundscape", "music"].some((key) => typeof result[key] !== "string"))) {
+        throw new Error(t("the refiner returned an invalid result for this field"));
+      }
+      for (const shot of result.shots ?? []) {
+        if (!Number.isInteger(shot.index) || !owner.segments[shot.index]
+            || S.isClip(owner.segments[shot.index]) || seen.has(shot.index)
+            || typeof shot.body !== "string") {
+          throw new Error(t("the refiner returned an invalid result for this field"));
+        }
+        if (structured && (!Array.isArray(shot.fields) || [...shot.fields].sort().join(",") !== "prompt,retention_analysis,summary"
+            || !shot.sections || Object.keys(shot.sections).sort().join(",") !== "retention_analysis,summary"
+            || Object.values(shot.sections).some((value) => typeof value !== "string"))) {
+          throw new Error(t("the refiner returned an invalid result for this field"));
+        }
+        seen.add(shot.index);
+      }
+      if (structured && seen.size !== owner.segments.filter((segment) => !S.isClip(segment)).length) {
+        throw new Error(t("the refiner returned an invalid result for this field"));
+      }
       for (const shot of result.shots ?? []) {
         const segment = this.timeline.segments[shot.index];
-        if (!segment || !shot.body) continue;
+        if (!segment || (!shot.body && !structured)) continue;
         segment.refined = {
           body: shot.body,
           // The rewrite is the shot alone: compile joins the (rewritten) global
@@ -3386,6 +4532,7 @@ class Timeline {
           // shot entry. In one pass there is one merged pool and the one
           // top-level set goes on the timeline instead — see `takePiece`.
           ...(shot.sections ? { sections: shot.sections } : {}),
+          ...(structured ? { fields: [...shot.fields], sources: refineSources(segment) } : {}),
           ...(result.template ? { template: result.template, forced: !!result.forced } : {}),
           source: segment.prompt ?? "",
           model: refineModel(),
@@ -3395,6 +4542,7 @@ class Timeline {
       this.takePiece(result);
       this.refineError = (result.problems ?? []).join(" · ") || null;
     } catch (error) {
+      if (!fresh()) return;
       this.refineError = String(error.message || error);
     }
     this.commit();
@@ -3404,8 +4552,24 @@ class Timeline {
   /** The segment editor: the node's own body, over the strip. */
   edit(index) {
     const segment = this.timeline.segments[index];
+    const cacheKey = segment.card_id || `segment-${index}`;
+    const pass = S.passOf(this.timeline, index);
+    const binding = JSON.stringify([index, S.pieceFamily(this.timeline), pass.start,
+      pass.segments.map((card) => card.card_id)]);
+    const cached = this.segmentEditors.get(cacheKey);
+    if (cached?.state === segment && !cached.destroyed && cached.mmcSegmentBinding === binding) {
+      cached.refreshReferences();
+      this.showSegmentEditor(cached, index);
+      return;
+    }
+    if (cached) {
+      cached.destroy();
+      this.segmentEditors.delete(cacheKey);
+    }
+    const shared = pass.segments.length > 1;
     const editor = new CreatorEditor({
       state: segment,
+      structuredPrompt: S.hasPromptSections(this.timeline),
       // Which piece this card belongs to — the same answer the lone shot's
       // editor gets (`faceBody`). Without it the editor fell back to the card
       // itself, a segment carries no `family`, and every family-derived control
@@ -3423,8 +4587,15 @@ class Timeline {
       // nowhere yet" for the whole of the edit that cited it. It holds no caret
       // and nothing focusable, so rebuilding it under an open window costs
       // nothing. See `renderPool` and `S.poolCitations`.
-      onCommit: () => {
+      onCommit: (options) => {
+        S.syncTimeline(this.timeline);
         this.onCommit?.(); this.renderStrip(); this.renderPool(); this.renderCast();
+        this.refreshReferences(options);
+      },
+      onPromptCommit: () => {
+        this.onPromptCommit?.();
+        this.renderBar(); this.renderStrip(); this.renderPool(); this.renderCast();
+        this.renderReferenceWarnings();
       },
       // A member typed into this card's prose is cast into the *piece* — where
       // the cast lives — and their files land in the piece's pool. The card is
@@ -3437,7 +4608,7 @@ class Timeline {
       // The shelf is this window's, a few rows down — a card draws none of its
       // own, and a name pressed in it opens the member there.
       openCast: (handle) => this.openCastMember(handle),
-      compiledPrompt: () => compiledFor(this.timeline, index, this.pieceSeed()),
+      compiledPrompt: () => compiledFor(this.timeline, index, this.pieceSeed(), () => this.onPromptCommit?.()),
       // What a `{day|night}` in this card is chosen on: the card's own seed
       // where it was retaken on one, the piece's otherwise — the sampler's
       // rule — and the card's number, so two cards holding the same sentence
@@ -3465,12 +4636,8 @@ class Timeline {
         index,
         data: JSON.parse(S.serializeTimeline(this.timeline)),
       }),
-      // The soundscape and the score describe the piece rather than the shot, so
-      // they land on the timeline's own fields where they are visible and
-      // editable — not inside the card that happened to be refined. A single
-      // card's refine never returns a rewritten global prompt — the other
-      // cards' rewrites were written against the standing one — so `takePiece`
-      // only moves the audio here.
+      // Audio is edited/refined in its own timeline field, not this card.
+      refineAudioFields: false,
       // This card, as a preset — the scope that makes the library worth opening
       // mid-edit. A card has no stage of its own and the piece's last render is
       // the whole piece rather than this shot, so there is nothing to take as a
@@ -3491,25 +4658,32 @@ class Timeline {
           this.renderStrip();
         },
       }),
-      onRefined: (result) => this.takePiece(result),
-      // …and go with the last rewrite that was using them. The commit is this
-      // callback's own: the editor's fired before it, so what it wrote out still
-      // had the timeline's audio fields in it.
-      onReverted: () => { this.dropTimelineRewrite(); this.onCommit?.(); },
+      // Plain Refine and its Revert own this prompt only. Whole-piece audio
+      // and global rewrite metadata belong exclusively to Refine all/Revert all.
     });
 
-    // A card sharing a pass is a shot of it; a card generated alone is a
-    // segment. The two words mean different things in this node and the header
-    // is where the user finds out which one they are editing.
+    editor.mmcSegmentBinding = binding;
+    editor.mmcRetainRefineWhileHidden = true;
+    this.segmentEditors.set(cacheKey, editor);
+    this.showSegmentEditor(editor, index);
+  }
+
+  showSegmentEditor(editor, index) {
     const shared = S.passOf(this.timeline, index).segments.length > 1;
     // The same window the Creator's face opens: one shot's body over whatever
     // it was opened from. It was already this window in all but the code.
-    openEditorSheet({
+    this.editors.set(editor, openEditorSheet({
       title: t(shared ? "Shot {n}" : "Segment {n}", { n: index + 1 }),
       subtitle: t("of {count}", { count: this.timeline.segments.length }),
+      headerTools: editor.structuredPrompt ? [editor.headerTools] : [],
       content: [editor.root],
-      onClose: () => this.render(),
-    });
+      onClose: () => {
+        this.editors.delete(editor);
+        // Closing the sheet only hides this view. Keep its refine state with
+        // the card so reopening it does not make an active request look idle.
+        if (!this.storyboardClosed) this.render();
+      },
+    }));
   }
 }
 
@@ -3536,13 +4710,15 @@ export class TimelineBody {
    *  `face` is where the piece-view pin is kept, which is a preference about
    *  this node rather than anything the render reads, so it lives on the node
    *  and not in the blob. */
-  constructor({ read, write, widgets = {}, onWidgetChange, nodeId,
-                preStage = null, face = null, fullscreen = null, sections = null }) {
+  constructor({ read, write, widgets = {}, onWidgetChange, nodeId, runtimeKey = null,
+                preStage = null, face = null, fullscreen = null, sections = null,
+                tools = null }) {
     this.read = read;
     this.write = write;
     this.widgets = widgets;
     this.onWidgetChange = onWidgetChange;
     this.nodeId = nodeId;
+    this.runtimeKey = runtimeKey;
     this.preStage = preStage;
     this.face = face;
     this.sections = sections;
@@ -3552,6 +4728,9 @@ export class TimelineBody {
     // has been told about is not a door, and the setting in ComfyUI's own page
     // only decides what a *new* node opens as. So the face grows one.
     this.fullscreen = fullscreen;
+    // A second way into the same shell, already turned to its existing tools
+    // dashboard. Kept on the strip face only, not lent to shot editors.
+    this.tools = tools;
     this.timeline = S.parseTimeline(read());
     // Persist identities before graphToPrompt reads the widget, including
     // migration of an old strip. They identify UI cards, not render content.
@@ -3592,6 +4771,7 @@ export class TimelineBody {
       (promptId, snapshot) => this.rememberQueued(promptId, snapshot));
     this.stage = new Stage({
       nodeId,
+      runtimeKey,
       // A look for the finished render, where the family has the pass.
       onRestyle: S.canDo(this.timeline, "guide_lora") ? () => this.restyle() : null,
       // Which generation the queue is on, said over the preview: the strip runs
@@ -3625,7 +4805,7 @@ export class TimelineBody {
     this.destroyed = true;
     this.offSubmitted?.();
     this.stage?.destroy();
-    this.laneFit?.disconnect();
+    this.nodeSummaryFit?.disconnect();
     this.dropFaceEditor();
   }
 
@@ -3840,8 +5020,9 @@ export class TimelineBody {
         return subject.handle;
       },
       onCommit: () => this.commit(),
+      onPromptCommit: () => this.commitPrompt(),
       // The face wears the piece's first card, so that is the pass it shows.
-      compiledPrompt: () => compiledFor(this.timeline, 0, this.pieceSeed()),
+      compiledPrompt: () => compiledFor(this.timeline, 0, this.pieceSeed(), () => this.commitPrompt()),
       // The face wears card 1, and a `{day|night}` on it chooses as card 1.
       varies: () => ({ seed: S.segmentSeed(segment) ?? this.pieceSeed(), card: 1 }),
       samplingWidgets: this.widgets,
@@ -3862,19 +5043,13 @@ export class TimelineBody {
       // The piece's, for the same reason: the face is wearing the only card,
       // but what Clear empties is the node.
       clearTool: () => [this.clearTool()],
-      // One card of a piece, refined against the piece — the same target the
-      // strip gives a card, because that is what this is. The route knows a
-      // piece of one segment has no cut times of its own and asks the model for
-      // the cuts, which is what the Creator always did.
+      // One card's prompt, with the piece supplied as read-only context.
       refineTarget: () => ({
         kind: "segment",
         index: 0,
         data: JSON.parse(S.serializeTimeline(this.timeline)),
       }),
-      // No `onRefined`: with no strip there is nothing above this shot for the
-      // soundscape and the score to belong to, so the editor keeps its own audio
-      // fields and writes them onto the segment. Setting the *piece's* is what
-      // the strip face is for, and doing it is what takes you there.
+      // Manual audio fields remain available. Plain Refine never writes them.
 
       // The next shot, as a pill in the row that already carries the piece's
       // other two controls. See `CreatorEditor.renderGrowPill`.
@@ -3938,6 +5113,15 @@ export class TimelineBody {
     this.render();
   }
 
+  /** A prompt-only change must not settle seams, pins or sampler settings. */
+  commitPrompt() {
+    this.write(S.serializeTimeline(this.timeline));
+    // A strip summary is read-only. The shot face's editor has already refreshed
+    // its own prompt panel, and a full editor render would settle unrelated pins.
+    if (this.showsStrip()) this.render();
+    else this.onRender?.();
+  }
+
   /**
    * What the preset library can save from this node and apply back to it.
    *
@@ -3986,6 +5170,7 @@ export class TimelineBody {
     openTimeline({
       timeline: this.timeline,
       onCommit: () => this.commit(),
+      onPromptCommit: () => this.commitPrompt(),
       sections: this.sections,
       soundSnaps: this.soundSnaps,
       edit,
@@ -4047,7 +5232,7 @@ export class TimelineBody {
       // face than the strip's on a node of the same width, and it showed as the
       // sampler pills wrapping a row earlier here than there.
       this.root.classList.add("hosting");
-      this.laneFit?.disconnect();
+      this.nodeSummaryFit?.disconnect();
       // A host drawing something derived from this piece — the editor's empty
       // frame — has no other way to hear that the canvas or the length changed.
       this.onRender?.();
@@ -4062,12 +5247,8 @@ export class TimelineBody {
                               // the sampler away in its simple view by this class, and a bar
                               // parented straight to the root gave it nothing to fold.
                               el("div", { class: "mmc-sampling-host" }, [this.renderSampling()]));
-    // The reel is the one part of the body whose reading depends on the width
-    // it ended up with, so it is fitted after it is in the document — once now,
-    // and again from its own observer whenever the node is resized.
-    this.laneFit?.disconnect();
-    this.laneFit?.observe(this.lane);
-    this.fitLane();
+    this.nodeSummaryFit?.disconnect();
+    this.nodeSummaryFit = observeTimelineSummary(this.summaryStats);
     this.onRender?.();
   }
 
@@ -4102,8 +5283,8 @@ export class TimelineBody {
    * segment — the same stack the modal's LoRAs pill opens.
    */
   renderRail() {
-    const tool = (label, iconName, title, onclick) =>
-      el("button", { class: "mmc-tool", title, onclick },
+    const tool = (label, iconName, title, onclick, props = {}) =>
+      el("button", { class: "mmc-tool", title, onclick, ...props },
          [el("span", { class: "mmc-tool-icon" }, [icon(iconName)]), el("span", { text: t(label) })]);
 
     // The pool is references, so it is gone on a family that reads none — see
@@ -4114,6 +5295,14 @@ export class TimelineBody {
 
     return el("div", { class: "mmc-rail" }, [
       el("div", { class: "mmc-rail-group" }, [
+        // The strip face's view controls belong to the rail, not among the
+        // generation's numeric readouts. The same callbacks and capability
+        // gates as their former pills, dressed as the surrounding tools.
+        ...(this.fullscreen ? [tool("Fullscreen", "expand",
+          t("Draw this piece over the whole window. The node stays in the graph "
+            + "and is queued exactly as it is now; Escape brings you back."),
+          () => this.fullscreen(), { class: "mmc-tool mmc-tool-expand" }),
+          el("span", { class: "mmc-tool-view-divider", "aria-hidden": "true" })] : []),
         // Per kind — see `CreatorEditor.renderRail`. A family whose references
         // are a sheet of stills offers the image tool alone.
         ...(takesRefs ? [["image", "Add image", "image"], ["video", "Add video", "video"],
@@ -4131,6 +5320,9 @@ export class TimelineBody {
         // End of the cluster, and the end of the piece: everything above it
         // adds to the scene, and this is the one that takes the scene back.
         this.clearTool(),
+        ...(this.preStage ? [this.renderPreStageTool()] : []),
+        ...(this.tools ? [tool("Tools", "panel", t("Tools"),
+          () => this.tools(), { class: "mmc-tool mmc-tool-expand mmc-tool-tools" })] : []),
       ]),
       el("div", { class: "mmc-rail-group" }, [
         tool("Presets", "star",
@@ -4172,6 +5364,7 @@ export class TimelineBody {
    *  the node-side twin of. */
   async addPoolAssets(kind) {
     const chosen = await openPicker({
+      selectionPurpose: "timeline-node-pool-files",
       kinds: [kind, "renders", "refmods"],
       kind,
       referenceOptions: {},
@@ -4208,10 +5401,7 @@ export class TimelineBody {
 
   async manageLoras(entry = null) {
     await openLoras({
-      state: this.timeline,
-      family: S.pieceFamily(this.timeline),
-      targets: S.timelineCheckpoints(this.timeline),
-      scope: "piece",
+      ...globalLoraOptions(this.timeline),
       reveal: entry?.name ?? null,
       onChange: () => this.commit(),
     });
@@ -4222,7 +5412,6 @@ export class TimelineBody {
     const segments = this.timeline.segments;
     const single = S.isSingle(this.timeline);
     const passes = S.passes(this.timeline);
-    const seconds = S.timelineSeconds(this.timeline);
     probeAspectSizes(this.timeline, () => this.render());
     const { width, height, ratio, fromInput } = timelineGeometry(this.timeline);
     const rules = rulesFor(S.pieceFamily(this.timeline));
@@ -4233,10 +5422,12 @@ export class TimelineBody {
       ...(this.timeline.music?.trim() ? [t("music")] : []),
     ];
 
+    this.summaryStats = timelineSummary(this.timeline);
+    this.summaryStats.classList.add("mmc-tl-node-stats");
     return el("div", { class: "mmc-panel mmc-tl-summary" }, [
       // The prompt's room, not the prompt: the text is clamped to six lines
       // (see the stylesheet for why), so this wrapper is what soaks up the
-      // panel's free height on a tall node — the reel and the pills dock to
+      // panel's free height on a tall node — the stats and the pills dock to
       // the bottom, beside the sampler rows, the way the shot face's writing
       // box already pushes its controls down. All of it opens the strip.
       el("div", { class: "mmc-tl-summary-room", onclick: () => this.open() }, [
@@ -4247,14 +5438,7 @@ export class TimelineBody {
             : t("No global prompt yet — the standing description every segment inherits.")),
         }),
       ]),
-      // The one picture of the timeline the node has room for: blocks at their
-      // real relative lengths, so a 10-second shot is visibly twice a 5. Merged
-      // shots close ranks under one outline — the same reading as the modal's
-      // casing, at a tenth the size.
-      // Always a lane: `syncTimeline` keeps a piece at one shot or more, and a
-      // piece of one wears that shot's editor rather than this summary — so by
-      // the time anything gets here there are at least two cards to draw.
-      this.renderLane(passes),
+      this.summaryStats,
       el("div", { class: "mmc-pills" }, [
         // The model leads even the render mode, which is the one thing about
         // this node that changes what all the other numbers mean — because the
@@ -4282,17 +5466,6 @@ export class TimelineBody {
               ? t(segments.length === 1 ? "{count} shot" : "{count} shots", { count: segments.length })
               : t(segments.length === 1 ? "{count} segment" : "{count} segments", { count: segments.length }),
           }),
-        ]),
-        el("span", { class: "mmc-pill mmc-pill-static",
-                     title: S.hasAutoDuration(this.timeline)
-                       ? t("An estimate: a shot on auto is measured by the model "
-                         + "while it renders, so the finished length is not known "
-                         + "until it has.")
-                       : t("The finished clip's length at {fps} fps",
-                           { fps: rules.fps }) }, [
-          icon("clock", 16),
-          el("span", { text: S.hasAutoDuration(this.timeline)
-            ? `~${seconds.toFixed(1)} s` : `${seconds.toFixed(1)} s` }),
         ]),
         el("span", {
           class: "mmc-pill mmc-pill-static",
@@ -4336,19 +5509,7 @@ export class TimelineBody {
           class: "mmc-pill mmc-pill-static",
           title: t("The Context-IR audio fields this timeline sets for every segment."),
         }, [icon("audio", 16), el("span", { text: audio.join(" · ") })])] : []),
-        el("button", {
-          class: "mmc-tl-open",
-          title: t("Open the timeline: the global prompt, the segments, and what happens between them"),
-          onclick: () => this.open(),
-        }, [icon("sliders", 16), el("span", { text: t("Edit timeline") })]),
-        ...(this.fullscreen ? [el("button", {
-          class: "mmc-pill mmc-fs-enter",
-          title: t("Draw this piece over the whole window. The node stays in the graph "
-                 + "and is queued exactly as it is now; Escape brings you back."),
-          onclick: () => this.fullscreen(),
-        }, [icon("expand", 16), el("span", { text: t("Fullscreen") })])] : []),
         ...(this.pieceView() ? [this.renderPieceViewPill()] : this.renderHeldPieceViewPill()),
-        ...(this.preStage ? [this.renderPreStagePill()] : []),
       ]),
     ]);
   }
@@ -4406,174 +5567,21 @@ export class TimelineBody {
     }, [icon("timeline", 16), el("span", { text: t("Timeline") })])];
   }
 
-  /**
-   * The reel: every shot as a block of the width its own length earns.
-   *
-   * Two readings out of one markup, chosen by how much room a block gets — see
-   * `fitLane`. Roomy, a block is a labelled tile: its number, its length, a link
-   * glyph where the seam continues. Crowded, the labels come off and the row
-   * closes into a single band with the shots divided by frame lines, numbered
-   * along its edge the way footage counters run down the edge of film rather
-   * than across the picture. The proportions are the same band either way; what
-   * changes is only what there is room to print on it.
-   */
-  renderLane(passes) {
-    this.lane = el("div", { class: "mmc-tl-lane" }, passes.map((pass) => {
-      const { at, total } = S.cutTimes(pass.segments);
-      const shared = pass.segments.length > 1;
-      return el("div", {
-        // The run takes the width its shots add up to, and they divide it
-        // between themselves — so the lane stays proportional whatever is
-        // merged into what.
-        class: `mmc-tl-run${shared ? " on" : ""}`,
-        style: { flexGrow: String(Math.max(1, total)) },
-      }, pass.segments.map((segment, offset) => {
-        const index = pass.start + offset;
-        // A clip's length is the window that plays, not the file's, and it has
-        // no mode: nothing is sampled, so there is no route to name.
-        const seconds = S.segmentSeconds(segment);
-        const what = S.isClip(segment) ? t("clip") : S.mode(segment, this.timeline);
-        // A seam only exists in front of a pass. Inside one the cut is a line
-        // of the description, so the block reads as a shot rather than a join.
-        const continues = !offset && index > 0 && S.continues(segment);
-        // Crowded, the reel marks the exception rather than the rule: a strip
-        // whose seams nearly all continue is one unbroken take, and colouring
-        // every one of them says only that the feature exists. The hard cut is
-        // the thing that happens rarely, so the hard cut is what gets drawn —
-        // as a real break in the band, which is what it is.
-        const cut = !offset && index > 0 && !continues;
-        // ...and the same picture the strip draws, at a tenth the size: a block
-        // filled in because the film exists, hollow because it does not. What
-        // the node's one honest picture of the piece is for is knowing where
-        // the shoot has got to without opening the strip.
-        const head = pass.segments[0];
-        const state = S.isHeld(head) ? (S.takeOn(head) ? " kept" : " unshot") : "";
-        return el("div", {
-          class: `mmc-tl-tick${continues ? " on" : ""}${cut ? " cut" : ""}${state}`,
-          style: { flexGrow: String(Math.max(1, seconds)) },
-          title: shared
-            ? (offset
-                ? t("Shot {n} · {s} s · cuts in at {time} of this pass",
-                    { n: index + 1, s: seconds, time: S.shotTime(at[offset]) })
-                : t("Shot {n} · {s} s · opens a pass of {count}",
-                    { n: index + 1, s: seconds, count: pass.segments.length }))
-            : (continues
-                ? t("Segment {n} · {s} s · {mode} · continues from segment {from}",
-                    { n: index + 1, s: seconds, mode: what,
-                      from: S.continueSource(segment, index) })
-                : t("Segment {n} · {s} s · {mode} · hard cut",
-                    { n: index + 1, s: seconds, mode: what })),
-        }, [
-          ...(continues ? [icon("link", 13)] : []),
-          el("span", { class: "mmc-tl-tick-n", text: String(index + 1) }),
-          el("span", { class: "mmc-tl-tick-s", text: `${Math.round(seconds * 10) / 10}s` }),
-        ]);
-      }));
-    }));
-    this.edge = el("div", { class: "mmc-tl-edge" });
-    // The observer is the lane's, not the render's: the node is resizable, and
-    // dragging it narrower is exactly how a roomy strip becomes a crowded one.
-    this.laneFit ??= new ResizeObserver(() => this.fitLane());
-    return el("div", { class: "mmc-tl-reel", onclick: () => this.open() }, [this.lane, this.edge]);
-  }
 
-  /**
-   * Measure the lane and pick the reading that fits.
-   *
-   * A block needs about 46 px to hold "12" and "15s" side by side, and about
-   * 30 to hold the number alone — under which the same markup draws the digits
-   * of one shot over the digits of the next, which is what a ten-minute strip
-   * of forty-seven shots looked like. So nothing is guessed from the count:
-   * the lane asks how wide its own blocks came out and gives up one label at a
-   * time, in the order of what it can afford to lose — the length first, since
-   * a band drawn to scale is already a picture of the lengths.
-   */
-  fitLane() {
-    const lane = this.lane;
-    if (!lane?.isConnected) return;
-    const blocks = [...lane.querySelectorAll(".mmc-tl-tick")];
-    const width = lane.clientWidth;
-    // Called once before layout on every render; the observer calls back the
-    // moment there is a width to measure.
-    if (!blocks.length || !width) return;
-
-    // The average block, not the narrowest: whether this is a strip of tiles or
-    // a band is one decision about the whole lane, and a single three-second
-    // shot among twenty long ones should not make that decision for it.
-    const per = width / blocks.length;
-    const dense = per < 46;
-    let crowded = per < 30;
-
-    // What the number itself needs — shot 7 fits where shot 47 does not, and
-    // dropping a digit that would have fitted reads as a blank block rather
-    // than as a tight one. Measured from the block at full label, never from
-    // the block as it was left last time: a hidden label makes a block
-    // narrower, so measuring the trimmed one would find it narrower still and
-    // never give the label back. Laid-out width, not painted width:
-    // getBoundingClientRect() reports the box *after* every transform on the
-    // way up the tree, and the fullscreen card is turned on its vertical axis
-    // while it swaps steps — so a fit that ran during the turn measured every
-    // block as a few pixels wide, went bare on all of them, and stayed that
-    // way. offsetWidth is the layout answer, which is the question.
-    for (const block of blocks) block.classList.remove("narrow", "bare");
-    const bare = (block) => {
-      const digits = block.querySelector(".mmc-tl-tick-n")?.textContent.length ?? 2;
-      return block.offsetWidth < 16 + 9 * digits;
-    };
-    // On a band, all the numbers or none of them. A tile with no number among
-    // tiles that have them is a tile that is short; a bare cell at the head of
-    // a band with no gaps in it is a band that looks cut off at the edge —
-    // three short opening shots on a seventeen-shot piece read as "3 4 5 …"
-    // with something missing before it. So one short shot on a band takes the
-    // whole band to the edge reading, where the counting is done beside the
-    // film and no cell has to hold a numeral.
-    if (dense && !crowded && blocks.some(bare)) crowded = true;
-    lane.classList.toggle("dense", dense);
-    lane.classList.toggle("crowded", crowded);
-
-    if (!crowded) {
-      // Above that, each block answers for itself: whether the lane is a strip
-      // of tiles or a band is one decision about the whole lane, but what fits
-      // on a block is a question about that block. A three-second shot beside a
-      // twenty is a quarter of its width, and giving both the same labels is
-      // how the short one ends up with a clipped one.
-      this.edge.replaceChildren();
-      for (const block of blocks) {
-        block.classList.toggle("narrow", block.offsetWidth < 46);
-        block.classList.toggle("bare", bare(block));
-      }
-      return;
-    }
-
-    // Edge code: a numeral every few shots, at the widest cadence that still
-    // keeps two numbers well clear of each other. Sparse on purpose — its job
-    // is to make the band countable, not to name every block on it.
-    const step = [1, 2, 5, 10, 20, 25, 50].find((n) => per * n >= 56) ?? 100;
-    // Layout again, and for the same reason — nothing between the lane and a
-    // block is positioned, so the two offsets are measured from the same corner
-    // and the difference is the block's distance along the lane.
-    const origin = lane.offsetLeft;
-    this.edge.replaceChildren(...blocks.flatMap((block, index) => (index % step ? [] : [
-      el("span", {
-        class: "mmc-tl-edge-n",
-        style: { left: `${block.offsetLeft - origin}px` },
-        text: String(index + 1),
-      }),
-    ])));
-  }
-
-  /** Same pill as the Creator's — see `CreatorEditor.renderPreStagePill`. */
-  renderPreStagePill() {
+  /** The strip face's pre-stage toggle, with its original action and wording. */
+  renderPreStageTool() {
     const on = this.preStage.active();
     return el("button", {
-      class: `mmc-pill mmc-prestage-toggle${on ? " on" : ""}`,
+      class: `mmc-tool mmc-prestage-toggle${on ? " on" : ""}`,
+      "aria-pressed": String(on),
       title: on
         ? t("The pre-stage node on the left generates stills for this timeline — the opening "
           + "frame, the closing frame, references. Click to remove it.")
         : t("Add a pre-stage: an image node (Krea 2 / Ideogram 4) at this node's left edge whose "
           + "stills land on the timeline's shots with one click."),
       onclick: () => { this.preStage.toggle(); this.render(); },
-    }, [icon("image", 16), el("span", { text: t("pre-stage") })]);
+    }, [el("span", { class: "mmc-tool-icon" }, [icon("image")]),
+        el("span", { text: t("Pre-stage") })]);
   }
 
   /**
@@ -4748,8 +5756,6 @@ export class TimelineBody {
       trailing: [
         // Only where the family has the pass, or where one is already on —
         // see the same gate, and the same reason, on the Creator's own row.
-        ...(S.canDo(this.timeline, "face") || S.faceAnywhere(this.timeline)
-          ? [facesPill({ target: this.timeline, commit: () => this.commit() })] : []),
         // The DLSS 5 refiner, family-neutral: it runs over decoded frames.
         neuralPill({ target: this.timeline, commit: () => this.commit(),
                      // TimelineBody has no geometry() method; the modal does.

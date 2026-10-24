@@ -87,7 +87,7 @@ try {
   };
   for (const [name, text] of Object.entries(cases)) {
     box.setValue(text);
-    const chips = [...box.root.childNodes].filter((n) => n.dataset?.say !== undefined);
+    const chips = [...box.root.childNodes].filter((n) => n.classList?.contains("mmc-dialogue"));
     out.round[name] = {
       back: box.getValue(),
       same: box.getValue() === text,
@@ -97,13 +97,17 @@ try {
       // `text` and not `textContent`: the shim flattens what is rendered
       // under a node onto the first and leaves the second the node's own.
       shown: chips.map((chip) => chip.text.replace(/\s+/g, " ").trim()).join(" | "),
+      speech: chips.map((chip) => chip.dataset.say),
+      language: chips.map((chip) => chip.dataset.language),
+      speakers: [...box.root.querySelectorAll("[data-handle]")]
+        .map((node) => node.dataset.handle),
     };
   }
 
   // The chip, wherever the box put it. Not `childNodes[0]`: the box pads a
   // leading chip with a zero-width text node so there is a caret position in
   // front of it, and a click finds the chip with `closest` rather than by index.
-  const sayChip = () => [...box.root.childNodes].find((n) => n.dataset?.say !== undefined);
+  const sayChip = () => [...box.root.childNodes].find((n) => n.classList?.contains("mmc-dialogue"));
 
   // A chip is contenteditable="false", and Gecko puts no caret at a spot with no
   // text node beside it — so a sentence that *ends* in a spoken line had no
@@ -161,7 +165,7 @@ try {
     const reopen = () => {
       box.closeMenu();
       box.setValue(START);
-      box.editSaid(box.root.querySelector("[data-say]"));
+      box.editSaid(box.root.querySelector(".mmc-dialogue"));
     };
 
     reopen();
@@ -208,7 +212,7 @@ try {
   {
     box.closeMenu();
     box.setValue("(S@anna) says: <d>[English] Here.</d>");
-    box.editSaid(box.root.querySelector("[data-say]"));
+    box.editSaid(box.root.querySelector(".mmc-dialogue"));
     await new Promise((f) => setTimeout(f, 0));
     // The handler itself, because the shim's document takes listeners and
     // forgets them. It is registered on a timeout and torn down by `closeMenu`,
@@ -225,7 +229,7 @@ try {
     out.away.inside = { menu: !!box.menu, text: box.getValue() === held };
 
     box.setValue("(S@anna) says: <d>[English] Here.</d>");
-    box.editSaid(box.root.querySelector("[data-say]"));
+    box.editSaid(box.root.querySelector(".mmc-dialogue"));
     await new Promise((f) => setTimeout(f, 0));
     // A press on the menu itself is somebody using it.
     box.away({ target: box.menu });
@@ -350,25 +354,23 @@ for name in ("plain", "delivered", "together", "voiceover", "inSentence", "uncas
           round_trip.get(name, {}).get("same"), True)
 
 check("a spoken line is one chip", round_trip["plain"]["chips"], 1)
-check("...and shows the speaker and the words",
-      round_trip["plain"]["shown"], "@anna “I get off at the next station.”")
-# The delivery and the language show only where they are not the ordinary
-# answer, which is the whole reason the plain one above shows neither.
-check("a delivery that is not `says` is on the chip",
-      "WHISPERS" in round_trip["delivered"]["shown"].upper(), True)
-check("...and so is a language that is not English",
-      "FR" in round_trip["delivered"]["shown"], True)
-check("two speakers are one chip naming both",
-      round_trip["together"]["shown"].split("“")[0].strip(), "@anna @ben shouts")
-check("a voiceover is one chip, tail and all", round_trip["voiceover"]["chips"], 1)
+check("...and holds only the actual d block",
+      round_trip["plain"]["speech"], ["<d>[English] I get off at the next station.</d>"])
+check("the speaker remains its own citation outside the dialogue chip",
+      round_trip["delivered"]["speakers"], ["ben"])
+check("the language is retained independently of its translated display name",
+      round_trip["delivered"]["language"], ["French"])
+check("two speakers remain separate citations before one dialogue chip",
+      round_trip["together"]["speakers"], ["anna", "ben"])
+check("a voiceover has one dialogue chip", round_trip["voiceover"]["chips"], 1)
 
 # §4.5: plain double quotes are what a sign or a subtitle already is, so the
 # box has one chip in that sentence and not two.
 check("an on-screen quote is left as the text it is",
       round_trip["inSentence"]["chips"], 1)
-# A speaker nobody cast stays prose, exactly as an uncited `@name` does.
-check("a line by somebody uncast is not drawn as one",
-      round_trip["uncast"]["chips"], 0)
+# Dialogue syntax is independent from whether its speaker has a live reference.
+check("a line by somebody uncast still has its dialogue recognized",
+      round_trip["uncast"]["chips"], 1)
 check("the walk counts a spoken line as its own length",
       round_trip["offsets"]["walked"], round_trip["offsets"]["source"])
 

@@ -452,12 +452,18 @@ const SEAM_HANDOFFS = [
 
 const PLAYBACK = [
   { value: true, label: "Plays itself",
-    note: "What the stage has always done: the clip loops silently as soon as it "
-        + "lands, and the sound follows the pointer." },
+    note: "The finished clip starts playing and loops. Preview audio is controlled separately." },
   { value: false, label: "Waits for play",
     note: "The finished clip holds its first frame, still, with the browser's "
         + "controls to start it. For crowded canvases, where every looping clip is "
         + "a decoder running for nobody. The step preview keeps moving either way." },
+];
+
+const PREVIEW_AUDIO = [
+  { value: "muted", label: "Muted by default",
+    note: "Finished previews start muted. Use their video controls to enable sound. Moving the pointer does not change audio." },
+  { value: "hover", label: "Sound on hover",
+    note: "Finished previews play sound while the pointer is over the video. Moving away mutes them." },
 ];
 
 const ADVANCED = [
@@ -1239,6 +1245,16 @@ class SettingsPage {
           options: PLAYBACK,
           value: this.settings.autoplay_previews !== false,
           apply: (value) => this.set({ autoplay_previews: value }),
+        }),
+      }),
+      this.row({
+        key: "preview_audio",
+        name: "Preview audio",
+        ...this.segment({
+          options: PREVIEW_AUDIO,
+          value: this.settings.preview_audio === "hover" ? "hover" : "muted",
+          also: "For the node preview and fullscreen take review. Timeline card volume is set separately.",
+          apply: (value) => this.set({ preview_audio: value }),
         }),
       }),
       this.row({

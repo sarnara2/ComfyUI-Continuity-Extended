@@ -9,6 +9,7 @@ import { DEFAULT_STILL_ARCH, DEFAULT_VIDEO_FAMILY, STILL_ARCHES,
          UPSCALERS, VIDEO_FAMILIES, family as anyFamily, stillFamily, upscaler, videoFamily } from "./manifest.js";
 import { t } from "./i18n.js";
 import { parseScreens, serializeScreens } from "./screenspec.js";
+import { withRuntimePrompts } from "./prompt-overrides.js";
 // Where files land is not in the blob any more — it is a preference of this
 // machine, in `settings.js`, so a shared workflow does not carry one person's
 // folder names onto another person's disk.
@@ -32,6 +33,8 @@ export const DEFAULT_DURATION_S = 6;
 // becomes when it is taught to ask the piece which family it is drawing.
 
 export { VIDEO_FAMILIES, DEFAULT_VIDEO_FAMILY };
+
+export const hasPromptSections = (piece) => videoFamily(pieceFamily(piece)).prompt.pipeline === "context-ir";
 
 /** The id a piece renders with, validated. An absent or unknown one is the
  *  default — see `compile.piece_family` for why an unrecognised id is a piece
@@ -262,6 +265,14 @@ export function plateEntry(picked, taken, {
     if (source.crop) made.crop = source.crop;
     if (TAKES.image.includes(source.takes)) made.takes = source.takes;
     else if (before?.takes) made.takes = before.takes;
+    // Keep a panel's own prose when the same file returns. A former single
+    // image becoming the sheet keeps its owner prose on the sheet, not twice
+    // (once there and again on its newly allocated panel).
+    if (before?.handle !== entry.handle) {
+      for (const key of ["description", "usage_rules"]) {
+        if (typeof before?.[key] === "string") made[key] = before[key];
+      }
+    }
     taken.add(made.handle);
     entry.panels.push(made);
   }
@@ -485,6 +496,7 @@ export const takeable = (asset) => takeOptions(asset).length > 0;
 /** What the slot a file sits in says the file should be narrowed to, or null
  *  where the file has no such word to take. */
 export function slotTake(subject, slot, asset) {
+  if (slot === "replaces" && subject.replacement_reference_only) return null;
   const wanted = slot === "from" ? (subject.takes ?? "person")
     : slot === "motion" ? "motion"
     : slot === "voice" ? "voice"
@@ -1421,9 +1433,8 @@ export function redetailTarget(target, ratio, backend = upscalerOf(target)) {
  * face is cropped out frame by frame, re-drawn at a canvas where it fills the
  * picture, and composited back.
  *
- * The piece owns the two knobs and a card owns only the switch: "on", "off", or
- * nothing at all, which inherits. How the pass works is one answer per render;
- * what a card gets to say is whether this shot is one that needs it.
+ * Each generated shot owns its switch and both knobs. `face_schema` marks the
+ * one-time move away from the old piece-wide switch; old workflows start OFF.
  */
 export const DEFAULT_FACE_CANVAS = 512;
 // The face pass belongs to the default family — it is written against that
@@ -1435,7 +1446,7 @@ export const MAX_FACE_CANVAS = VIDEO_RULES.nativeShortEdge;
 export const DEFAULT_FACE_DENOISE = 0.45;
 export const MIN_FACE_DENOISE = 0.1;
 export const MAX_FACE_DENOISE = 0.9;
-export const FACE_OVERRIDES = ["on", "off"];
+export const FACE_SCHEMA = 1;
 
 /**
  * The DLSS 5 neural refiner: a material pass over the finished frames.
@@ -1627,7 +1638,7 @@ export function parseFace(raw) {
   const face = { ...emptyFace(), ...(raw && typeof raw === "object" ? raw : {}) };
   const canvas = Number(face.canvas);
   const denoise = Number(face.denoise);
-  face.on = Boolean(face.on);
+  face.on = face.on === true;
   face.canvas = Number.isFinite(canvas)
     ? Math.min(MAX_FACE_CANVAS, Math.max(MIN_FACE_CANVAS,
         Math.round(canvas / VIDEO_RULES.multiple) * VIDEO_RULES.multiple))
@@ -1638,26 +1649,20 @@ export function parseFace(raw) {
   return face;
 }
 
-/** Absent while it is off, so every blob that never asked for one is unchanged. */
-export const serializeFace = (face) =>
-  (face?.on ? { face: { on: true, canvas: face.canvas, denoise: face.denoise } } : {});
-
-/** What one card's switch says: "on", "off", or "" for inherit. */
-export const faceOverride = (segment) =>
-  (FACE_OVERRIDES.includes(segment?.face) ? segment.face : "");
-
-/** Whether this shot runs the face pass, piece and card taken together. */
-export const faceOn = (piece, segment) => {
-  const override = faceOverride(segment);
-  if (override) return override === "on" && Boolean(piece?.face?.on);
-  return Boolean(piece?.face?.on);
+/** OFF is explicit too: retain the shot's knobs and the migration boundary. */
+export const serializeFace = (face) => {
+  const { on, canvas, denoise } = parseFace(face);
+  return { face: { on, canvas, denoise } };
 };
+
+/** No piece-wide inheritance; clips and unsupported families never run it. */
+export const faceOn = (piece, segment) =>
+  !isClip(segment) && canDo(piece, "face") && segment?.face?.on === true;
 
 /** Whether any shot on this strip runs one — what decides if a detector is
  *  needed at all. Mirrors the `face` flag `render.emit` hands `models.check`. */
 export const faceAnywhere = (timeline) =>
-  Boolean(timeline?.face?.on)
-  && (timeline.segments ?? []).some((segment) => !isClip(segment) && faceOn(timeline, segment));
+  (timeline.segments ?? [timeline]).some((segment) => faceOn(timeline, segment));
 
 const clampRefineDenoise = (value) => {
   const n = Number(value);
@@ -1718,7 +1723,8 @@ export function emptyState() {
     refine_denoise: DEFAULT_REFINE_DENOISE,
     refine_upscaler: DEFAULT_REFINE_UPSCALER,
     refine_steps: DEFAULT_REFINE_STEPS,
-    // The face pass, off until asked for. Owned wherever the canvas is owned.
+    face_schema: FACE_SCHEMA,
+    // The face pass, owned by this shot and off until explicitly asked for.
     face: emptyFace(),
     // The DLSS 5 refiner over the finished frames, off until asked for.
     neural: emptyNeural(),
@@ -1755,6 +1761,7 @@ function parseSubjects(raw, family = DEFAULT_VIDEO_FAMILY) {
       from: Array.isArray(s.from) ? s.from.filter((h) => typeof h === "string") : [],
       takes: SUBJECT_TAKES.includes(s.takes) ? s.takes : "person",
       ...(s.description ? { description: String(s.description) } : {}),
+      ...(s.usage_rules ? { usage_rules: String(s.usage_rules) } : {}),
       ...(subjectFeatures(s).length ? { features: subjectFeatures(s) } : {}),
       // Two states, one empty list: see `seedSubject`. Written only where it is
       // true, so a piece nobody has opened since is byte-identical.
@@ -1763,6 +1770,7 @@ function parseSubjects(raw, family = DEFAULT_VIDEO_FAMILY) {
       ...(s.voice ? { voice: String(s.voice) } : {}),
       ...(replacesOf(s).length ? { replaces: replacesOf(s) } : {}),
       ...(s.replaces_what ? { replaces_what: String(s.replaces_what) } : {}),
+      ...(s.replacement_reference_only === true ? { replacement_reference_only: true } : {}),
       ...(SUBJECT_MARKERS.includes(s.relationship) ? { relationship: s.relationship } : {}),
       ...(Object.keys(subjectNotes(s)).length ? { notes: subjectNotes(s) } : {}),
       ...(Object.keys(subjectTriggers(s)).length ? { triggers: subjectTriggers(s) } : {}),
@@ -1816,6 +1824,7 @@ export function parseState(raw) {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object") {
       const state = { ...emptyState(), ...parsed };
+      normalizePromptSections(state);
       // Workflows saved before LoRAs existed have no key at all, and a
       // hand-edited blob can have the wrong type in it.
       if (!Array.isArray(state.loras)) state.loras = [];
@@ -1841,6 +1850,8 @@ export function parseState(raw) {
       state.refine_upscaler = parseRefineUpscaler(state.refine_upscaler);
       state.refine_steps = clampRefineSteps(state.refine_steps);
       state.face = parseFace(state.face);
+      if (parsed.face_schema !== FACE_SCHEMA) state.face.on = false;
+      state.face_schema = FACE_SCHEMA;
       state.neural = parseNeural(state.neural);
       // The screens this shot replaces (`screens.js`). Absent is none, which
       // is what every card written before them says.
@@ -1923,10 +1934,14 @@ function serializeRefined(refined) {
       // join when it was written, and compile leaves it whole.
       ...(refined.scope === "shot" ? { scope: "shot" } : {}),
       ...(sections ? { sections: { ...sections } } : {}),
+      ...(Array.isArray(refined.fields) ? { fields: [...new Set(refined.fields.filter((field) =>
+        ["summary", "retention_analysis", "prompt"].includes(field)))] } : {}),
       // Kept so the panel can say the prompt has moved on since; compile.py
       // never reads either, and both are small enough not to be worth splitting
       // out of the one object that says "this was refined".
       source: refined.source ?? "",
+      ...(refined.sources ? { sources: Object.fromEntries(Object.entries(refined.sources).filter(
+        ([field, value]) => ["summary", "retention_analysis", "prompt"].includes(field) && typeof value === "string")) } : {}),
       ...(refined.model ? { model: refined.model } : {}),
       // Which template wrote this prose, and whether it was pinned — kept for
       // the same reason as `model`: after a reload it is the only record of
@@ -1952,6 +1967,9 @@ function serializeRefined(refined) {
 function serializeAssets(assets) {
   return assets.map((asset) => {
     const out = { handle: asset.handle, kind: asset.kind, role: asset.role, filename: asset.filename };
+    for (const key of ["description", "usage_rules"]) {
+      if (typeof asset[key] === "string" && asset[key].trim()) out[key] = asset[key];
+    }
     // Absent means live, so nothing that was never muted grows a key.
     if (asset.enabled === false) out.enabled = false;
     if (asset.kind === "video") out.track = asset.track || DEFAULT_TRACK;
@@ -1981,6 +1999,8 @@ function serializeAssets(assets) {
     // editor rendered whole and was forgotten on reload, and a cut-out came
     // back as the flat composite with its panels' handles gone.
     if (asset.crop) out.crop = { ...asset.crop };
+    if (asset.replacement_origin) out.replacement_origin = { ...asset.replacement_origin };
+    if (asset.replacement_annotation) out.replacement_annotation = structuredClone(asset.replacement_annotation);
     // The picture's saved renditions, by latent space (`compile.Asset.mods`).
     // Only where there are any, so a picture nobody saved adds nothing.
     if (asset.mods && Object.keys(asset.mods).length) out.mods = { ...asset.mods };
@@ -1992,6 +2012,8 @@ function serializeAssets(assets) {
         ...(panel.rect ? { rect: [...panel.rect] } : {}),
         ...(panel.points?.length ? { points: panel.points.map((p) => ({ ...p })) } : {}),
         ...(panel.crop ? { crop: { ...panel.crop } } : {}),
+        ...(typeof panel.description === "string" && panel.description.trim() ? { description: panel.description } : {}),
+        ...(typeof panel.usage_rules === "string" && panel.usage_rules.trim() ? { usage_rules: panel.usage_rules } : {}),
       }));
     }
     return out;
@@ -2004,6 +2026,7 @@ function serializeAssets(assets) {
 function serializeCommon(state, family = DEFAULT_VIDEO_FAMILY) {
   return {
     prompt: state.prompt ?? "",
+    ...serializePromptSections(state),
     ...serializeRefined(state.refined),
     // An empty field is emitted as nothing, which is not the same as "N/A" —
     // see contextir.compose. A segment leaving them blank inherits the
@@ -2025,9 +2048,61 @@ function serializeCommon(state, family = DEFAULT_VIDEO_FAMILY) {
   };
 }
 
+export function serializePromptSections(state) {
+  const out = {};
+  if (state.prompt_sections && typeof state.prompt_sections === "object" && !Array.isArray(state.prompt_sections)) {
+    const sections = Object.fromEntries(Object.entries(state.prompt_sections)
+      .filter(([, value]) => typeof value === "string"));
+    if (Object.keys(sections).length) out.prompt_sections = sections;
+  }
+  if (Array.isArray(state.retention_blocks)) {
+    out.retention_blocks = state.retention_blocks.flatMap((block) =>
+      block?.type === "text" && typeof block.text === "string" ? [{ type: "text", text: block.text }]
+      : block?.type === "subject" && typeof block.handle === "string" ? [{ type: "subject", handle: block.handle }]
+      : []);
+  }
+  if (Array.isArray(state.retention_overrides)) {
+    out.retention_overrides = [...new Set(state.retention_overrides.filter((handle) => typeof handle === "string"))];
+  }
+  return out;
+}
+
+function normalizePromptSections(state) {
+  const stored = serializePromptSections(state);
+  for (const key of ["prompt_sections", "retention_blocks", "retention_overrides"]) delete state[key];
+  Object.assign(state, stored);
+}
+
+export function promptSectionTexts(state) {
+  const texts = Object.entries(state.prompt_sections ?? {})
+    .filter(([name, value]) => typeof value === "string"
+      && !(name === "retention_analysis" && Array.isArray(state.retention_blocks)))
+    .map(([, value]) => value);
+  for (const block of Array.isArray(state.retention_blocks) ? state.retention_blocks : []) {
+    if (block?.type === "text" && typeof block.text === "string") texts.push(block.text);
+  }
+  return texts;
+}
+
+function renameSectionCitations(state, rename) {
+  for (const [name, text] of Object.entries(state.prompt_sections ?? {})) {
+    if (typeof text === "string") state.prompt_sections[name] = renameCitations(text, rename);
+  }
+  for (const block of state.retention_blocks ?? []) {
+    if (block?.type === "text") block.text = renameCitations(block.text, rename);
+  }
+  for (const asset of state.assets ?? []) {
+    const origin = asset.replacement_origin;
+    if (origin && rename.has(origin.handle)) {
+      asset.replacement_origin = { ...origin, handle: rename.get(origin.handle) };
+    }
+  }
+}
+
 export function serializeState(state) {
   return JSON.stringify({
     version: 1,
+    face_schema: FACE_SCHEMA,
     ...serializeCommon(state),
     aspect: state.aspect,
     short_edge: state.short_edge,
@@ -2364,7 +2439,7 @@ export function editedSince(timeline) {
  *  twenty times to answer one question about it. */
 function stampsOf(timeline) {
   const blob = JSON.parse(serializeTimeline(timeline));
-  const { segments, ...piece } = blob;
+  const { segments, extended_ui, ...piece } = blob;
   const head = JSON.stringify(piece);
   return (segments ?? []).map((card) => {
     const { hold, take, card_id, ...rest } = card;
@@ -2436,9 +2511,8 @@ export function emptyTimeline() {
     refine_denoise: DEFAULT_REFINE_DENOISE,
     refine_upscaler: DEFAULT_REFINE_UPSCALER,
     refine_steps: DEFAULT_REFINE_STEPS,
-    // The face pass, off until asked for. One answer for the whole piece; a
-    // card may still opt out of it.
-    face: emptyFace(),
+    // Explicit even while every shot is OFF; a saved choice never re-migrates.
+    face_schema: FACE_SCHEMA,
     // The DLSS 5 refiner over the finished frames, off until asked for.
     neural: emptyNeural(),
     // The guide-LoRA pass over the written passes, off until asked for.
@@ -2527,13 +2601,15 @@ export function emptyTimeline() {
  * scene. The sampler row is not in the blob at all and so is untouched by
  * construction.
  */
-export const CLEARED_KEYS = ["prompt", "soundscape", "music", "refined", "assets", "subjects",
+export const CLEARED_KEYS = ["prompt", "prompt_sections", "retention_blocks", "retention_overrides",
+                             "soundscape", "music", "refined", "assets", "subjects",
                              "sound", "segments"];
 
 /** The shot's own writing — everything on a card that is not mirrored down onto
  *  it by `syncCanvas`, which is where the canvas and the pool arrive from. */
 const segmentWritten = (segment) =>
   Boolean((segment.prompt || "").trim()
+    || promptSectionTexts(segment).some((text) => text.trim())
     || (segment.soundscape || "").trim()
     || (segment.music || "").trim()
     || segment.refined
@@ -2543,13 +2619,14 @@ const segmentWritten = (segment) =>
     || segment.duration_s !== DEFAULT_DURATION_S
     || segment.auto_duration
     || (segment.checkpoint && segment.checkpoint !== "auto")
-    || faceOverride(segment));
+    || segment.face?.on === true);
 
 /** Whether `clearPiece` would change anything. A piece still as it was dropped
  *  has nothing to clear, and the tool says so by being unavailable rather than
  *  by arming, confirming and then doing nothing. */
 export function pieceWritten(timeline) {
   if (CLEARED_KEYS.some((key) => typeof timeline[key] === "string" && timeline[key].trim())) return true;
+  if (promptSectionTexts(timeline).some((text) => text.trim())) return true;
   if (timeline.refined) return true;
   if (timeline.assets?.length) return true;
   if (timeline.subjects?.length) return true;
@@ -2724,6 +2801,15 @@ export function castAssets(timeline) {
   return [...(timeline.assets ?? []), ...lone];
 }
 
+export function staleReplacementReferences(assets) {
+  const sources = new Map(assets.map(asset => [asset.handle, asset]));
+  return assets.filter(asset => {
+    const origin = asset.replacement_origin;
+    const source = origin && sources.get(origin.handle);
+    return source?.kind === "video" && source.filename !== origin.filename;
+  });
+}
+
 /** `text` with `@old` rewritten to `@new` for each entry of `renamed`. The
  *  word boundary is what keeps `@img-1` off the front of `@img-10`. */
 function renameCitations(text, renamed) {
@@ -2732,6 +2818,24 @@ function renameCitations(text, renamed) {
     out = out.replace(new RegExp(`@${from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"), `@${to}`);
   }
   return out;
+}
+
+function renameAssetAnnotations(assets, renamed, seen = new Set()) {
+  if (!renamed.size) return false;
+  let changed = false;
+  const escape = (handle) => handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`(?<![\\w@])@(${[...renamed.keys()].map(escape).join("|")})(?![\\w-])`, "g");
+  for (const asset of assets ?? []) {
+    if (seen.has(asset)) continue;
+    seen.add(asset);
+    for (const key of ["description", "usage_rules"]) {
+      if (typeof asset[key] !== "string") continue;
+      const written = asset[key].replace(pattern, (_, handle) => `@${renamed.get(handle)}`);
+      if (written !== asset[key]) { asset[key] = written; changed = true; }
+    }
+    if (renameAssetAnnotations(asset.panels, renamed, seen)) changed = true;
+  }
+  return changed;
 }
 
 /**
@@ -2767,6 +2871,8 @@ function followPromoted(timeline, moved, renamed) {
     for (const key of ["prompt", "soundscape", "music"]) {
       if (segment[key]) segment[key] = renameCitations(segment[key], dropped);
     }
+    renameSectionCitations(segment, dropped);
+    renameAssetAnnotations(segment.assets, dropped);
     const refined = segment.refined;
     if (refined?.body) refined.body = renameCitations(refined.body, dropped);
     for (const [name, text] of Object.entries(refined?.sections ?? {})) {
@@ -2857,6 +2963,7 @@ function followRenamed(subject, renamed) {
   }
   const stood = replacesOf(subject);
   if (stood.length) subject.replaces = stood.map(rename);
+  if (subject.usage_rules) subject.usage_rules = renameCitations(subject.usage_rules, renamed);
 }
 
 function moveCastFilesToPool(timeline, segment) {
@@ -2889,6 +2996,10 @@ function moveCastFilesToPool(timeline, segment) {
   for (const key of ["prompt", "soundscape", "music"]) {
     if (segment[key]) segment[key] = renameCitations(segment[key], renamed);
   }
+  renameSectionCitations(segment, renamed);
+  renameSectionCitations(timeline, renamed);
+  renameAssetAnnotations([...(segment.assets ?? []),
+    ...timeline.assets.filter((asset) => [...renamed.values()].includes(asset.handle))], renamed);
   const refined = segment.refined;
   if (refined?.body) refined.body = renameCitations(refined.body, renamed);
   for (const [name, text] of Object.entries(refined?.sections ?? {})) {
@@ -2962,6 +3073,9 @@ function collapsePool(timeline) {
     if (timeline[key]) timeline[key] = renameCitations(timeline[key], renamed);
     if (segment[key]) segment[key] = renameCitations(segment[key], renamed);
   }
+  renameSectionCitations(timeline, renamed);
+  renameSectionCitations(segment, renamed);
+  renameAssetAnnotations([...(timeline.assets ?? []), ...(segment.assets ?? [])], renamed);
   for (const holder of [timeline.refined, segment.refined]) {
     if (holder?.body) holder.body = renameCitations(holder.body, renamed);
     for (const [name, text] of Object.entries(holder?.sections ?? {})) {
@@ -3041,12 +3155,7 @@ function syncCanvas(timeline) {
     segment.refine_denoise = timeline.refine_denoise;
     segment.refine_upscaler = timeline.refine_upscaler;
     segment.refine_steps = timeline.refine_steps;
-    // The face pass is *not* mirrored down: a segment's `face` key is its own
-    // switch, not a copy of the piece's settings. What is cleaned up here is a
-    // card left saying "on" after the piece was switched off — compile refuses
-    // that pairing by name, and a switch nobody can see is not worth being
-    // refused over. Same repair `merge` gets on a clip, two blocks up.
-    if (!timeline.face?.on && faceOverride(segment) === "on") delete segment.face;
+    // Face settings are owned by this shot, never mirrored from the piece.
     // The piece's reference pool, mirrored like the canvas so a segment state
     // answers `mode()`, `checkpoint()` and the prompt box's chips on its own:
     // a segment citing @ref-1 is a reference generation and every accessor has
@@ -3063,6 +3172,7 @@ function syncCanvas(timeline) {
       prompt: timeline.prompt ?? "",
       soundscape: timeline.soundscape ?? "",
       music: timeline.music ?? "",
+      ...serializePromptSections(timeline),
     };
   });
   // Segment 1 has nothing in front of it. Kept in step here rather than guarded
@@ -3274,7 +3384,7 @@ export { syncCanvas as syncTimeline };
  */
 export const PIECE_FIELDS = ["family", "aspect", "aspect_source", "short_edge",
                              "upscale", "sample_edge", "refine_denoise",
-                             "refine_upscaler", "refine_steps", "face",
+                             "refine_upscaler", "refine_steps", "face_schema",
                              "models", "models_spare", "upscale_models", "turbo",
                              "output_prefix", "subjects", "sampling",
                              "sampling_spare"];
@@ -3283,7 +3393,29 @@ export const PIECE_FIELDS = ["family", "aspect", "aspect_source", "short_edge",
  *  `creator_data` blob from a fresh node's "{}" — which is an empty piece and
  *  must not become a shot nobody wrote. Mirrors `compile._LONE_SHOT_KEYS`. */
 const LONE_SHOT_KEYS = ["prompt", "assets", "loras", "duration_s", "checkpoint",
-                        "refined", "soundscape", "music"];
+                        "refined", "soundscape", "music", "prompt_sections",
+                        "retention_blocks", "retention_overrides"];
+
+/** Same non-mutating workflow-only Face migration as compile._migrate_faces.
+ * Current-schema pieces retain identity. Old global/card switches start OFF
+ * once; their knobs and all unrelated card/take fields remain independent. */
+function migrateFaces(piece) {
+  if (!piece || typeof piece !== "object" || !Array.isArray(piece.segments)
+      || piece.face_schema === FACE_SCHEMA) return piece;
+  const object = (value) => value && typeof value === "object" && !Array.isArray(value);
+  const old = object(piece.face) ? piece.face : {};
+  const migrated = { ...piece, face_schema: FACE_SCHEMA };
+  delete migrated.face;
+  migrated.segments = piece.segments.map((raw) => {
+    if (!object(raw) || isClip(raw)) return raw;
+    const knobs = object(raw.face) ? raw.face : old;
+    return { ...raw, face: { on: false,
+      canvas: "canvas" in knobs ? knobs.canvas : DEFAULT_FACE_CANVAS,
+      denoise: "denoise" in knobs ? knobs.denoise : DEFAULT_FACE_DENOISE,
+    } };
+  });
+  return migrated;
+}
 
 /**
  * A version-1 `creator_data` blob, read as the one-shot piece it always was.
@@ -3294,10 +3426,11 @@ const LONE_SHOT_KEYS = ["prompt", "assets", "loras", "duration_s", "checkpoint",
  * it gets right are `prompt` and `assets` going *down* to the shot while the
  * seven piece fields go up.
  *
- * Idempotent — a blob that already has a strip is returned untouched.
+ * Idempotent — a current Face-schema strip is returned untouched. Legacy
+ * strips are copied once through the same Face migration as the compiler.
  */
 export function asPiece(parsed) {
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed.segments)) return parsed;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed.segments)) return migrateFaces(parsed);
   if (parsed.version !== 1 && !LONE_SHOT_KEYS.some((key) => key in parsed)) return parsed;
 
   const shot = { ...parsed };
@@ -3313,7 +3446,27 @@ export function asPiece(parsed) {
     }
   }
   piece.segments = [shot];
-  return piece;
+  return migrateFaces(piece);
+}
+
+/** A card's view-only name, never a prompt, handle or generation setting. */
+export function cardName(segment) {
+  return typeof segment?.extended_card_name === "string"
+    ? segment.extended_card_name.trim().slice(0, 80) : "";
+}
+
+/** Saved beside the model input, keyed by the same stable ownership as takes.
+ *  Rebuilt from current cards so moving/copying/removing needs no parallel map.
+ *  Unknown view keys survive; a strip without names writes its original bytes. */
+function serializeCardViews(timeline) {
+  const saved = timeline.extended_ui;
+  const ui = saved && typeof saved === "object" && !Array.isArray(saved) ? { ...saved } : {};
+  delete ui.card_names;
+  const names = timeline.segments.filter((segment) =>
+    typeof segment.card_id === "string" && segment.card_id && cardName(segment))
+    .map((segment) => [segment.card_id, cardName(segment)]);
+  if (names.length) ui.card_names = Object.fromEntries(names);
+  return Object.keys(ui).length ? { extended_ui: ui } : {};
 }
 
 export function parseTimeline(raw) {
@@ -3321,6 +3474,7 @@ export function parseTimeline(raw) {
     const parsed = asPiece(JSON.parse(raw));
     if (parsed && typeof parsed === "object") {
       const timeline = { ...emptyTimeline(), ...parsed };
+      normalizePromptSections(timeline);
       // Workflows saved before either existed have no key at all, and a
       // hand-edited blob can have the wrong type in it.
       if (!Array.isArray(timeline.loras)) timeline.loras = [];
@@ -3383,7 +3537,10 @@ export function parseTimeline(raw) {
       timeline.refine_denoise = clampRefineDenoise(timeline.refine_denoise);
       timeline.refine_upscaler = parseRefineUpscaler(timeline.refine_upscaler);
       timeline.refine_steps = clampRefineSteps(timeline.refine_steps);
-      timeline.face = parseFace(timeline.face);
+      // The old piece-wide block only supplies dormant knobs during migration.
+      const legacyFace = parseFace(parsed.face);
+      delete timeline.face;
+      timeline.face_schema = FACE_SCHEMA;
       timeline.neural = parseNeural(timeline.neural);
       timeline.guide_lora = parseGuideLora(timeline.guide_lora, pieceFamily(timeline));
       timeline.models = parseModels(timeline.models, timeline.family);
@@ -3430,8 +3587,13 @@ export function parseTimeline(raw) {
           if (typeof raw.card_id === "string") segment.card_id = raw.card_id;
           return segment;
         }
-        const segment = parseState(JSON.stringify(raw ?? {}));
+        const segment = parseState(JSON.stringify({ ...(raw ?? {}),
+          face_schema: parsed.face_schema,
+          face: raw?.face && typeof raw.face === "object" ? raw.face
+            : parsed.face_schema === FACE_SCHEMA ? emptyFace() : legacyFace,
+        }));
         delete segment.version;
+        delete segment.face_schema;
         // The weights are the timeline's. A segment carrying its own would be a
         // second answer to a question that has one. The turbo switch likewise.
         delete segment.models;
@@ -3500,6 +3662,17 @@ export function parseTimeline(raw) {
         if (Number.isInteger(seed) && seed >= 0) segment.seed = seed;
         return segment;
       });
+      // Names live outside the segment model input, and only a matching stable
+      // card identity may recover one. A stray per-segment key is never queued.
+      const names = timeline.extended_ui?.card_names;
+      for (const segment of timeline.segments) {
+        delete segment.extended_card_name;
+        const name = cardName({ extended_card_name:
+          typeof segment.card_id === "string" && segment.card_id
+            && names && typeof names === "object" && !Array.isArray(names)
+            && Object.hasOwn(names, segment.card_id) ? names[segment.card_id] : "" });
+        if (name) segment.extended_card_name = name;
+      }
       // Every cast file narrowed to what its slot says — once, on the way in.
       //
       // A piece written before hanging a file on somebody narrowed it carries
@@ -3533,8 +3706,11 @@ export function parseTimeline(raw) {
 }
 
 export function serializeTimeline(timeline) {
-  return JSON.stringify({
+  return JSON.stringify(withRuntimePrompts(timeline, {
     version: 2,
+    face_schema: FACE_SCHEMA,
+    ...serializePromptSections(timeline),
+    ...serializeCardViews(timeline),
     // Absent means the default, so every piece rendered before a second family
     // existed round-trips to the bytes it always did — the same rule `upscale`
     // and `aspect_source` follow, and the one `compile.piece_family` reads.
@@ -3558,7 +3734,6 @@ export function serializeTimeline(timeline) {
     ...(timeline.sample_edge !== rulesFor(pieceFamily(timeline)).nativeShortEdge
       ? { sample_edge: timeline.sample_edge } : {}),
     ...serializeRefine(timeline),
-    ...serializeFace(timeline.face),
     ...serializeNeural(timeline.neural),
     ...serializeGuideLora(timeline.guide_lora),
     loras: serializeLoras(timeline.loras ?? [], pieceFamily(timeline)),
@@ -3631,9 +3806,7 @@ export function serializeTimeline(timeline) {
       // with no numbers to keep in step. Never on the first segment, which is
       // always a pass of its own.
       if (index > 0 && merged(segment)) out.merge = true;
-      // The card's own answer about the face pass, and only when it has one:
-      // absent is the third state and the default, which is to inherit.
-      if (faceOverride(segment)) out.face = faceOverride(segment);
+      Object.assign(out, serializeFace(segment.face));
       // Absent means a hard cut, which is the default, so only continuations
       // add anything. Never on the first segment: there is nothing to continue.
       if (index > 0 && segment.continue) out.continue = true;
@@ -3677,7 +3850,7 @@ export function serializeTimeline(timeline) {
       if (segmentSeed(segment) !== null) out.seed = segmentSeed(segment);
       return out;
     }),
-  }, null, 2);
+  }), null, 2);
 }
 
 /** A copy that shares nothing with the original — for "duplicate segment". */
@@ -3685,6 +3858,7 @@ export function cloneSegment(segment) {
   const copy = JSON.parse(JSON.stringify(segment));
   // A clone may look identical, but it never owns the original's in-flight take.
   copy.card_id = newCardId();
+  if (!isClip(copy)) copy.face = { ...parseFace(copy.face), on: false };
   return copy;
 }
 
@@ -4910,6 +5084,13 @@ export function missingPreStageModels(state) {
  *  across deletions, so img-2 keeps its hue after img-1 is removed. The kind
  *  offset staggers img-1 / vid-1 / aud-1 onto different hues. */
 const TAG_OFFSET = { img: 0, vid: 1, aud: 2 };
+/** Display order only: never reorder the registry the compiler numbers. */
+export function sortByHandle(rows = []) {
+  return [...rows].sort((left, right) => left.handle.localeCompare(right.handle, "en", {
+    numeric: true, sensitivity: "base", ignorePunctuation: true,
+  }));
+}
+
 export function tagIndex(handle) {
   const match = /^([A-Za-z]+)-(\d+)$/.exec(handle || "");
   if (match) return (Number(match[2]) - 1 + (TAG_OFFSET[match[1]] ?? 0)) % 8;
@@ -4999,6 +5180,27 @@ export const checkpointsFor = (state, family = DEFAULT_VIDEO_FAMILY) => {
   return routed ? [routed] : [];
 };
 
+/** The piece's standing route wins over a card's pin or derived mode, just as
+ *  `Weights.routed` stamps it before the backend compiles a pass. */
+export function standingCheckpoint(piece) {
+  const route = piece.models?.route;
+  return checkpointsOf(pieceFamily(piece)).includes(route) ? route : null;
+}
+
+/** The actual pass this card will sample, not just the card's own mode. A
+ *  merged neighbour may supply references; a still or lone request has none. */
+export function effectiveCheckpoints(state, piece = state) {
+  if (isClip(state)) return [];
+  const family = pieceFamily(piece);
+  if (!routing(family)) return [];
+  const route = standingCheckpoint(piece);
+  const pass = piece.segments?.includes(state)
+    ? passes(piece).find((item) => item.segments.includes(state)) : null;
+  const target = pass ? passCheckpoint(pass.segments, family, route)
+    : route || checkpoint(state, family);
+  return target ? [target] : [];
+}
+
 /** Whether the routing is the user's choice rather than the mode's. */
 export const checkpointPinned = (state, family = DEFAULT_VIDEO_FAMILY) =>
   canPinCheckpoint(state, family) && state.checkpoint !== "auto";
@@ -5021,6 +5223,7 @@ export function normalizeCheckpoint(state, family = DEFAULT_VIDEO_FAMILY) {
 export function refinedBody(state) {
   const refined = state?.refined;
   if (!refined || refined.enabled === false) return "";
+  if (Array.isArray(refined.fields) && !refined.fields.includes("prompt")) return "";
   return (refined.body || "").trim();
 }
 
@@ -5030,13 +5233,14 @@ export const findLora = (state, name) => state.loras.find((l) => l.name === name
  *  nothing to route between, every enabled entry is applied — there is one set
  *  of weights and they are what a LoRA on this piece patches. Mirrors
  *  `compile.active_loras`. */
-export function activeLoras(state, family = DEFAULT_VIDEO_FAMILY) {
-  const target = checkpoint(state, family);
+export function activeLoras(state, family = DEFAULT_VIDEO_FAMILY, targets = null) {
+  if (isClip(state)) return [];
+  const routed = targets ?? checkpointsFor(state, family);
   // What the cast this state cites wears, under the state's own — the order
   // `compile.cast_loras` merges them in, so a shot naming the same file wins.
   return mergeLoras(castLoras(state, family), state.loras).filter((entry) =>
     entry.enabled !== false && round2(entry.strength) !== 0
-    && (!target || loraModes(entry, family).includes(target)));
+    && (!routing(family) || loraModes(entry, family).some((target) => routed.includes(target))));
 }
 
 /** `triggers` seeds from the sidecar's trained words, which is the only moment
@@ -5083,10 +5287,10 @@ function newLora(name, triggers, strength, family = DEFAULT_VIDEO_FAMILY) {
  * same reason canvas.js mirrors canvas.py: the node has to show the composed
  * prompt before anything is queued. compile.py stays authoritative.
  */
-export function promptTriggers(state, family = DEFAULT_VIDEO_FAMILY) {
+export function promptTriggers(state, family = DEFAULT_VIDEO_FAMILY, targets = null) {
   const out = [];
   const seen = new Set();
-  for (const entry of activeLoras(state, family)) {
+  for (const entry of activeLoras(state, family, targets)) {
     for (const raw of entry.triggers || []) {
       const word = String(raw).trim();
       if (!word || seen.has(word.toLowerCase())) continue;
@@ -5112,20 +5316,22 @@ export function promptTriggers(state, family = DEFAULT_VIDEO_FAMILY) {
  */
 export function timelineCheckpoints(timeline) {
   const family = pieceFamily(timeline);
+  const route = standingCheckpoint(timeline);
   const routed = new Set(passes(timeline)
-    .map((pass) => passCheckpoint(pass.segments, family)));
+    .map((pass) => passCheckpoint(pass.segments, family, route)));
   return checkpointsOf(family).filter((name) => routed.has(name));
 }
 
 /** The one checkpoint a pass runs on. Its shots are merged into a single
  *  request, so a reference in any of them makes the whole pass Ref2VA. */
-export function passCheckpoint(segments, family = DEFAULT_VIDEO_FAMILY) {
+export function passCheckpoint(segments, family = DEFAULT_VIDEO_FAMILY, route = null) {
   // Supplied footage is played rather than sampled, so it routes to no
   // checkpoint at all — and a clip is never merged, so a pass holding one
   // holds nothing else. Answered before `checkpoint()`, which would ask a clip
   // card for the references it has no place to keep.
   if (segments.some(isClip)) return null;
   if (!routing(family)) return null;
+  if (checkpointsOf(family).includes(route)) return route;
   if (segments.length === 1) return checkpoint(segments[0], family);
   const routed = routesOf(family);
   if (segments.some(hasReferences)) return routed.reference;
@@ -5309,6 +5515,7 @@ export function passProblem(timeline, pass) {
  *  reading `activeLoras` gives. */
 export function activeGlobalLoras(timeline) {
   const family = pieceFamily(timeline);
+  if (!passes(timeline).some((pass) => !pass.segments.some(isClip))) return [];
   const targets = timelineCheckpoints(timeline);
   return (timeline.loras ?? []).filter((entry) =>
     entry.enabled !== false && round2(entry.strength) !== 0
@@ -5389,14 +5596,26 @@ function citedHandles(texts) {
  *  fields are inherited by a segment that writes none of its own. `own: true`
  *  drops the global parts — for telling a segment's own citation from one the
  *  global prompt put there. */
-function poolTexts(state, { own = false } = {}) {
+function poolTexts(state, { own = false, pick = null, usage = true } = {}) {
   const global_ = (own ? null : state.globalTexts) ?? {};
-  const texts = [state.prompt ?? "", global_.prompt ?? "",
-                 state.soundscape || global_.soundscape || "",
-                 state.music || global_.music || ""];
+  const local = (text) => pick ? resolveVariations(text ?? "", pick.seed, pick.card) : text ?? "";
+  const piece = (text) => pick ? resolveVariations(text ?? "", pick.seed, "piece") : text ?? "";
+  const texts = [local(state.prompt), piece(global_.prompt),
+                 state.soundscape ? local(state.soundscape) : piece(global_.soundscape),
+                 state.music ? local(state.music) : piece(global_.music),
+                 ...promptSectionTexts(global_).map(piece),
+                 ...promptSectionTexts(state).map(local)];
   if (state.refined && state.refined.enabled !== false) {
-    texts.push(state.refined.body ?? "");
-    for (const text of Object.values(state.refined.sections ?? {})) texts.push(text ?? "");
+    texts.push(local(state.refined.body));
+    for (const text of Object.values(state.refined.sections ?? {})) texts.push(local(text));
+  }
+  const cast = state.cast ?? state.subjects ?? [];
+  const named = citedSubjects(texts, cast);
+  for (const subject of usage ? cast : []) {
+    if (named.has(subject.handle)
+        && !(state.retention_overrides ?? global_.retention_overrides ?? []).includes(subject.handle)) {
+      texts.push(piece(subject.usage_rules));
+    }
   }
   return texts;
 }
@@ -5418,7 +5637,7 @@ export const SUBJECT_TAKES = ["person", "object", "scene", "style"];
  * The baseline attributes each `takes` is made of.
  *
  * Casting somebody seeds one feature row per entry, so what the reference
- * carries is a list on the card — four rows for a person — rather than a
+ * carries is a list on the card — three rows for a person — rather than a
  * sentence buried in the compiler. That is what makes "keep everything except
  * their build" a thing you can do: drop the row.
  *
@@ -5433,7 +5652,7 @@ export const SUBJECT_TAKES = ["person", "object", "scene", "style"];
  * copies to the same list.
  */
 export const SUBJECT_ATTRIBUTES = {
-  person: ["face", "hair", "build", "clothing"],
+  person: ["face", "hair", "build"],
   object: ["form", "colour", "markings"],
   scene: ["environment", "surfaces", "light"],
   style: ["medium", "palette", "light", "rendering"],
@@ -5738,15 +5957,14 @@ export function says(prose, word) {
  * with its take, which is exactly what recasting somebody else into it needs.
  * `subjectFiles` has always said the same thing for the same reason.
  *
- * Claims only, deliberately. Whether a *prompt* still writes `@img-2` is a
- * question about the host's own texts, and the host is the one that can answer
- * it — see `handleWritten`. A shelf knows the cast and nothing else.
+ * Claims only: the host removes these from the attachments it owns. A written
+ * tag stays in the sentence, but does not keep a removed member's file attached.
  */
 export function soleClaims(subject, cast) {
   const held = new Set();
   for (const other of cast ?? []) {
     if (other === subject) continue;
-    for (const handle of subjectFiles(other)) held.add(handle);
+    for (const handle of [...subjectFiles(other), ...replacesOf(other)]) held.add(handle);
   }
   return subjectFiles(subject).filter((handle) => !held.has(handle));
 }
@@ -5791,19 +6009,15 @@ export function releaseClaim(subject, handle, role = null) {
 /**
  * A file left the piece: the cast built out of it is built without it.
  *
- * Only once nothing in the piece holds the handle any more — no pool entry and
- * no shot's row — so a picture taken off one card of a strip stays claimed for
- * the card ahead that still carries it. A member whose whole account was that
- * file keeps the dead claim instead: dropping it would leave a name standing
- * for nothing, which is the one thing `subjects.parse` refuses, and the
- * refusal `subjects.here` writes says what to do about it. Answers whether
- * anybody was changed.
+ * Only once the cast's scope no longer holds the handle: the pool and a lone
+ * shot's row, or a standalone state's attachments. A different card's local
+ * handle is not the cast's file. A member whose whole account was that file
+ * keeps the dead claim instead: dropping it would leave a name standing for
+ * nothing, which `subjects.parse` refuses. The missing-file warning tells them
+ * what to fix. Answers whether anybody was changed.
  */
 export function releaseFromPiece(piece, handle) {
-  const rows = [
-    ...(piece.assets ?? []),
-    ...(piece.segments ?? []).flatMap((segment) => segment.assets ?? []),
-  ];
+  const rows = castAssets(piece);
   if (rows.some((asset) => asset.handle === handle)) return false;
   let changed = false;
   for (const subject of piece.subjects ?? []) {
@@ -5833,11 +6047,30 @@ export function handleWritten(texts, handle) {
 /** Every text in a piece a citation could be written into: the timeline's own
  *  three, and each segment's. */
 export function allTexts(timeline) {
-  const texts = [timeline.prompt, timeline.soundscape, timeline.music];
+  const texts = [timeline.prompt, timeline.soundscape, timeline.music, ...promptSectionTexts(timeline)];
   for (const segment of timeline.segments ?? []) {
-    texts.push(segment.prompt, segment.soundscape, segment.music);
+    texts.push(segment.prompt, segment.soundscape, segment.music, ...promptSectionTexts(segment));
   }
   return texts;
+}
+
+/** Written tags without a live attachment or a usable cast member in this scope. */
+export function missingPromptHandles(texts, assets, cast = [], screens = []) {
+  const known = takenHandles({ assets: assets ?? [] });
+  for (const screen of screens) known.add(screen.handle);
+  for (const subject of cast) {
+    if ([...subjectFiles(subject), ...replacesOf(subject)].every((handle) => known.has(handle))) {
+      known.add(subject.handle);
+    }
+  }
+  const missing = new Set();
+  const pattern = /(?:(?<![\w@])|(?<=\(S))@([A-Za-z]+-\d+|[A-Za-z][A-Za-z0-9_]*)(?![A-Za-z0-9_-])/g;
+  for (const text of texts) {
+    for (const match of String(text ?? "").matchAll(pattern)) {
+      if (!known.has(match[1])) missing.add(match[1]);
+    }
+  }
+  return [...missing];
 }
 
 /** A pattern matching `@name` for exactly the subjects in `cast`, or null for
@@ -5886,6 +6119,17 @@ export function renameSubjectCitations(hosts, from, to) {
   for (const host of hosts ?? []) {
     if (!host) continue;
     for (const field of CITING_FIELDS) write(host, field);
+    for (const key of Object.keys(host.prompt_sections ?? {})) write(host.prompt_sections, key);
+    for (const block of host.retention_blocks ?? []) {
+      if (block?.type === "text") write(block, "text");
+      if (block?.type === "subject" && block.handle === name) { block.handle = next; moved = true; }
+    }
+    if (host.retention_overrides?.includes(name)) {
+      host.retention_overrides = host.retention_overrides.map((handle) => handle === name ? next : handle);
+      moved = true;
+    }
+    for (const member of host.subjects ?? []) write(member, "usage_rules");
+    if (renameAssetAnnotations(host.assets, new Map([[name, next]]))) moved = true;
     // The rewrite as well. A refined body is the prompt that is actually
     // queued while it is enabled, and a rename that moved the sentence under it
     // and not the sentence itself would put the departed name back into the
@@ -5915,23 +6159,14 @@ export function renameSubjectCitations(hosts, from, to) {
 export function passedOver(state, pick) {
   const found = new Set();
   if (!pick) return found;
-  const own = (text) => resolveVariations(text ?? "", pick.seed, pick.card);
-  const piece = (text) => resolveVariations(text ?? "", pick.seed, "piece");
-  const global_ = state.globalTexts ?? {};
   const before = poolTexts(state);
   if (!before.some((text) => String(text ?? "").includes("{"))) return found;
-  const after = [own(state.prompt), piece(global_.prompt),
-                 state.soundscape ? own(state.soundscape) : piece(global_.soundscape),
-                 state.music ? own(state.music) : piece(global_.music)];
-  if (state.refined && state.refined.enabled !== false) {
-    after.push(own(state.refined.body));
-    for (const text of Object.values(state.refined.sections ?? {})) after.push(own(text));
-  }
+  const after = poolTexts(state, { pick });
   const lost = citedHandles(before);
   for (const handle of citedHandles(after)) lost.delete(handle);
   const cast = state.cast ?? [];
-  const named = citedSubjects(before, cast);
-  const kept = citedSubjects(after, cast);
+  const named = citedSubjects(poolTexts(state, { usage: false }), cast);
+  const kept = citedSubjects(poolTexts(state, { pick, usage: false }), cast);
   for (const subject of cast) {
     if (!named.has(subject.handle) || kept.has(subject.handle)) continue;
     lost.add(subject.handle);
@@ -5974,20 +6209,8 @@ export function asleepHere(state, pick = null) {
   const cast = state.cast ?? state.subjects ?? [];
   const found = new Set();
   if (!cast.length) return found;
-  let texts = poolTexts(state);
-  if (pick) {
-    const own = (text) => resolveVariations(text ?? "", pick.seed, pick.card);
-    const piece = (text) => resolveVariations(text ?? "", pick.seed, "piece");
-    const global_ = state.globalTexts ?? {};
-    texts = [own(state.prompt), piece(global_.prompt),
-             state.soundscape ? own(state.soundscape) : piece(global_.soundscape),
-             state.music ? own(state.music) : piece(global_.music)];
-    if (state.refined && state.refined.enabled !== false) {
-      texts.push(own(state.refined.body));
-      for (const text of Object.values(state.refined.sections ?? {})) texts.push(own(text));
-    }
-  }
-  const named = citedSubjects(texts, cast);
+  const texts = poolTexts(state, { pick });
+  const named = citedSubjects(poolTexts(state, { pick, usage: false }), cast);
   // Sole claims only, as the compiler cuts: a file awake on one member who is
   // cited stays for both — and a file the prose writes by handle stays for
   // everyone.
@@ -6023,13 +6246,13 @@ export function citedCast(state) {
   // pair `asleepHere` reads, so the two cannot disagree about who is here.
   const cast = state.cast ?? state.subjects ?? [];
   if (!cast.length) return [];
-  const found = citedSubjects(poolTexts(state), cast);
+  const found = citedSubjects(poolTexts(state, { usage: false }), cast);
   return cast.filter((subject) => found.has(subject.handle));
 }
 
 /** Whether the timeline's own texts cite a subject — "in every segment". */
 export function subjectCitedGlobally(timeline, subject) {
-  return citedSubjects([timeline.prompt, timeline.soundscape, timeline.music],
+  return citedSubjects([timeline.prompt, timeline.soundscape, timeline.music, ...promptSectionTexts(timeline)],
                        timeline.subjects ?? []).has(subject.handle);
 }
 

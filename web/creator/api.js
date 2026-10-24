@@ -61,7 +61,12 @@ export async function listExternalFolders() {
 export const chooseExternalFolder = () => folderPost("choose");
 export const removeExternalFolder = (folder) => folderPost("remove", { folder });
 export const revealExternalFolder = async (folder) => (await folderPost("reveal", { folder })).path;
-export const listExternalAssets = ({ folder, kind }) => folderPost("assets", { folder, kind });
+export const listExternalAssets = ({ folder, kind, directory }) => folderPost("assets", {
+  folder, kind, ...(directory === undefined ? {} : { directory }),
+});
+// Read-only validation of remembered checks, even outside the visible folder.
+// Restoring UI selection never calls importExternalAssets or an attachment.
+export const checkExternalAssets = ({ paths, kind }) => folderPost("metadata", { paths, kind });
 export async function importExternalAssets(assets) {
   if (!assets.some((row) => isExternalFile(row?.path))) return assets;
   const answer = await folderPost("import", { assets });

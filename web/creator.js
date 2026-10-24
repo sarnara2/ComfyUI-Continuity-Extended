@@ -10,12 +10,14 @@ import { Satellite } from "./creator/satellite.js";
 import { adopted, SAMPLING_WIDGETS } from "./creator/sampling.js";
 import { rememberQueuedSeeds } from "./creator/seedmemory.js";
 import { primeSettings } from "./creator/api.js";
-import { close as closeFullscreen, fullscreenNode, openFullscreen, remount as remountFullscreen,
+import { close as closeFullscreen, fullscreenNode, openFullscreen, openFullscreenTools, remount as remountFullscreen,
          stepToShot, toggleFullscreen } from "./creator/fullscreen.js";
 import { openPresetLibrary } from "./creator/presetlib.js";
 import { el } from "./creator/dom.js";
 import * as S from "./creator/state.js";
 import { t } from "./creator/i18n.js";
+import { addSheetToCast, sheetCastChoices } from "./creator/sheet-cast.js";
+import { st } from "./creator/sheet-locales.js";
 
 const CREATOR = "MiniMaxH3Creator";
 // The retired Timeline id. One shot and twenty are the same node now, and this
@@ -65,6 +67,40 @@ const STASH = "mmc_prestage_stash";
 const FACE_PIN = "mmc_face_piece";
 
 const SECTION_STATE = "mmc_timeline_sections";
+const RUNTIME_KEY = "mmc_runtime_key";
+const RUNTIME_SCOPE = "mmc_runtime_scope";
+const runtimeScopes = new WeakMap();
+const pendingRuntimeScopes = new Set();
+
+const activeRuntimeScope = () => app.extensionManager?.workflow?.activeWorkflow?.instanceId ?? "";
+
+/** Stable identity for this piece across workflow tabs and node remounts. */
+function runtimeKey(node) {
+  node.properties = node.properties || {};
+  // activeWorkflow is updated after loadedGraphNode. Nodes built by configure
+  // must wait for afterLoadGraph before adopting a tab's session identity.
+  if (app.configuringGraph) pendingRuntimeScopes.add(node);
+  if (pendingRuntimeScopes.has(node)) return null;
+  if (!runtimeScopes.has(node)) runtimeScopes.set(node, activeRuntimeScope());
+  const scope = runtimeScopes.get(node);
+  if (scope && node.properties[RUNTIME_SCOPE] !== scope) {
+    // Saved-as/copied workflows can contain the same piece UUID. Give each
+    // loaded tab its own UUID and carry it with the submitted workflow JSON.
+    delete node.properties[RUNTIME_KEY];
+    node.properties[RUNTIME_SCOPE] = scope;
+  }
+  const used = new Set((node.graph?._nodes ?? [])
+    .filter((other) => other !== node)
+    .map((other) => other.properties?.[RUNTIME_KEY])
+    .filter(Boolean));
+  let key = node.properties[RUNTIME_KEY];
+  if (typeof key !== "string" || !key || used.has(key)) {
+    key = globalThis.crypto?.randomUUID?.()
+      ?? `mmc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    node.properties[RUNTIME_KEY] = key;
+  }
+  return key;
+}
 
 // View preferences ride the workflow, not the render's creator_data blob.
 const sectionControls = (node) => ({
@@ -134,7 +170,8 @@ function stashPreStage(mother, pre) {
     if (["string", "number", "boolean"].includes(typeof widget.value)) sampling[widget.name] = widget.value;
   }
   mother.properties = mother.properties || {};
-  mother.properties[STASH] = JSON.stringify({ blob: S.serializePreStage(state), sampling });
+  mother.properties[STASH] = JSON.stringify({ blob: S.serializePreStage(state), sampling,
+    ...(pre.properties?.continuity_sheet ? { sheet: pre.properties.continuity_sheet } : {}) });
 }
 
 function togglePreStage(node) {
@@ -166,8 +203,12 @@ function togglePreStage(node) {
     const stashed = node.properties?.[STASH];
     if (stashed) {
       try {
-        const { blob, sampling } = JSON.parse(stashed);
+        const { blob, sampling, sheet } = JSON.parse(stashed);
         body.setState(S.parsePreStage(blob));
+        if (sheet) {
+          spawned.properties = spawned.properties || {};
+          spawned.properties.continuity_sheet = structuredClone(sheet);
+        }
         for (const [name, value] of Object.entries(sampling ?? {})) {
           const widget = spawned.widgets?.find((w) => w.name === name);
           if (!widget) continue;
@@ -211,6 +252,16 @@ const peerOf = (node) => () => {
   if (!body?.attachFromPreStage) return null;
   return {
     label: peer.title || peer.comfyClass,
+    sheetCast: () => sheetCastChoices(body.timeline),
+    attachSheet: (request) => {
+      const current = nodeById(node.graph, node.mmcBody?.state?.peer);
+      if (current !== peer || current?.mmcBody !== body || !body.timeline) {
+        throw new Error(st("The paired timeline is no longer available."));
+      }
+      const subject = addSheetToCast(body.timeline, request);
+      body.commit();
+      return { handle: subject.handle };
+    },
     attach: (role, filename) => {
       body.attachFromPreStage({ role, filename });
       // The hand-off is the reason the pair exists, so it is also where the
@@ -314,7 +365,7 @@ function attach(node, build) {
   // first pass — hide it again once the frontend has built it.
   requestAnimationFrame(() => hideWidget(widget));
 
-  const body = build(widget);
+  const body = build(widget, PIECE.includes(node.comfyClass) ? () => runtimeKey(node) : null);
   // The DOM widget writes left/top/width/height straight onto the element it is
   // handed, every frame. The body has to be able to leave the node — the
   // fullscreen editor hosts this very element (fullscreen.js) — so what the
@@ -425,9 +476,12 @@ app.registerExtension({
     rememberQueuedSeeds();
   },
 
+  beforeLoadGraph() { pendingRuntimeScopes.clear(); },
+
   async nodeCreated(node) {
     if (PIECE.includes(node.comfyClass)) {
-      node.mmcBody = attach(node, (widget) => new TimelineBody({
+      if (app.configuringGraph) pendingRuntimeScopes.add(node);
+      node.mmcBody = attach(node, (widget, getRuntimeKey) => new TimelineBody({
         read: () => widget.value,
         write: (raw) => {
           widget.value = raw;
@@ -438,6 +492,7 @@ app.registerExtension({
         // Read late rather than captured: a node pasted from the clipboard is
         // renumbered after it is built, and the stage matches previews by id.
         nodeId: () => node.id,
+        runtimeKey: getRuntimeKey,
         preStage: preStageControls(node),
         face: faceControls(node),
         sections: sectionControls(node),
@@ -445,6 +500,7 @@ app.registerExtension({
         // before the node is in the graph, and the editor scans the graph for
         // the piece and its PreStage.
         fullscreen: () => requestAnimationFrame(() => openFullscreen(node)),
+        tools: () => requestAnimationFrame(() => openFullscreenTools(node)),
       }));
       // Deferred a frame: `nodeCreated` runs before the node is in the graph
       // and before a pasted one is renumbered, and the editor scans the graph
@@ -455,6 +511,7 @@ app.registerExtension({
         const state = S.parsePreStage(widget.value);
         let body;
         body = new PreStageBody({
+          node,
           state,
           // `body` is not assigned until the constructor returns, and the
           // editor's first render can commit before that — the family's pins
@@ -488,6 +545,15 @@ app.registerExtension({
   loadedGraphNode(node) {
     const body = node.mmcBody;
     if (!body) return;
+    if (PIECE.includes(node.comfyClass)) {
+      runtimeKey(node);
+      if (body.stage?.restoreRuntimeState?.({ onlyIfIdle: true })) {
+        body.stage.replayRuntimeEvents();
+        body.stage.render();
+        body.stage.syncTicker();
+        if (body.stage.promptId) body.stage.recoverTimings(true);
+      }
+    }
     if (node.comfyClass === PRESTAGE) {
       const widget = node.widgets?.find((w) => w.name === WIDGET[PRESTAGE]);
       // The sampler row moved off the widgets into the blob; this is where a
@@ -505,6 +571,24 @@ app.registerExtension({
       body.setState(state);
     } else {
       body.reload();
+    }
+  },
+
+  afterLoadGraph() {
+    const scope = activeRuntimeScope();
+    const nodes = new Set([...pendingRuntimeScopes, ...((app.rootGraph ?? app.graph)?._nodes ?? [])]);
+    pendingRuntimeScopes.clear();
+    for (const node of nodes) {
+      if (!PIECE.includes(node.comfyClass)) continue;
+      runtimeScopes.set(node, scope);
+      runtimeKey(node);
+      const stage = node.mmcBody?.stage;
+      if (!stage || node.mmcBody.destroyed) continue;
+      stage.restoreRuntimeState({ onlyIfIdle: true });
+      stage.replayRuntimeEvents();
+      stage.render();
+      stage.syncTicker();
+      if (stage.promptId || stage.timing.queuedRuns().length) stage.recoverTimings(true);
     }
   },
 

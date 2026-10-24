@@ -55,7 +55,7 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 import { watch as watchQueue } from "./queue.js";
-import { viewUrl } from "./api.js";
+import { viewUrl, uiSetting } from "./api.js";
 import { el, icon, mark, spinner } from "./dom.js";
 import { buildDashboard } from "./navigate.js";
 import { openBlockout } from "./blockout.js";
@@ -1348,18 +1348,19 @@ class Fullscreen {
           onload: (event) => this.reviewSized(event.currentTarget.naturalWidth,
                                               event.currentTarget.naturalHeight),
         })
-      // Everything the plate's own finished player is, by the same argument
-      // made in stage.js: the transport is the browser's, it loops, it starts
-      // silent because no browser would start it otherwise, and the sound
-      // follows the pointer. One video, one set of manners, in one window.
+      // The finished stage's playback and audio preference also apply here.
       : el("video", {
           class: "mmc-fs-review-media", src: result.url,
           autoplay: true, controls: true, loop: true, playsinline: true,
           preload: "metadata",
           onloadedmetadata: (event) => this.reviewSized(event.currentTarget.videoWidth,
                                                         event.currentTarget.videoHeight),
-          onmouseenter: (event) => { event.currentTarget.muted = false; },
-          onmouseleave: (event) => { event.currentTarget.muted = true; },
+          onmouseenter: (event) => {
+            if (uiSetting("preview_audio", "muted") === "hover") event.currentTarget.muted = false;
+          },
+          onmouseleave: (event) => {
+            if (uiSetting("preview_audio", "muted") === "hover") event.currentTarget.muted = true;
+          },
         });
     if (media.tagName === "VIDEO") media.muted = true;
 
@@ -1827,6 +1828,14 @@ export function openFullscreen(node) {
   if (open?.node === node) return;
   close();
   open = new Fullscreen(node);
+}
+
+/** The strip face's Tools shortcut. Reuse the shell and its own dashboard;
+ *  opening it does not choose a destination or run anything. */
+export function openFullscreenTools(node) {
+  if (!node?.mmcBody) return;
+  openFullscreen(node);
+  if (open?.node === node) open.openDash();
 }
 
 /** Rebuild the columns in place — a PreStage spawned or closed under the editor

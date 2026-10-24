@@ -54,11 +54,10 @@ function laid(entries = [{ filename: "score.wav", at_s: 0, in_s: 0, out_s: 5 }])
     sound: entries,
   }));
   let commits = 0;
-  const lane = new SoundLane({ read: () => piece, onCommit: () => { commits += 1; },
+  // These original cut-placement assertions exercise explicit snapping ON.
+  // The per-track magnet now defaults OFF; seed the fixture, not product defaults.
+  const lane = new SoundLane({ read: () => piece, snaps: new Set(piece.sound), onCommit: () => { commits += 1; },
                                flash: () => {} });
-  // This suite exercises the original snap-enabled gestures; free drag and the
-  // new per-track switch are covered by test-sound-clip-snap.cjs in a browser.
-  for (const entry of piece.sound) lane.snaps.add(entry);
   lane.lengths.set("score.wav", 30);
   lane.render();
   return { piece, lane, commits: () => commits };
@@ -229,7 +228,9 @@ const grip = (lane, edge) =>
   const { piece, lane } = laid();
   const node = block(lane);
   press(node, 0);
-  move(node, 30);
+  // The persistence case targets the first cut exactly. An approximate 40 px
+  // can legitimately snap the other edge to the next cut with both-edge snap.
+  move(node, S.passWindows(piece)[1].at / S.timelineFrames(piece) * 100);
   lift(node);
 
   const saved = S.serializeTimeline(piece);

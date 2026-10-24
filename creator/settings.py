@@ -82,6 +82,7 @@ def default_prefixes():
 SEAM_HANDOFFS = ("frames", "latent", "levelled", "masked")
 # Which loader puts H3's LoRAs on, see `DEFAULTS["lora_loader"]`.
 LORA_LOADERS = ("vendored", "core")
+PREVIEW_AUDIO_MODES = ("muted", "hover")
 DEFAULTS = {
     "video_crf": DEFAULT_CRF,
     # `{family: prefix}` apiece — see `default_prefixes` above. Asked of the
@@ -114,6 +115,8 @@ DEFAULTS = {
     # where a dozen finished renders is a dozen looping decoders playing for
     # nobody. UI-only like the pills above: nothing queued ever reads it.
     "autoplay_previews": True,
+    # Finished node previews and fullscreen take reviews; card volume is separate.
+    "preview_audio": "muted",
     # Card labels only; loading and the detail sheet keep their model metadata.
     "lora_skip_metadata": False,
     # How many of a turbo render's opening steps run on the un-distilled
@@ -510,6 +513,10 @@ def clean(raw):
         if raw["lora_loader"] not in LORA_LOADERS:
             raise ValueError(f"lora_loader must be one of {', '.join(LORA_LOADERS)}")
         clean_settings["lora_loader"] = raw["lora_loader"]
+    if "preview_audio" in raw and raw["preview_audio"] is not None:
+        if raw["preview_audio"] not in PREVIEW_AUDIO_MODES:
+            raise ValueError(f"preview_audio must be one of {', '.join(PREVIEW_AUDIO_MODES)}")
+        clean_settings["preview_audio"] = raw["preview_audio"]
     for flag in ("show_shift_pills", "autoplay_previews", "advanced", "latent_cache",
                  "lora_skip_metadata"):
         if flag in raw and raw[flag] is not None:
@@ -717,7 +724,7 @@ def clean_chat(raw):
 
 REFINER_BACKENDS = ("local", "remote")
 REFINER_NAMES = ("model", "remoteModel", "language", "skill")
-REFINER_FLAGS = ("eject",)
+REFINER_FLAGS = ("eject", "reference_images")
 REFINER_TABLES = ("skillModes", "templates")
 
 

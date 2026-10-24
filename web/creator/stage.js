@@ -52,6 +52,87 @@ const EVENTS = ["progress_state", "b_preview_with_metadata", "b_preview",
                 "execution_start", "execution_success", "execution_interrupted", "mmc_segment", "mmc_refused",
                 "reconnected", "status", "mmc_queue_removed"];
 
+// A workflow tab can unmount its node while ComfyUI keeps rendering. Keep the
+// last stage snapshot in this page-level cache so a remounted node can resume
+// the same prompt instead of appearing idle. The Blob is the latest transient
+// frame; it is never written into the workflow JSON.
+const STAGE_RUNTIME = Symbol.for("continuity.stage-runtime.v1");
+const runtimeCache = globalThis[STAGE_RUNTIME] ?? (globalThis[STAGE_RUNTIME] = new Map());
+const RUNTIME_CACHE_LIMIT = 16;
+
+// Keep wire facts while a workflow has no mounted Stage. This notebook holds
+// only bounded event payloads, never DOM nodes or callbacks from a closed view.
+const wireJournal = new Map();
+const promptOwners = new Map();
+const promptQueuedAt = new Map();
+const wireNotes = new WeakMap();
+let wireSequence = 0, wirePromptId = null;
+const WIRE_EVENTS = EVENTS.filter((name) => !["status", "reconnected", "mmc_refused"].includes(name));
+
+function bindPromptOwner(promptId, key, queuedAt = Date.now()) {
+  if (!promptId || !key) return;
+  const id = String(promptId);
+  if (!promptOwners.has(id)) promptOwners.set(id, new Set());
+  promptOwners.get(id).add(key);
+  if (!promptQueuedAt.has(id)) promptQueuedAt.set(id, queuedAt);
+  while (promptOwners.size > 128) {
+    const oldest = promptOwners.keys().next().value;
+    promptOwners.delete(oldest); promptQueuedAt.delete(oldest);
+  }
+}
+
+// Submission ownership must survive closing the view before /prompt replies.
+// This observer captures only serialized ids; it never retains a Stage.
+watchSubmittedPrompts((output, targets, workflow) => {
+  const ids = targets.length ? targets : Object.keys(output ?? {});
+  const owners = (workflow?.nodes ?? []).filter((node) =>
+    typeof node.properties?.mmc_runtime_key === "string"
+    && ids.some((id) => String(id) === String(node.id) || String(id).startsWith(`${node.id}.`)))
+    .map((node) => ({ key: node.properties.mmc_runtime_key, queuedAt: Date.now() }));
+  return owners.length ? owners : null;
+}, (promptId, owners) => {
+  for (const owner of owners) bindPromptOwner(promptId, owner.key, owner.queuedAt);
+});
+
+function rememberWire(event) {
+  const { type, detail } = event;
+  if (type === "executing" && detail == null) return;
+  const named = detail?.prompt_id ?? detail?.promptId;
+  if (type === "execution_start" && named != null) wirePromptId = String(named);
+  const id = named == null ? wirePromptId : String(named);
+  if (!id) return;
+  let slot = type;
+  if (type === "executing") slot += `:${typeof detail === "object" ? detail.node : detail}`;
+  if (["b_preview", "b_preview_with_metadata", "kj_preview_override"].includes(type)) {
+    // A schedule-only KJ tick must not replace the last actual picture.
+    if (type === "kj_preview_override" && !detail.image) slot = "preview-progress";
+    else slot = type === "b_preview" ? "preview-legacy" : "preview-named";
+  }
+  if (type === "executed") {
+    const output = detail.output;
+    const kind = output?.mmc_video ? "video" : output?.mmc_image ? "image"
+      : output?.mmc_takes?.length ? `takes-${output.mmc_takes[0].segment}` : null;
+    if (!kind) return;
+    slot += `:${detail.display_node ?? detail.node}:${kind}`;
+  }
+  const entry = { seq: ++wireSequence, at: Date.now(), promptId: id, type, detail };
+  wireNotes.set(event, entry);
+  if (!wireJournal.has(id)) wireJournal.set(id, new Map());
+  const row = wireJournal.get(id);
+  row.delete(slot); row.set(slot, entry);
+  if (["execution_success", "execution_error", "execution_interrupted"].includes(type)) {
+    row.delete("preview-named"); row.delete("preview-legacy");
+  }
+  while (row.size > 96) {
+    const keys = [...row.keys()];
+    row.delete(keys.find((key) => key.startsWith("executing:"))
+      ?? keys.find((key) => key !== "execution_start" && !key.startsWith("execution_")) ?? keys[0]);
+  }
+  wireJournal.delete(id); wireJournal.set(id, row);
+  while (wireJournal.size > 32) wireJournal.delete(wireJournal.keys().next().value);
+}
+for (const name of WIRE_EVENTS) api.addEventListener(name, rememberWire);
+
 /** A progress report this long is a sampler; the loaders and decoders report a
  *  step or two each. What lets the stage open on progress rather than waiting
  *  for a first frame, without opening as an empty black box for as long as a
@@ -147,9 +228,10 @@ export class Stage {
    *   segment is being rendered — the Timeline passes one that knows the strip
    *   ("Segment 2 of 5"); without it the announce's index shows bare.
    */
-  constructor({ nodeId, onVisibility, onState, onGallery, resultChips, segmentLabel,
+  constructor({ nodeId, runtimeKey = null, onVisibility, onState, onGallery, resultChips, segmentLabel,
                 onTakes = null, onRestyle = null }) {
     this.nodeId = nodeId;
+    this.runtimeKey = runtimeKey;
     this.onVisibility = onVisibility;
     this.onState = onState;
     this.onGallery = onGallery;
@@ -165,6 +247,7 @@ export class Stage {
     this.segment = null;     // 1-based index of the segment now rendering
     this.progress = null;    // {step, total}
     this.frame = null;       // object URL or data URI of the newest preview
+    this.frameBlob = null;   // durable for this page session across workflow tabs
     this.result = null;      // {url, name} of the finished video
     // Why there is no picture: `{started, items: [{where, what}]}`. `started`
     // says whether the run got as far as the sampler — a refusal never does —
@@ -177,10 +260,16 @@ export class Stage {
     this.renderPromptId = null;
     this.timing = new ExecutionTiming();
     this.observedPrompts = new Set();
+    this.ownedPromptIds = new Set();
+    this.journalSequence = 0;
     this.offSubmitted = watchSubmittedPrompts(
-      (output, targets) => this.claims({ nodes: Object.keys(output ?? {}), targets }),
+      (output, targets, workflow) => this.claimsWorkflow(output, targets, workflow),
       (promptId) => {
+        this.ownedPromptIds.add(String(promptId));
+        while (this.ownedPromptIds.size > 128) this.ownedPromptIds.delete(this.ownedPromptIds.values().next().value);
+        bindPromptOwner(promptId, this.runtimeCacheKey());
         this.timing.queued(promptId);
+        this.replayRuntimeEvents();
         this.syncTicker();
         this.renderReadout();
       });
@@ -210,15 +299,21 @@ export class Stage {
     this.root = el("div", { class: "mmc-stage" }, [this.media, this.rule, this.readout]);
     this.stopFooterSize = watchFooterSize(this.root, this.readout);
 
-    this.onEvent = (event) => this.handle(event.type, event.detail);
+    this.restoreRuntimeState();
+
+    this.onEvent = (event) => this.handle(event.type, event.detail, wireNotes.get(event));
     for (const name of EVENTS) api.addEventListener(name, this.onEvent);
 
+    this.replayRuntimeEvents();
     this.render();
+    this.syncTicker();
+    if (this.promptId || this.timing.queuedRuns().length) this.recoverTimings(true);
   }
 
   /** Called when the node body is torn down. Listeners on `api` outlive the DOM
    *  otherwise, and a deleted node would go on decoding previews forever. */
   destroy() {
+    this.rememberRuntimeState();
     this.destroyed = true;
     this.offSubmitted();
     this.stopFooterSize();
@@ -268,6 +363,117 @@ export class Stage {
     this.frameUrl = null;
   }
 
+  runtimeCacheKey() {
+    try {
+      return typeof this.runtimeKey === "function" ? this.runtimeKey() : this.runtimeKey;
+    } catch { return null; }
+  }
+
+  rememberRuntimeState() {
+    const key = this.runtimeCacheKey();
+    if (!key) return;
+    const frame = this.frameUrl ? null : this.frame;
+    const snapshot = {
+      state: this.state, segment: this.segment, progress: this.progress,
+      frame, frameBlob: this.frameBlob, frameIsClip: this.frameIsClip,
+      result: this.result, failure: this.failure, refused: this.refused,
+      startedAt: this.startedAt, renderPromptId: this.renderPromptId,
+      promptId: this.promptId, claimed: this.claimed,
+      lastNewsAt: this.lastNewsAt, probedAt: this.probedAt, tookMs: this.tookMs,
+      metaFrameAt: this.metaFrameAt, timing: this.timing,
+      observedPrompts: [...this.observedPrompts],
+      ownedPromptIds: [...this.ownedPromptIds], journalSequence: this.journalSequence,
+    };
+    runtimeCache.delete(key);
+    runtimeCache.set(key, snapshot);
+    while (runtimeCache.size > RUNTIME_CACHE_LIMIT) {
+      runtimeCache.delete(runtimeCache.keys().next().value);
+    }
+  }
+
+  restoreRuntimeState({ onlyIfIdle = false } = {}) {
+    if (onlyIfIdle && (this.state !== "idle" || this.promptId)) return false;
+    const key = this.runtimeCacheKey();
+    const saved = key ? runtimeCache.get(key) : null;
+    if (!saved) return false;
+    Object.assign(this, {
+      state: saved.state, segment: saved.segment, progress: saved.progress,
+      frameIsClip: saved.frameIsClip, result: saved.result,
+      failure: saved.failure, refused: saved.refused,
+      startedAt: saved.startedAt, renderPromptId: saved.renderPromptId,
+      promptId: saved.promptId, claimed: saved.claimed,
+      lastNewsAt: saved.lastNewsAt, probedAt: saved.probedAt,
+      tookMs: saved.tookMs, metaFrameAt: saved.metaFrameAt,
+      timing: saved.timing ?? this.timing,
+      observedPrompts: new Set(saved.observedPrompts ?? []),
+      ownedPromptIds: new Set(saved.ownedPromptIds ?? []),
+      journalSequence: saved.journalSequence ?? 0,
+      frameBlob: saved.frameBlob ?? null,
+    });
+    for (const id of this.ownedPromptIds) bindPromptOwner(id, key);
+    if (this.frameBlob && typeof URL.createObjectURL === "function") {
+      this.frameUrl = URL.createObjectURL(this.frameBlob);
+      this.frame = this.frameUrl;
+    } else {
+      this.frame = saved.frame ?? null;
+    }
+    return true;
+  }
+
+  claimsWorkflow(output, targets, workflow) {
+    if (!this.claims({ nodes: Object.keys(output ?? {}), targets })) return false;
+    return this.matchesWorkflow(workflow);
+  }
+
+  matchesWorkflow(workflow) {
+    const key = this.runtimeCacheKey();
+    if (!this.runtimeKey) return true;
+    if (!key) return false;
+    const node = workflow?.nodes?.find((entry) => String(entry.id) === String(this.nodeId()));
+    return node?.properties?.mmc_runtime_key === key;
+  }
+
+  ownsPrompt(promptId) {
+    const key = this.runtimeCacheKey();
+    if (!this.runtimeKey) return true;
+    if (!key) return false;
+    if (promptId == null) return false;
+    const id = String(promptId);
+    return this.ownedPromptIds.has(id) || promptOwners.get(id)?.has(key) === true;
+  }
+
+  runtimeEventAllowed(type, detail, promptId) {
+    if (!this.runtimeKey) return true;
+    if (!this.runtimeCacheKey()) return false;
+    if (["status", "reconnected"].includes(type) || (type === "executing" && detail == null)) return true;
+    if (type === "mmc_refused") return this.matchesWorkflow(detail?.workflow);
+    return this.ownsPrompt(promptId ?? detail?.prompt_id ?? detail?.promptId ?? wirePromptId);
+  }
+
+  replayRuntimeEvents() {
+    const key = this.runtimeCacheKey();
+    if (!key) return;
+    const ids = new Set(this.ownedPromptIds);
+    for (const [id, owners] of promptOwners) if (owners.has(key)) ids.add(id);
+    for (const id of ids) {
+      if (!this.ownedPromptIds.has(id)) {
+        this.ownedPromptIds.add(id);
+        this.timing.queued(id, promptQueuedAt.get(id) ?? Date.now());
+      }
+    }
+    while (this.ownedPromptIds.size > 128) this.ownedPromptIds.delete(this.ownedPromptIds.values().next().value);
+    const entries = [...ids].flatMap((id) => [...(wireJournal.get(id)?.values() ?? [])])
+      .filter((entry) => entry.seq > this.journalSequence).sort((a, b) => a.seq - b.seq);
+    try {
+      for (const entry of entries) {
+        this.replayAt = entry.at;
+        this.handle(entry.type, entry.detail, entry);
+      }
+    } finally { this.replayAt = null; }
+  }
+
+  eventNow() { return this.replayAt ?? Date.now(); }
+
   /** Is `id` this node, or something the expansion emitted from it? */
   ours(id) {
     if (id === null || id === undefined) return false;
@@ -283,7 +489,9 @@ export class Stage {
 
   // ---- the wire ------------------------------------------------------------
 
-  handle(type, detail) {
+  handle(type, detail, note = {}) {
+    if (!this.runtimeEventAllowed(type, detail, note?.promptId)) return;
+    if (note?.seq) this.journalSequence = Math.max(this.journalSequence, note.seq);
     // Core's frontend emits a bare null for the queue's final `executing`,
     // after history has been filed. Reconnection also need not have a payload.
     if (type === "reconnected" || (type === "executing" && detail === null)) {
@@ -312,9 +520,10 @@ export class Stage {
         if (this.timing.runs.get(String(detail.prompt_id))?.terminal) break;
         this.promptId = detail.prompt_id == null ? null : String(detail.prompt_id);
         this.observePrompt(this.promptId);
-        this.timing.start(this.promptId, detail.timestamp);
-        this.claimed = false;
-        this.lastNewsAt = Date.now();
+        this.timing.start(this.promptId, detail.timestamp, this.eventNow());
+        this.claimed = this.runtimeCacheKey() ? this.ownsPrompt(this.promptId) : this.claims(submission(this.promptId));
+        this.lastNewsAt = this.eventNow();
+        this.rememberRuntimeState();
         break;
 
       case "executing":
@@ -332,6 +541,7 @@ export class Stage {
         if (String(detail) !== String(this.nodeId())) break;
         this.claimed = true;
         this.news();
+        this.rememberRuntimeState();
         break;
 
       case "status":
@@ -343,7 +553,7 @@ export class Stage {
         break;
 
       case "mmc_queue_removed":
-        this.timing.removed(detail.prompt_id);
+        this.timing.removed(detail.prompt_id, this.eventNow());
         this.syncTicker();
         this.renderReadout();
         break;
@@ -364,6 +574,7 @@ export class Stage {
         }
         if (!best) break;
         if (!this.acceptPrompt(detail.prompt_id ?? best.prompt_id)) break;
+        this.claimed = true;
         this.news();
         // The stage opens the moment something with real steps is running —
         // not on the loaders (their one-step reports stay below the
@@ -392,9 +603,10 @@ export class Stage {
         if (!this.ours(detail.parentNodeId) && !this.ours(detail.nodeId)) break;
         if (!this.acceptPrompt(detail.promptId ?? detail.prompt_id)) break;
         this.news();
-        this.metaFrameAt = Date.now();
+        this.metaFrameAt = this.eventNow();
         this.begin();
         this.releaseFrame();
+        this.frameBlob = detail.blob;
         this.frameUrl = URL.createObjectURL(detail.blob);
         this.frame = this.frameUrl;
         this.frameIsClip = false;
@@ -409,11 +621,12 @@ export class Stage {
         // same picture with a name on it.
         if (this.state !== "sampling") break;
         if (this.renderPromptId !== this.promptId) break;
-        if (this.metaFrameAt && Date.now() - this.metaFrameAt < 2000) break;
+        if (this.metaFrameAt && this.eventNow() - this.metaFrameAt < 2000) break;
         const blob = detail instanceof Blob ? detail : detail.blob;
         if (!blob) break;
         this.news();
         this.releaseFrame();
+        this.frameBlob = blob;
         this.frameUrl = URL.createObjectURL(blob);
         this.frame = this.frameUrl;
         this.frameIsClip = false;
@@ -443,11 +656,13 @@ export class Stage {
           ? { step: detail.step ?? 0, total: detail.total } : null;
         if (!detail.image) {
           if (progress) this.progress = progress;
+          this.rememberRuntimeState();
           break;
         }
         this.begin();
         if (progress) this.progress = progress;
         this.releaseFrame();
+        this.frameBlob = null;
         this.frame = `data:${detail.mime || "image/jpeg"};base64,${detail.image}`;
         // With NVENC available the pack encodes the step clip as video/mp4,
         // which an <img> renders as a black box. webp — animated or not — and
@@ -549,6 +764,7 @@ export class Stage {
    *  a previous queue must not start a fresh clock or overwrite its successor. */
   acceptPrompt(promptId, { completed = false } = {}) {
     const id = promptId == null ? this.promptId : String(promptId);
+    if (!this.ownsPrompt(id)) return false;
     const known = id == null ? null : this.timing.runs.get(id);
     if (!completed && known?.terminal) return false;
     if (id && this.promptId && id !== this.promptId && this.observedPrompts.has(id)) return false;
@@ -572,7 +788,7 @@ export class Stage {
 
   endTiming(type, detail) {
     const id = detail.prompt_id == null ? this.promptId : String(detail.prompt_id);
-    this.timing.stop(id, type, detail.timestamp);
+    this.timing.stop(id, type, detail.timestamp, this.eventNow());
     this.renderReadout();
     this.syncTicker();
     const run = id == null ? null : this.timing.runs.get(id);
@@ -636,7 +852,7 @@ export class Stage {
    */
   fail(items, { started, promptId = this.promptId, recovered = false }) {
     const observedRender = started && !recovered && this.state === "sampling" && this.sameRender(promptId);
-    const tookMs = observedRender && this.startedAt !== null ? Math.max(0, Date.now() - this.startedAt) : null;
+    const tookMs = observedRender && this.startedAt !== null ? Math.max(0, this.eventNow() - this.startedAt) : null;
     const renderPromptId = started ? promptId : null;
     this.clearRender();
     this.state = "failed";
@@ -663,6 +879,7 @@ export class Stage {
     this.segment = null;
     this.releaseFrame();
     this.frame = null;
+    this.frameBlob = null;
     this.frameIsClip = false;
     this.clearAspect();
   }
@@ -689,8 +906,9 @@ export class Stage {
     this.renderPromptId = this.promptId;
     this.timing.get(this.renderPromptId);
     this.probedAt = 0;
-    this.startedAt = Date.now();
-    this.lastNewsAt = Date.now();
+    // Replaying the newest progress report cannot tell when sampling began.
+    this.startedAt = this.replayAt == null ? this.eventNow() : null;
+    this.lastNewsAt = this.eventNow();
     // Only the readout, and only once a second: the frames arrive when they
     // arrive, and a full render on a timer would fight the preview for the box.
     this.syncTicker();
@@ -727,7 +945,7 @@ export class Stage {
       return;
     }
     const observedSave = !recovered && this.state === "sampling" && this.sameRender(promptId);
-    const tookMs = observedSave && this.startedAt !== null ? Math.max(0, Date.now() - this.startedAt) : null;
+    const tookMs = observedSave && this.startedAt !== null ? Math.max(0, this.eventNow() - this.startedAt) : null;
     this.state = "done";
     this.progress = null;
     // The clock stops here rather than on the next tick, so what the readout
@@ -749,13 +967,14 @@ export class Stage {
     this.syncTicker();
     this.releaseFrame();
     this.frame = null;
+    this.frameBlob = null;
     this.render();
   }
 
   /** A step, a frame, a segment — something said this render is still alive. */
   news() {
     const wasStalled = this.quiet() > STALL_MS;
-    this.lastNewsAt = Date.now();
+    this.lastNewsAt = this.eventNow();
     if (wasStalled) this.renderReadout();
   }
 
@@ -916,6 +1135,7 @@ export class Stage {
   // ---- render --------------------------------------------------------------
 
   render() {
+    this.rememberRuntimeState();
     const showing = this.showing();
     this.root.style.display = showing ? "flex" : "none";
     this.root.dataset.state = this.state;
@@ -961,7 +1181,7 @@ export class Stage {
    * became the answer was the one reading the row could not give you.
    */
   renderReadout() {
-    if (!this.showing()) return;
+    if (!this.showing()) { this.rememberRuntimeState(); return; }
     // Built as two lists and hung on the row at the end, so the empty case is
     // an empty row — which is what `.mmc-stage-readout:empty` hides, and the
     // reason a finished still with no chips does not draw a scrim over itself.
@@ -1034,6 +1254,7 @@ export class Stage {
       ...(left.length ? [el("div", { class: "mmc-stage-side mmc-stage-actions" }, left)] : []),
       ...(right.length ? [el("div", { class: "mmc-stage-side end mmc-stage-times" }, right)] : []),
     );
+    this.rememberRuntimeState();
   }
 
   /**
@@ -1130,28 +1351,9 @@ export class Stage {
   }
 
   video() {
-    // Plays itself, silently, forever. Silence is not a preference: no browser
-    // will autoplay a video with sound at all, so an unmuted one would simply
-    // sit on its first frame — and a node body that starts talking the moment a
-    // render lands is a node body you turn off.
-    //
-    // **So the sound follows the pointer**, which is what VHS's preview does and
-    // is the only place volume can come from without either a click or a
-    // surprise: putting the pointer on the picture is deliberate enough to mean
-    // "let me hear this", and taking it off takes the sound away again. Nothing
-    // about the autoplay policy is being worked around — the page has sticky
-    // user activation long before a render exists, because queueing one is a
-    // click.
-    //
-    // The control bar is the browser's: scrubbing and volume are solved problems
-    // and a hand-built transport here would only be a worse one. Muting from it
-    // sticks until the pointer next arrives, which is the same rule.
-    //
-    // Whether it plays *itself* is Settings → Nodes' preview-playback answer,
-    // read at draw time off the same cache the shift pills use. Off means the
-    // first frame, still, and the browser's play button — everything above
-    // (loop, hover sound) applies unchanged once it is started by hand.
-    return el("video", {
+    // Start silent for autoplay. Native volume controls remain available;
+    // pointer sound is an explicit, separate Settings → Nodes choice.
+    const video = el("video", {
       class: "mmc-stage-video",
       src: this.result.url,
       // No tooltip, for the reason `still` gives.
@@ -1160,12 +1362,18 @@ export class Stage {
       controls: true, loop: true, muted: true, playsinline: true, preload: "metadata",
       onloadedmetadata: (event) => this.setAspect(event.currentTarget.videoWidth,
                                                   event.currentTarget.videoHeight),
-      onmouseenter: (event) => { event.currentTarget.muted = false; },
-      onmouseleave: (event) => { event.currentTarget.muted = true; },
+      onmouseenter: (event) => {
+        if (uiSetting("preview_audio", "muted") === "hover") event.currentTarget.muted = false;
+      },
+      onmouseleave: (event) => {
+        if (uiSetting("preview_audio", "muted") === "hover") event.currentTarget.muted = true;
+      },
       // The canvas pans on drag, and a drag that starts on the scrub bar is a
       // scrub rather than a pan.
       onpointerdown: (event) => event.stopPropagation(),
     });
+    video.muted = true;
+    return video;
   }
 }
 

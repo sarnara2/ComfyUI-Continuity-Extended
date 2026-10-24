@@ -393,6 +393,38 @@ def dropped_quotes(requests, written):
     return missing
 
 
+_DIALOGUE_RE = re.compile(r"<d>\[[^\]\n]+\](?:(?!</?d>)[\s\S])*?</d>")
+_DIALOGUE_SPEAKER_RE = re.compile(
+    r"\(S(@[A-Za-z][A-Za-z0-9_]*(?:\s*,\s*@[A-Za-z][A-Za-z0-9_]*)*)\)"
+    r"|(@[A-Za-z][A-Za-z0-9_]*)\s*\(S\d+(?:\s*,\s*S\d+)*\)"
+    r"|\((S\d+(?:\s*,\s*S\d+)*)\)")
+
+
+def preserve_dialogue(original, written):
+    """Keep authored speech exact; an ambiguous rewrite keeps its source field."""
+    source = list(_DIALOGUE_RE.finditer(original))
+    if not source:
+        return written, False
+    target = list(_DIALOGUE_RE.finditer(written))
+
+    def speakers(text, spans):
+        owners, previous = [], 0
+        for span in spans:
+            found = list(_DIALOGUE_SPEAKER_RE.finditer(text[previous:span.start()]))
+            owners.append(re.sub(r"\s", "", next((part for part in found[-1].groups() if part), ""))
+                          if found else "")
+            previous = span.end()
+        return owners
+
+    # Positional replacement is safe only when line count and explicit speaker
+    # ownership survived. Do not guess where a dropped or reordered line belongs.
+    if len(source) != len(target) or speakers(original, source) != speakers(written, target):
+        return original, True
+    for before, after in reversed(list(zip(source, target))):
+        written = written[:after.start()] + before.group(0) + written[after.end():]
+    return written, False
+
+
 def dropped_variations(requests, written):
     """Request groups — `{day|night}` — the rewrite no longer offers. Empty is good.
 

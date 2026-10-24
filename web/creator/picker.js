@@ -6,12 +6,14 @@ import { listAssets, listingTruncated, listedFolders, makeFolder, removeFolder,
          revealFolder, viewUrl, stillUrl, upload, moveAsset,
          deleteAsset, loadPickerPrefs, savePickerPrefs, buildPlate,
          cutPanel, uploadRefMod, listExternalFolders, chooseExternalFolder,
-         listExternalAssets, importExternalAssets, removeExternalFolder,
+         listExternalAssets, checkExternalAssets, importExternalAssets, removeExternalFolder,
          revealExternalFolder } from "./api.js";
 import { openTrim, trimLabel } from "./trim.js";
 import { openPicture, cropLabel } from "./picture.js";
 import { greyField } from "./subject.js";
 import { t } from "./i18n.js";
+import { readViewPrefs, patchViewPrefs, pickerViewContext, pickerViewKind } from "./viewprefs.js";
+import { pickerSelectionContext, readPickedPaths, writePickedPaths } from "./picker-checks.js";
 import { memberFromMod } from "./presets.js";
 import { queueState, watch as watchQueue, dropQueued } from "./queue.js";
 import { takeOptions, takeWord } from "./state.js";
@@ -56,6 +58,12 @@ const PAGE_SIZE = 60;
 // in PAGE_SIZE batches; past it a pager appears, because a ten-thousand-file
 // folder should be jumped through, not scrolled end to end.
 const PER_PAGE = 240;
+const VIEW_MODES = ["large", "small", "details"];
+const VIEW_LABEL = { large: "Large thumbnails", small: "Small thumbnails", details: "Details" };
+const relativeDirectory = (value) => typeof value === "string" && value.length <= 1024
+  && !/[\\\u0000-\u001f\u007f]/.test(value) && !value.startsWith("/")
+  && (value === "" || value.split("/").every((part) => part && part !== "." && part !== "..")) ? value : "";
+let fileInfoSequence = 0;
 
 /** A face count the way the image-to-3D tool writes one: 200k, 1.2M. */
 const meshFaces = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}k`);
@@ -84,6 +92,11 @@ function chevron(cls) {
  *   renders one included — a swap has to be the kind whose handle it inherits
  * @param {boolean} options.viewOnly      browse and play, select nothing — the
  *   Timeline's gallery, which has no segment to attach a pick to
+ * @param {string} options.selectionPurpose explicit UI-check memory scope; no
+ *   workflow attachment is made until the caller receives an explicit commit
+ * @param {boolean} [options.rememberSelection=false] fresh checks per opening;
+ *   true explicitly remembers checks between openings. Tab choices and view
+ *   preferences remain available within a fresh opening.
  * @param {object} options.referenceOptions initial {takes, ref_size}, with
  *   per-file overrides and selection-wide defaults; allowedTakes may narrow
  *   the real vocabulary per kind for a caller with a fixed-purpose slot
@@ -99,8 +112,24 @@ export class Picker {
   constructor(options, resolve) {
     this.options = options;
     this.resolve = resolve;
-    this.kind = options.kind || options.kinds[0];
-    this.query = "";
+    this.viewContext = pickerViewContext(options);
+    const view = readViewPrefs(this.viewContext);
+    this.kind = pickerViewKind(options, view.kind);
+    this.query = (view.query ?? "").toLowerCase();
+    this.viewQuery = view.query ?? "";
+    this.sortOrder = view.sort ?? "recent";  // view order only; selected files keep click order
+    this.viewMode = VIEW_MODES.includes(view.view) ? view.view : "large";
+    this.rememberedExternal = Object.hasOwn(view, "externalFolder") ? view.externalFolder : null;
+    this.externalDirectory = relativeDirectory(view.directory ?? "");
+    this.externalDirectories = [];
+    this.externalParent = null;
+    this.sourceAliases = new Map(); // Imported copy -> original registered token.
+    this.selectionRevision = 0;
+    this.checksReady = false;
+    // RAM for this opening only: tab roundtrips keep checks, but reopening
+    // cannot bring a detached reference back from an earlier selection.
+    this.sessionChecks = options.rememberSelection === true ? null : new Map();
+    this.pickAnchor = null;    // separate from organize's marks and preview clicks
     this.selected = [];   // asset rows, in click order
     this.assets = [];
     this.renders = [];    // the output folder, only fetched when the tab exists
@@ -199,13 +228,16 @@ export class Picker {
   }
 
   mount() {
-    this.grid = el("div", { class: "mmc-grid" });
+    this.grid = el("div", { class: "mmc-grid", onscroll: () => this.hideFileInfo() });
     this.search = el("input", {
       class: "mmc-search",
       type: "search",
       placeholder: t("Search..."),
+      value: this.viewQuery,
       oninput: (event) => {
         this.query = event.target.value.toLowerCase();
+        patchViewPrefs(this.viewContext, { query: event.target.value });
+        this.pickAnchor = null;
         this.page = 0;
         this.visibleCount = PAGE_SIZE;
         this.renderGrid();
@@ -234,13 +266,42 @@ export class Picker {
     this.pager = el("div", { class: "mmc-pager" });
 
     this.shelfRow = el("div", { class: "mmc-shelves" });
-    this.modal = el("div", { class: "mmc-modal" }, [
+    this.directoryBar = el("nav", { class: "mmc-picker-directory-bar", hidden: true,
+      "aria-label": t("Folder navigation") });
+    this.viewButtons = VIEW_MODES.map((mode) => el("button", {
+      type: "button", class: "mmc-picker-view-opt", text: t(VIEW_LABEL[mode]),
+      "aria-pressed": String(this.viewMode === mode), onclick: () => this.setViewMode(mode),
+    }));
+    this.viewControls = el("div", { class: "mmc-picker-view-modes", "aria-label": t("File display mode") }, this.viewButtons);
+    this.sortSelect = el("select", {
+      class: "mmc-picker-sort", "aria-label": t("File display order"),
+      title: t("Sort the displayed files only; selected files keep their order."),
+      onchange: () => {
+        this.sortOrder = this.sortSelect.value;
+        patchViewPrefs(this.viewContext, { sort: this.sortOrder });
+        this.pickAnchor = null;
+        this.anchor = null;
+        this.lastClick = null;
+        this.page = 0;
+        this.visibleCount = PAGE_SIZE;
+        this.renderGrid();
+        this.grid.scrollTop = 0;
+      },
+    }, [el("option", { value: "recent", text: t("Recently modified") }),
+        el("option", { value: "name", text: t("Filename order") })]);
+    this.sortSelect.value = this.sortOrder;
+    this.sortControl = el("label", { class: "mmc-picker-sort-control" }, [this.sortSelect]);
+    this.fileInfo = el("div", {
+      class: "mmc-file-info", id: `mmc-file-info-${++fileInfoSequence}`, role: "tooltip", hidden: true,
+    });
+    this.modal = el("div", { class: `mmc-modal mmc-picker mmc-picker-view-${this.viewMode}` }, [
       el("div", { class: "mmc-modal-head" }, [
         ...this.tabs,
         el("button", { class: "mmc-close", text: "✕", onclick: () => this.close(null) }),
       ]),
       el("div", { class: "mmc-modal-bar" }, [
         this.search,
+        this.viewControls,
         el("button", {
           class: "mmc-organize",
           "aria-pressed": false,
@@ -266,9 +327,11 @@ export class Picker {
         el("button", { class: "mmc-upload", text: t("+  Upload {kind}", { kind: t(KIND_LABEL[this.kind].toLowerCase()) }), onclick: () => this.pickFile() }),
       ]),
       this.shelfRow,
+      this.directoryBar,
       this.grid,
       this.pager,
       this.foot,
+      this.fileInfo,
     ]);
     this.uploadButton = this.modal.querySelector(".mmc-upload");
     this.organizeButton = this.modal.querySelector(".mmc-organize");
@@ -306,9 +369,11 @@ export class Picker {
         if (this.closed || sequence !== this.listingSequence) return;
         this.prefs = prefs;
         this.externalFolders = registry.folders ?? [];
+        const remembered = this.rememberedExternal ?? prefs.externalFolder;
         this.externalFolder = this.kind !== "meshes"
-          ? this.externalFolders.find((folder) => folder.id === prefs.externalFolder)?.id ?? null
+          ? this.externalFolders.find((folder) => folder.id === remembered)?.id ?? null
           : null;
+        if (!this.externalFolder) this.externalDirectory = "";
       }
       if (this.externalFolder) {
         this.shelf = "all";
@@ -316,11 +381,14 @@ export class Picker {
         if (this.closed || sequence !== this.listingSequence) return;
         // These paths already belong to the attached sheet, so restoring its
         // known panels does not need a walk of any other media folder.
-        this.selected = (this.plate?.panels ?? []).map((panel) => ({
+        if (!this.restored) this.selected = (this.plate?.panels ?? []).map((panel) => ({
           path: panel.path, kind: "image", name: panel.path.split("/").pop(),
           subfolder: "", size: 0, mtime: 0,
         }));
         this.restored = true;
+        await this.restorePicked({ sequence });
+        if (this.closed || sequence !== this.listingSequence) return;
+        this.renderGrid();
         this.renderFoot();
         if (this.plate?.edit && !this.editOpened && this.sheetPanels().length) {
           this.editOpened = true;
@@ -365,6 +433,8 @@ export class Picker {
                        ?? this.renders.find((a) => a.path === panel.path))
           .filter(Boolean);
       }
+      if (!this.checksReady) await this.restorePicked();
+      if (this.closed || sequence !== this.listingSequence) return;
     } catch (error) {
       if (this.closed || sequence !== this.listingSequence) return;
       this.assets = [];
@@ -395,23 +465,97 @@ export class Picker {
     if (external && this.organize) this.setOrganize(false);
   }
 
+  selectionContext() {
+    const options = this.sessionChecks ? { ...this.options, rememberSelection: true } : this.options;
+    return pickerSelectionContext(options, this.kind);
+  }
+
+  rememberPicked() {
+    if (!this.checksReady || this.options.viewOnly) return;
+    const context = this.selectionContext();
+    if (!context) return;
+    const paths = this.selected.map((asset) => this.sourceAliases.get(asset.path) ?? asset.path);
+    if (this.sessionChecks) this.sessionChecks.set(context, paths);
+    else writePickedPaths(context, paths);
+  }
+
+  /** Checks are a UI memory, never an attachment or an old edit recipe. */
+  async restorePicked() {
+    if (this.checksReady || this.closed) return;
+    const kind = this.kind, context = this.selectionContext(), revision = this.selectionRevision;
+    if (!context) { this.checksReady = true; return; }
+    const paths = this.sessionChecks ? this.sessionChecks.get(context) ?? [] : readPickedPaths(context);
+    const known = kind === "renders" ? this.renders : kind === "refmods" ? this.mods
+      : kind === "meshes" ? this.meshes : this.assets;
+    const byPath = new Map(known.map((asset) => [asset.path, asset]));
+    const external = paths.filter((path) => path.startsWith("external:"));
+    let verified = true;
+    if (external.length && kind !== "meshes") {
+      // Validation is optional UI restoration. Fresh builtin files remain
+      // usable while another directory's registered tokens are being checked.
+      if (this.loaded && !this.grid.childElementCount) {
+        this.renderShelves(); this.renderGrid(); this.renderFoot();
+      }
+      try {
+        const result = await checkExternalAssets({ paths: external, kind: kind === "guides" ? "renders" : kind });
+        for (const asset of result.assets ?? []) byPath.set(asset.path, asset);
+      } catch {
+        // A temporary metadata error must not erase a previously saved check.
+        verified = false;
+      }
+    }
+    if (this.closed || kind !== this.kind || context !== this.selectionContext()
+        || revision !== this.selectionRevision || this.checksReady) return;
+    this.selected = [];
+    for (const path of paths) {
+      const asset = byPath.get(path);
+      if (!asset || !this.tabAllows(asset) || !this.room(this.targetKind(asset))) continue;
+      this.selected.push(asset);
+    }
+    this.checksReady = verified;
+    this.syncSelected({ remember: false });
+    this.renderFoot();
+  }
+
+  tabAllows(asset) {
+    if (asset.path.startsWith("external:")) {
+      const grant = asset.path.slice("external:".length).split("/")[0];
+      // A metadata response issued before the user revoked a shortcut can
+      // arrive afterward. Only still-registered sources may regain checks.
+      if (!this.externalFolders.some((folder) => folder.id === grant)) return false;
+    }
+    if (this.options.only && asset.kind !== this.options.only) return false;
+    if (this.kind === "guides") return asset.path.startsWith("external:")
+      ? ["image", "video"].includes(asset.kind) : isGuide(asset);
+    if (["renders", "refmods", "meshes"].includes(this.kind)) return true;
+    return asset.kind === this.kind;
+  }
+
   async refreshExternal({ sequence = ++this.listingSequence } = {}) {
-    const folder = this.externalFolder, kind = this.kind;
+    const folder = this.externalFolder, kind = this.kind, directory = this.externalDirectory;
     if (!folder) return;
     this.loaded = false;
     this.loadError = null;
     this.updateFolderTools();
     this.renderGrid();
     try {
-      const result = await listExternalAssets({ folder, kind: kind === "guides" ? "renders" : kind });
-      if (this.closed || sequence !== this.listingSequence || folder !== this.externalFolder || kind !== this.kind) return;
+      const result = await listExternalAssets({ folder, kind: kind === "guides" ? "renders" : kind, directory });
+      if (this.closed || sequence !== this.listingSequence || folder !== this.externalFolder || kind !== this.kind || directory !== this.externalDirectory) return;
       this.externalAssets = result.assets ?? [];
       this.externalTruncated = result.truncated === true;
+      this.externalDirectory = relativeDirectory(result.directory ?? directory);
+      this.externalDirectories = (result.folders ?? []).filter((row) => typeof row?.name === "string"
+        && row.directory && relativeDirectory(row.directory) === row.directory
+        && row.directory.split("/").slice(0, -1).join("/") === this.externalDirectory);
+      this.externalParent = result.parent == null ? null : relativeDirectory(result.parent);
+      patchViewPrefs(this.viewContext, { externalFolder: folder, directory: this.externalDirectory });
     } catch (error) {
-      if (this.closed || sequence !== this.listingSequence) return;
+      if (this.closed || sequence !== this.listingSequence || folder !== this.externalFolder || kind !== this.kind) return;
       this.externalAssets = [];
+      this.externalDirectories = [];
       this.externalTruncated = false;
       this.loadError = error.message;
+      this.externalParent = directory ? directory.split("/").slice(0, -1).join("/") : null;
     }
     this.loaded = true;
     this.renderShelves();
@@ -419,12 +563,54 @@ export class Picker {
     this.renderFoot();
   }
 
+  setViewMode(mode) {
+    if (!VIEW_MODES.includes(mode) || mode === this.viewMode) return;
+    this.lastClick = null; // A view-control click breaks a file double-click.
+    this.modal.classList.remove(`mmc-picker-view-${this.viewMode}`);
+    this.viewMode = mode;
+    this.modal.classList.add(`mmc-picker-view-${mode}`);
+    this.viewButtons.forEach((button, index) => button.setAttribute("aria-pressed", String(VIEW_MODES[index] === mode)));
+    patchViewPrefs(this.viewContext, { view: mode });
+    this.renderGrid();
+  }
+
+  openExternalDirectory(directory) {
+    if (!this.externalFolder || relativeDirectory(directory) !== directory) return;
+    this.pickAnchor = null; this.lastClick = null;
+    this.externalDirectory = directory;
+    this.page = 0; this.visibleCount = PAGE_SIZE;
+    return this.refreshExternal();
+  }
+
+  renderDirectoryBar() {
+    this.directoryBar.hidden = !this.externalFolder;
+    if (!this.externalFolder) { this.directoryBar.replaceChildren(); return; }
+    const folder = this.externalFolders.find((row) => row.id === this.externalFolder);
+    const crumb = (directory, label, className) => el("button", {
+      type: "button", class: className, text: label, title: label,
+      "aria-current": directory === this.externalDirectory ? "location" : null,
+      onclick: () => this.openExternalDirectory(directory),
+    });
+    const parts = this.externalDirectory ? this.externalDirectory.split("/") : [];
+    this.directoryBar.replaceChildren(
+      el("button", { type: "button", class: "mmc-picker-directory-up", text: "↑",
+        title: t("Parent folder"), "aria-label": t("Parent folder"), disabled: this.externalParent == null,
+        onclick: () => { if (this.externalParent != null) this.openExternalDirectory(this.externalParent); } }),
+      crumb("", folder?.name || t("Folder root"), "mmc-picker-directory-root"),
+      ...parts.flatMap((part, index) => [chevron("mmc-crumb-sep"),
+        crumb(parts.slice(0, index + 1).join("/"), part, "mmc-picker-directory-crumb")]),
+    );
+  }
+
   selectExternalFolder(id) {
     if (!this.externalFolders.some((folder) => folder.id === id)) return;
+    this.pickAnchor = null;
     this.externalFolder = id;
+    this.externalDirectory = "";
     this.shelf = "all";
     this.prefs = { ...this.prefs, externalFolder: id };
     savePickerPrefs(this.prefs);
+    patchViewPrefs(this.viewContext, { externalFolder: id, directory: "" });
     this.page = 0;
     this.visibleCount = PAGE_SIZE;
     this.marked = [];
@@ -479,6 +665,8 @@ export class Picker {
       }
       external.forEach((asset, index) => {
         const before = asset.path, picked = imported[index];
+        this.sourceAliases.set(picked.path, this.sourceAliases.get(before) ?? before);
+        if (this.pickAnchor === before) this.pickAnchor = picked.path;
         for (const map of [this.settings, this.cuts, this.rects, this.points]) {
           if (!map.has(before)) continue;
           map.set(picked.path, map.get(before));
@@ -497,6 +685,7 @@ export class Picker {
         // keeps crop/trim options and the user's selection on that same file.
         Object.assign(asset, picked);
       });
+      this.rememberPicked();
       this.renderGrid();
       this.renderFoot();
       return true;
@@ -507,11 +696,16 @@ export class Picker {
   }
 
   selectTab(kind) {
-    if (kind === this.kind) return;
+    if (kind === this.kind || !this.options.kinds.includes(kind)) return;
+    this.rememberPicked();
+    ++this.selectionRevision;
+    this.checksReady = false;
+    this.pickAnchor = null;
     const previous = this.kind;
     this.kind = kind;
-    // Selections do not survive a tab change: they go into different slots.
-    // The sheet does not either — its panels were part of the selection.
+    patchViewPrefs(this.viewContext, { kind });
+    // Each tab restores only its own checked paths. Connected sheets and edit
+    // recipes still do not travel between tabs.
     this.selected = [];
     this.sheet = [];
     for (const tab of this.tabs) tab.setAttribute("aria-selected", String(tab.textContent === t(KIND_LABEL[kind])));
@@ -530,11 +724,13 @@ export class Picker {
     if (this.externalFolder && kind !== "meshes") {
       this.page = 0;
       this.visibleCount = PAGE_SIZE;
-      this.refreshExternal();
+      this.refreshExternal().then(() => this.restorePicked());
       return;
     }
     if (this.externalFolder) {
       this.externalFolder = null;
+      this.externalDirectory = "";
+      patchViewPrefs(this.viewContext, { externalFolder: "", directory: "" });
       this.prefs = { ...this.prefs, externalFolder: null };
       savePickerPrefs(this.prefs);
       if (!this.builtinLoaded) { this.load({ force: true }); return; }
@@ -552,6 +748,7 @@ export class Picker {
     this.renderShelves();
     this.renderGrid();
     this.renderFoot();
+    this.restorePicked();
   }
 
   // ---- shelves -------------------------------------------------------------
@@ -703,9 +900,12 @@ export class Picker {
   }
 
   setShelf(shelf) {
+    this.pickAnchor = null;
     if (this.externalFolder) {
       ++this.listingSequence;
       this.externalFolder = null;
+      this.externalDirectory = "";
+      patchViewPrefs(this.viewContext, { externalFolder: "", directory: "" });
       this.prefs = { ...this.prefs, externalFolder: null };
       savePickerPrefs(this.prefs);
       this.loadError = null;
@@ -726,6 +926,7 @@ export class Picker {
   }
 
   renderShelves() {
+    this.renderDirectoryBar();
     if (!this.loaded) {
       this.shelfRow.style.display = "none";
       return;
@@ -847,7 +1048,7 @@ export class Picker {
     const fixed = this.kind === "meshes" || this.kind === "refmods" || this.externalFolder;
     const drop = fixed ? null : this.emptyShelfChip(here);
     this.shelfRow.replaceChildren(crumbs, strip, ...(fixed ? [] : [this.newShelfChip(here)]),
-                                  ...(drop ? [drop] : []));
+                                  ...(drop ? [drop] : []), ...(this.sortControl ? [this.sortControl] : []));
     requestAnimationFrame(() => this.markStripEdges(strip));
   }
 
@@ -1017,6 +1218,7 @@ export class Picker {
     this.organize = on;
     this.marked = [];
     this.anchor = null;
+    this.pickAnchor = null;
     this.organizeButton.setAttribute("aria-pressed", String(on));
     this.renderGrid();
     this.renderFoot();
@@ -1044,6 +1246,27 @@ export class Picker {
     const run = rows.slice(Math.min(from, to), Math.max(from, to) + 1);
     this.marked = [...new Set([...this.marked, ...run.map((a) => a.path)])];
     this.anchor = asset.path;
+    this.syncSelected();
+    this.renderFoot();
+  }
+
+  /** Import a displayed range additively, with the same buckets as a normal
+   *  pick. Marks, single-file pickers and preview-only galleries stay separate.
+   *  Settings are kept by path; choosing a range never opens an editor or
+   *  changes an existing selection's order, trim, crop or reference options. */
+  pickRun(asset) {
+    if (this.options.single || this.options.viewOnly || this.organize) return;
+    const rows = this.visible();
+    const from = rows.findIndex((row) => row.path === this.pickAnchor);
+    const to = rows.findIndex((row) => row.path === asset.path);
+    if (from < 0 || to < 0) { this.toggle(asset); return; }
+    const chosen = new Set(this.selected.map((row) => row.path));
+    for (const row of rows.slice(Math.min(from, to), Math.max(from, to) + 1)) {
+      if (chosen.has(row.path) || !this.room(this.targetKind(row))) continue;
+      this.selected.push(row);
+      chosen.add(row.path);
+    }
+    this.pickAnchor = asset.path;
     this.syncSelected();
     this.renderFoot();
   }
@@ -1152,9 +1375,17 @@ export class Picker {
       // clips and stills, and nothing else in the input folder.
       : this.kind === "guides" ? (asset) => this.externalFolder ? ["image", "video"].includes(asset.kind) : isGuide(asset)
       : (asset) => asset.kind === this.kind;
-    return this.activeAssets().filter((asset) =>
+    const rows = this.activeAssets().filter((asset) =>
       onKind(asset) && onShelf(asset)
       && (!this.query || asset.path.toLowerCase().includes(this.query)));
+    // Sort a filtered copy, not the source listing or the attachment list.
+    // Recent means the existing modification time, not last usage or a probe.
+    const compare = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" }).compare;
+    const nameOrder = (a, b) => compare(String(a.name ?? a.path), String(b.name ?? b.path))
+      || compare(String(a.path), String(b.path));
+    const modified = (asset) => Number.isFinite(asset.mtime) ? asset.mtime : 0;
+    return rows.sort(this.sortOrder === "name" ? nameOrder
+      : (a, b) => modified(b) - modified(a) || nameOrder(a, b));
   }
 
   /** The slot a selection will actually take. A video kept for its soundtrack
@@ -1201,6 +1432,8 @@ export class Picker {
   }
 
   renderGrid() {
+    this.renderDirectoryBar();
+    this.hideFileInfo();
     this.observer?.disconnect();
     this.observer = null;
     this.cells.clear();
@@ -1217,7 +1450,11 @@ export class Picker {
         : t("Could not read the input folder: {error}", { error: this.loadError }) }));
       return;
     }
-    const rows = this.visible();
+    const folders = this.externalFolder ? this.externalDirectories.filter((folder) =>
+      !this.query || folder.directory.toLowerCase().includes(this.query)).map((folder) => ({ ...folder, folder: true })) : [];
+    const compareFolders = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" }).compare;
+    folders.sort((a, b) => compareFolders(a.name, b.name));
+    const rows = [...folders, ...this.visible()];
     if (!rows.length) {
       this.grid.appendChild(el("div", {
         class: "mmc-empty",
@@ -1301,6 +1538,7 @@ export class Picker {
   appendCells(from) {
     const to = Math.min(this.visibleCount, this.gridRows.length);
     for (const asset of this.gridRows.slice(from, to)) {
+      if (asset.folder) { this.grid.appendChild(this.folderCell(asset)); continue; }
       const cell = this.cell(asset);
       this.cells.set(asset.path, cell);
       this.grid.appendChild(cell);
@@ -1329,11 +1567,21 @@ export class Picker {
     this.observer.observe(sentinel);
   }
 
+  folderCell(folder) {
+    return el("button", { type: "button", class: "mmc-picker-folder",
+      title: t("Open folder {name}", { name: folder.name }),
+      "aria-label": t("Open folder {name}", { name: folder.name }),
+      onclick: () => this.openExternalDirectory(folder.directory) }, [
+      icon("folder", 28), el("span", { class: "mmc-picker-folder-name", text: folder.name }),
+      el("span", { class: "mmc-picker-folder-hint", text: t("Folder") })]);
+  }
+
   /** Rebuild one cell in place — for a change that lives inside it, like its
    *  star or segment badge. Cells not yet materialised have nothing to show. */
   refreshCell(asset) {
     const old = this.cells.get(asset.path);
     if (!old) return;
+    if (this.infoCell === old) this.hideFileInfo();
     const fresh = this.cell(asset);
     this.cells.set(asset.path, fresh);
     old.replaceWith(fresh);
@@ -1343,12 +1591,19 @@ export class Picker {
    *  in the DOM. This is what a click changes — rebuilding the whole grid for
    *  it re-created every cell and re-fired every thumbnail request, which is
    *  what made large folders freeze. */
-  syncSelected() {
+  syncSelected({ remember = true } = {}) {
+    if (remember && !this.organize) {
+      ++this.selectionRevision;
+      this.checksReady = true;
+      this.rememberPicked();
+    }
     for (const [path, cell] of this.cells) {
       const chosen = this.organize
         ? this.marked.includes(path)
         : this.selected.some((a) => a.path === path);
       cell.setAttribute("aria-selected", String(chosen));
+      const check = cell.querySelector(".mmc-picker-check");
+      if (check) check.checked = chosen;
       if (this.referenceDefaults) {
         const asset = this.selected.find((a) => a.path === path);
         if (!asset) continue;
@@ -1471,6 +1726,60 @@ export class Picker {
       }, sizeable)]);
   }
 
+  /** Only facts already on the listing row. In particular, this must not call
+   *  probe(), decode media or walk a folder just because a tile was hovered. */
+  fileFacts(asset) {
+    const facts = [[t("File type"), `${t(KIND_LABEL[asset.kind] || asset.kind)}${asset.mod ? " · RefMod" : ""}`],
+      [t("File path"), asset.path]];
+    if (Number.isFinite(asset.size) && asset.size >= 0) {
+      const unit = asset.size >= 1048576 ? "MiB" : asset.size >= 1024 ? "KiB" : "B";
+      const scale = unit === "MiB" ? 1048576 : unit === "KiB" ? 1024 : 1;
+      facts.push([t("File size"), `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(asset.size / scale)} ${unit}`]);
+    }
+    if (Number.isFinite(asset.width) && asset.width > 0 && Number.isFinite(asset.height) && asset.height > 0) {
+      facts.push([t("Dimensions"), `${asset.width} × ${asset.height}`]);
+    }
+    if (Number.isFinite(asset.duration) && asset.duration > 0) {
+      facts.push([t("Duration"), t("{seconds} s", { seconds: new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 }).format(asset.duration) })]);
+    }
+    if (Number.isFinite(asset.mtime) && asset.mtime > 0) {
+      const date = new Date(asset.mtime * 1000);
+      if (Number.isFinite(date.getTime())) facts.push([t("Modified"), date.toLocaleString()]);
+    }
+    return facts;
+  }
+
+  showFileInfo(asset, cell, delayed = false) {
+    this.hideFileInfo();
+    const show = () => {
+      if (this.closed || this.dragging || !cell.isConnected || !this.fileInfo) return;
+      this.infoCell = cell;
+      this.fileInfo.replaceChildren(el("div", { class: "mmc-file-info-name", text: asset.name || asset.path }),
+        el("dl", {}, this.fileFacts(asset).flatMap(([label, value]) =>
+          [el("dt", { text: label }), el("dd", { text: value })])),
+        el("div", { class: "mmc-file-info-hint", text: t(this.options.viewOnly ? "Click to view" : "Double-click to view") }));
+      this.fileInfo.hidden = false;
+      cell.setAttribute("aria-describedby", this.fileInfo.id);
+      const modal = this.modal.getBoundingClientRect(), tile = cell.getBoundingClientRect();
+      const box = this.fileInfo.getBoundingClientRect();
+      const left = Math.max(8, Math.min(tile.left - modal.left, modal.width - box.width - 8));
+      const below = tile.bottom - modal.top + 8;
+      const top = below + box.height <= modal.height - 8 ? below : tile.top - modal.top - box.height - 8;
+      this.fileInfo.style.left = `${left}px`;
+      this.fileInfo.style.top = `${Math.max(8, Math.min(top, modal.height - box.height - 8))}px`;
+    };
+    if (delayed) this.infoTimer = setTimeout(show, 250);
+    else show();
+  }
+
+  hideFileInfo() {
+    clearTimeout(this.infoTimer);
+    this.infoTimer = null;
+    this.infoCell?.removeAttribute("aria-describedby");
+    this.infoCell = null;
+    if (this.fileInfo) this.fileInfo.hidden = true;
+  }
+
   cell(asset) {
     const chosen = this.organize
       ? this.marked.includes(asset.path)
@@ -1482,14 +1791,26 @@ export class Picker {
       role: "button",
       tabindex: "0",
       "aria-selected": chosen,
-      title: t("{path} — double-click to view", { path: asset.path }),
+      "aria-label": t("{path} — double-click to view", { path: asset.path }),
       // Double-clicks are detected by hand rather than with dblclick: the
       // second click re-toggles first, so viewing leaves the selection exactly
       // where it stood, and viewOnly grids get a single-click view.
       // A shift-click would start selecting the page's text and images.
-      onmousedown: (event) => { if (event.shiftKey && this.organize) event.preventDefault(); },
+      onmousedown: (event) => {
+        this.hideFileInfo();
+        if (event.shiftKey && (this.organize || (!this.options.single && !this.options.viewOnly))) event.preventDefault();
+      },
+      onmouseenter: () => this.showFileInfo(asset, cell, true),
+      onmouseleave: () => { if (!cell.contains(document.activeElement)) this.hideFileInfo(); },
+      onfocusin: () => this.showFileInfo(asset, cell),
+      onfocusout: (event) => { if (!cell.contains(event.relatedTarget)) this.hideFileInfo(); },
       onclick: (event) => {
         if (this.organize && event.shiftKey) { this.markRun(asset); return; }
+        if (event.shiftKey && !this.options.single && !this.options.viewOnly) {
+          this.lastClick = null;
+          this.pickRun(asset);
+          return;
+        }
         const now = Date.now();
         const double = this.lastClick
           && this.lastClick.path === asset.path && now - this.lastClick.at < 400;
@@ -1507,9 +1828,11 @@ export class Picker {
         if (double) this.view(asset);
       },
       onkeydown: (event) => {
+        if (event.target !== cell) return;
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         if (this.organize) (event.shiftKey ? this.markRun(asset) : this.mark(asset));
+        else if (event.shiftKey && !this.options.single && !this.options.viewOnly) this.pickRun(asset);
         else this.toggle(asset);
       },
     });
@@ -1549,6 +1872,17 @@ export class Picker {
     }
 
     cell.appendChild(el("div", { class: "mmc-check" }));
+    if (this.viewMode === "details" && !this.options.viewOnly) {
+      cell.appendChild(el("input", { type: "checkbox", class: "mmc-picker-check", checked: chosen,
+        "aria-label": t("Select {name}", { name: asset.name || asset.path }),
+        onmousedown: (event) => event.stopPropagation(),
+        onclick: (event) => { event.stopPropagation(); this.lastClick = null; },
+        onchange: (event) => {
+          if (this.organize) this.mark(asset); else this.toggle(asset);
+          event.target.checked = this.organize ? this.marked.includes(asset.path)
+            : this.selected.some((row) => row.path === asset.path);
+        } }));
+    }
     // Paired: this picture is a panel of the connected sheet, and the number is
     // where it sits — the same numbering the sheet editor and the card use.
     if (!this.organize && this.sheet.includes(asset.path)) {
@@ -1584,9 +1918,16 @@ export class Picker {
       if (asset.kind !== "image") cell.appendChild(this.badge(asset));
       if (asset.kind !== "audio") cell.appendChild(this.cropBadge(asset));
     }
-    if (asset.kind !== "audio") cell.appendChild(el("div", { class: "mmc-cell-name", text: asset.name }));
+    if (asset.kind !== "audio" || this.viewMode === "details") cell.appendChild(el("div", { class: "mmc-cell-name", text: asset.name }));
     const referenceControls = this.referenceControls(asset);
     if (referenceControls) cell.appendChild(referenceControls);
+    if (this.viewMode === "details") {
+      cell.appendChild(el("dl", { class: "mmc-picker-detail-meta" },
+        this.fileFacts(asset).flatMap(([label, value]) => [
+          el("dt", { class: "mmc-picker-detail-label", text: label }),
+          el("dd", { class: "mmc-picker-detail-value", text: value }),
+        ])));
+    }
 
     // Stars and dragging on every tab, renders included: a finished clip is the
     // thing most worth starring, and where a render was *written* is not where
@@ -1618,6 +1959,7 @@ export class Picker {
     cell.addEventListener("dragstart", (event) => {
       if (!cell.draggable) { event.preventDefault(); return; }
       this.dragging = asset;
+      this.hideFileInfo();
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", asset.path);
       this.modal.classList.add("dragging");
@@ -2386,6 +2728,7 @@ export class Picker {
 
   toggle(asset) {
     if (this.options.viewOnly) return;
+    this.pickAnchor = asset.path;
     const at = this.selected.findIndex((a) => a.path === asset.path);
     if (at >= 0) this.selected.splice(at, 1);
     else if (this.options.single) this.selected = [asset];
@@ -2663,7 +3006,10 @@ export class Picker {
   }
 
   close(result) {
+    if (this.closed) return;
+    this.rememberPicked();
     this.closed = true;
+    this.hideFileInfo();
     ++this.listingSequence;
     clearTimeout(this.warnTimer);
     clearTimeout(this.armTimer);

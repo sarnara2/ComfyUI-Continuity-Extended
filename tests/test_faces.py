@@ -169,8 +169,10 @@ check("...and never more than a third of the canvas",
 # --- the piece and the shot ---------------------------------------------------
 
 PIECE = {"version": 2, "prompt": "", "models": {},
-         "face": {"on": True, "canvas": 512, "denoise": 0.45},
-         "segments": [{"prompt": "a face", "duration_s": 5}]}
+         "face_schema": compiler.FACE_SCHEMA,
+         "segments": [{"prompt": "a face", "duration_s": 5,
+                       "face": {"on": True, "canvas": 512, "denoise": 0.45}}]}
+FACE = PIECE["segments"][0]["face"]
 
 
 def piece(**overrides):
@@ -181,7 +183,7 @@ check("off by default", compiler.face_piece({}), None)
 check("a switched-off piece runs none",
       compiler.face_piece({"face": {"on": False, "canvas": 512}}), None)
 check("the piece's settings come back whole",
-      compiler.face_piece(PIECE),
+      compiler.face_piece({"face": FACE}),
       {"on": True, "canvas": 512, "denoise": 0.45})
 check("the canvas is clamped to what the weights hold",
       compiler.face_piece({"face": {"on": True, "canvas": 4096}})["canvas"],
@@ -195,37 +197,33 @@ expect_error("a denoise that is not a number",
              lambda: compiler.face_piece({"face": {"on": True, "denoise": "lots"}}),
              "must be a number")
 
-# A shot says one of three things and only three.
-check("a shot that says nothing inherits",
-      compiler.face_for(PIECE, {}), compiler.face_piece(PIECE))
-check("a shot can opt out", compiler.face_for(PIECE, {"face": "off"}), None)
-check("a shot can opt in", compiler.face_for(PIECE, {"face": "on"}),
-      compiler.face_piece(PIECE))
-expect_error("a shot opting into a pass the piece is not running",
-             lambda: compiler.face_for({}, {"face": "on"}), "piece has it switched off")
-expect_error("a switch nobody defined",
-             lambda: compiler.face_for(PIECE, {"face": "maybe"}), "on, off")
+check("a shot that says nothing is OFF", compiler.face_for(PIECE, {}), None)
+check("a shot owns its OFF", compiler.face_for(PIECE, {"face": {"on": False}}), None)
+check("a shot owns its complete ON settings",
+      compiler.face_for(PIECE, {"face": FACE}), FACE)
+expect_error("new-schema settings cannot be a legacy string",
+             lambda: compiler.face_for(PIECE, {"face": "maybe"}), "must be an object")
 
 # A resolved setting reaches the segment node's payload, and only when it is on.
 payloads = compiler.timeline_payloads(piece())
-check("the shot's payload carries the piece's face pass",
-      payloads[0]["request"]["face"], compiler.face_piece(PIECE))
+check("the shot's payload carries only its own face pass",
+      payloads[0]["request"]["face"], FACE)
 payloads = compiler.timeline_payloads(
-    piece(segments=[{"prompt": "a face", "duration_s": 5, "face": "off"}]))
+    piece(segments=[{"prompt": "a face", "duration_s": 5, "face": {"on": False}}]))
 check("a shot that opted out carries no key at all",
       "face" in payloads[0]["request"], False)
 check("a piece that is not running one carries no key either",
       "face" in compiler.timeline_payloads(
-          piece(face={"on": False}))[0]["request"], False)
+          piece(segments=[{"prompt": "a face", "duration_s": 5}]))[0]["request"], False)
 
 # One pass is one face pass: merged cards that disagree are refused by name
 # rather than resolved in favour of whichever came first.
-merged = piece(segments=[{"prompt": "one", "duration_s": 5},
-                         {"prompt": "two", "duration_s": 5, "merge": True}])
+merged = piece(segments=[{"prompt": "one", "duration_s": 5, "face": dict(FACE)},
+                         {"prompt": "two", "duration_s": 5, "merge": True, "face": dict(FACE)}])
 check("merged cards that agree compile",
       compiler.timeline_payloads(merged)[0]["request"]["face"],
-      compiler.face_piece(PIECE))
-merged["segments"][1]["face"] = "off"
+      FACE)
+merged["segments"][1]["face"] = {"on": False}
 expect_error("merged cards that disagree",
              lambda: compiler.timeline_payloads(merged), "disagree about the face pass")
 
@@ -236,7 +234,7 @@ check("the pass knows its crop canvas",
       (512, 512, 0.45))
 check("and a piece without one compiles to nothing",
       compiler.compile_segment(
-          compiler.timeline_payloads(piece(face={"on": False}))[0]).face,
+          compiler.timeline_payloads(piece(segments=[{"prompt": "a face", "duration_s": 5}]))[0]).face,
       None)
 
 passed("face geometry, windows and the piece/shot switch all hold")

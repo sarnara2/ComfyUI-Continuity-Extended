@@ -196,6 +196,28 @@ const ext = globalThis.__ext;
 await ext.setup?.();
 
 const out = { registered: ext?.name ?? null, nodes: {}, still: null, leads: {}, errors: [] };
+// A manually driven mutation host must preserve records and cleanup without
+// shifting the resize/intersection registry used by older placement checks.
+{
+  const before = globalThis.__observers.length;
+  const target = document.createElement("div");
+  let calls = 0, delivered = null, callbackOwner = null;
+  const observer = new MutationObserver((records, owner) => { calls++; delivered = records; callbackOwner = owner; });
+  observer.observe(target, { childList: true, subtree: true });
+  const first = { type: "childList", target, addedNodes: [] };
+  observer.records.push(first);
+  const queued = observer.takeRecords();
+  const drained = observer.takeRecords();
+  observer.fire([first]);
+  observer.disconnect();
+  observer.fire([first]);
+  out.mutationHost = {
+    queuedOnce: queued.length === 1 && queued[0] === first && drained.length === 0,
+    callbackOnce: calls === 1 && delivered[0] === first && callbackOwner === observer,
+    disconnected: observer.dead && observer.targets.size === 0 && observer.takeRecords().length === 0,
+    separateRegistry: globalThis.__observers.length === before && globalThis.__mutationObservers.includes(observer),
+  };
+}
 
 const fakeNode = (comfyClass, widgetName, blob) => ({
   comfyClass, id: 3, size: [400, 300], pos: [0, 0], title: comfyClass,
@@ -895,8 +917,11 @@ try {
   await ext.nodeCreated(node);
   const body = node.mmcBody;
   const type = (box, text) => {
-    box.value = text;
-    box.listeners.input.forEach((fn) => fn({ target: box }));
+    // Refined prose now uses the same contenteditable PromptBox as source
+    // prose. Simulate editing its DOM, not the old textarea.value property.
+    if (box.classList.contains("mmc-refined-rich")) box.replaceChildren(document.createTextNode(text));
+    else box.value = text;
+    box.listeners.input.forEach((fn) => fn({ target: box, currentTarget: box }));
   };
 
   const first = find(body.root, "mmc-refined-box");
@@ -923,7 +948,7 @@ try {
       sections: { subject_definitions: "", summary: "", retention_analysis: "" } },
     { body: "A second rewrite." });
   const afterApply = find(body.root, "mmc-refined-box");
-  out.refineBox.applied = afterApply?.value;
+  out.refineBox.applied = body.faceEditor.refinePanel.promptBoxes.get("body")?.getValue() ?? afterApply?.value;
   out.refineBox.sameAfterApply = first === afterApply;
 } catch (error) {
   out.errors.push(`refine box: ${error.message}`);
@@ -1220,21 +1245,28 @@ try {
   click(names()[0]);
   out.loras.backOn = entry().enabled;
 
-  // The strip, where it belongs to the piece and was drawn nowhere.
+  // The strip keeps the global LoRA pill but no longer repeats editable chips.
+  // Opening the timeline must preserve the settings now managed in its modal.
   const strip = fakeNode("MiniMaxH3Creator", "creator_data", JSON.stringify({
     version: 2, prompt: "the piece", assets: [], loras: stack,
     segments: [{ prompt: "shot 1", assets: [], loras: [], duration_s: 5 },
                { prompt: "shot 2", assets: [], loras: [], duration_s: 5 }],
   }));
   await ext.nodeCreated(strip);
+  const pieceLorasBefore = JSON.stringify(strip.mmcBody.timeline.loras);
   const { openTimeline: openStrip } = await import("./web/creator/timeline.js");
   openStrip({ timeline: strip.mmcBody.timeline, onCommit: () => strip.mmcBody.commit() });
   await new Promise((done) => setTimeout(done, 0));
   const sheet = document.body.children.at(-1);
   out.loras.onStrip = all(sheet, "mmc-asset-name").map((n) => n.text.trim());
-  click(all(sheet, "mmc-asset-name")[1]);
-  out.loras.stripMuted = strip.mmcBody.timeline.loras[1].enabled;
-  // The pill over the chips counts what is in the run, so it moves with them.
+  const globalLoraHost = all(sheet, "mmc-tl-loras")[0];
+  out.loras.stripRail = { hidden: globalLoraHost?.hidden === true,
+                         children: globalLoraHost?.children.length };
+  out.loras.stripSettingsPreserved = JSON.stringify(strip.mmcBody.timeline.loras) === pieceLorasBefore;
+  out.loras.stripManagerPill = all(sheet, "mmc-pill").some((pill) =>
+    String(pill.getAttribute("title") ?? "").startsWith("LoRAs patched onto every segment")
+    && Boolean(pill.listeners?.click?.length));
+  // The unchanged active count is still what the global pill reports.
   out.loras.stripActive = S.activeGlobalLoras(strip.mmcBody.timeline).length;
 
   // The swap: a different file in the same slot, keeping what the slot is for.
@@ -1350,7 +1382,9 @@ try {
     fromFace, fromCard,
     same: !!fromFace && fromFace === fromCard,
     // ...and it is the shot's body in there, not a bare box.
-    body: all(document.body.children.at(-1), "mmc-prompt").length === 1,
+    body: all(document.body.children.at(-1), "mmc-root").length === 1
+      && all(document.body.children.at(-1), "mmc-prompt-sections").length === 1
+      && all(document.body.children.at(-1), "mmc-prompt").length === 3,
   };
 } catch (error) {
   out.errors.push(`editor window: ${error.message}`);
@@ -1843,7 +1877,9 @@ try {
   nodeType.prototype.getExtraMenuOptions?.call(one, null, menu);
   out.fsDoor = {
     onShot: !!hunt(one.mmcBody.root, "mmc-tool-expand"),
-    onStrip: !!hunt(strip.mmcBody.root, "mmc-fs-enter"),
+    // The strip's fullscreen door now uses the same icon-tool presentation.
+    onStrip: !!hunt(strip.mmcBody.root, "mmc-tool-expand")
+      && !hunt(strip.mmcBody.root, "mmc-tool-expand").classList.contains("mmc-tool-tools"),
     notInACard: !hunt(card.root, "mmc-tool-expand"),
     inTheMenu: menu.some((entry) => String(entry.content).toLowerCase().includes("fullscreen")),
   };
@@ -1944,7 +1980,9 @@ try {
   const beforePress = openOnWindow();
   findAll(win, "mmc-tl-edit")[0].listeners.click[0]();
   const sheet = document.body.children.at(-1);
-  const box = findAll(sheet, "mmc-prompt")[0];
+  const description = findAll(sheet, "mmc-prompt-section").find(section =>
+    findAll(section, "mmc-tl-section-title")[0]?.text === "detailed_description");
+  const box = findAll(description, "mmc-prompt")[0];
   box.listeners?.click?.forEach((fn) => fn({
     target: box.querySelectorAll('.mmc-ref-cast[data-handle="vera"]')[0],
     preventDefault() {}, stopPropagation() {},
@@ -2066,7 +2104,7 @@ try {
   const cancelled = (node) => {
     let stopped = false;
     box.listeners?.mousedown?.forEach((fn) => fn({
-      target: node, preventDefault() { stopped = true; }, stopPropagation() {},
+      target: node, button: 0, shiftKey: false, preventDefault() { stopped = true; }, stopPropagation() {},
     }));
     return stopped;
   };
@@ -2365,7 +2403,9 @@ try {
   // Open card 1 and write the citation into its box, the way a user does.
   findAll(modal, "mmc-tl-edit")[0].listeners.click[0]();
   const sheet = document.body.children.at(-1);
-  const box = findAll(sheet, "mmc-prompt")[0];
+  const description = findAll(sheet, "mmc-prompt-section").find(section =>
+    findAll(section, "mmc-tl-section-title")[0]?.text === "detailed_description");
+  const box = findAll(description, "mmc-prompt")[0];
   box.append(document.createTextNode(" @ref-1"));
   box.listeners.input.forEach((fn) => fn({ target: box }));
 
@@ -2411,10 +2451,8 @@ try {
   out.errors.push(`pool double: ${error.message}`);
 }
 
-// A rewrite takes only what the reply carries. The two audio fields are typed
-// in by hand as often as they are written, and a reply that skipped them used
-// to blank them — deleting a line the user wrote, in a box they were looking
-// at. The timeline has always taken them this way; this is the face agreeing.
+// A plain Refine now owns only its prompt. Even a reply accidentally carrying
+// audio must not change manually typed audio inputs on the Creator face.
 try {
   const node = fakeNode("MiniMaxH3Creator", "creator_data", JSON.stringify({
     version: 2, prompt: "", models: {},
@@ -2427,12 +2465,23 @@ try {
     { soundscape: "", music: "", seen: "", problems: [] },
     { body: "A lighthouse at dusk." });
   out.audioKept = { soundscape: shot.soundscape, music: shot.music };
-  // ...and a reply that *does* carry them still wins.
+  // ...and an unasked audio field in a reply is not authority to rewrite it.
   node.mmcBody.faceEditor.refinePanel.apply(
     { soundscape: "wind over the lamp", music: "", seen: "", problems: [] },
     { body: "A lighthouse at dusk." });
   out.audioKept.written = shot.soundscape;
   out.audioKept.musicStill = shot.music;
+  // The reusable panel's legacy default still supports actual whole-request
+  // callers: applying and reverting their audio keeps its original contract.
+  const { RefinePanel } = await import("./web/creator/refine.js");
+  const legacy = { prompt: "a lighthouse", soundscape: "original surf", music: "original score" };
+  const legacyPanel = new RefinePanel({ getState: () => legacy, onCommit: () => {} });
+  legacyPanel.apply({ soundscape: "legacy wind", music: "", seen: "", problems: [] },
+                    { body: "A lighthouse at dusk." });
+  out.audioKept.legacyWritten = legacy.soundscape;
+  out.audioKept.legacyMusicKept = legacy.music;
+  legacyPanel.clear();
+  out.audioKept.legacyReverted = legacy.soundscape;
 } catch (error) {
   out.errors.push(`audio kept: ${error.message}`);
 }
@@ -2507,7 +2556,7 @@ try {
   const click = (node) => node?.listeners?.click?.[0]?.();
   const type = (field, value) => {
     field._value = value;
-    field.listeners?.input?.forEach((fn) => fn({ target: { value } }));
+    field.listeners?.input?.forEach((fn) => fn({ target: field, currentTarget: field }));
   };
 
   const node = fakeNode("MiniMaxH3Creator", "creator_data", JSON.stringify({
@@ -2604,7 +2653,7 @@ try {
 //
 // Somebody taken out of the roster is in the piece from then on: the roster
 // stops offering them (`options` filters names the cast already holds), and
-// they come back under the cast group instead. With the shelf folded, the
+// they come back under the cast category instead. With the shelf folded, the
 // menu row is the one place that says they are the same person and not in
 // this sentence — deleting their chip keeps them (#52) — so the group is
 // named for where they are and the row says whether the prompt writes them.
@@ -2629,12 +2678,13 @@ try {
   await box.openMenu("", "@");
   await new Promise((done) => setTimeout(done, 0));
   const heads = findAll(box.menu, "mmc-mention-head").map((h) => h.text);
+  const categories = findAll(box.menu, "mmc-mention-category").map((h) => h.text);
   const subs = Object.fromEntries(findAll(box.menu, "mmc-mention-row").map((row) => [
     findAll(row, "mmc-mention-handle")[0]?.text,
     findAll(row, "mmc-mention-sub")[0]?.text ?? "",
   ]));
   box.closeMenu();
-  out.castMenu = { heads, subs };
+  out.castMenu = { heads, categories, subs };
 } catch (error) {
   out.errors.push(`cast menu: ${error.stack}`);
 }
@@ -2686,7 +2736,7 @@ try {
   // editor used to look the piece's subjects up on the segment, find none, and
   // open nothing — while deleting a chip took nobody out of anything.
   const card = all(modal, "mmc-tl-card")[1] ?? all(modal, "mmc-tl-card")[0];
-  card?.listeners?.dblclick?.[0]?.();
+  all(card, "mmc-tl-edit")[0]?.listeners?.click?.[0]?.();
   await new Promise((done) => setTimeout(done, 0));
   const sheet = document.body.children.at(-1);
   out.doors.inACard = sheet === modal ? "no card opened" : castable(sheet).join(",");
@@ -2771,6 +2821,7 @@ try {
   // ...and the chip now says so, where before it said nothing until you opened
   // the row of buttons that were hidden for saying nothing.
   out.refsheet.chipSays = all(editor.root, "mmc-asset-said").map((n) => n.text).join(",");
+  out.refsheet.sizeSays = all(editor.root, "mmc-asset-ref-size").map((n) => n.text).join(",");
 
   // ---- and what the picture is *for*, which is the row above all of that.
   //
@@ -2936,7 +2987,7 @@ try {
   const rowWith = (root, cls, text) =>
     root?.querySelectorAll("." + cls).find((h) => (h.text ?? "").includes(text));
 
-  const mark = rowWith(shell, "mmc-fs-mark", "Continuity - Extended");
+  const mark = rowWith(shell, "mmc-fs-mark", "Continuity");
   press(mark);
   const dash = shell.querySelectorAll(".mmc-dash")[0];
   const settle = () => new Promise((done) => setTimeout(done, 0));
@@ -3245,6 +3296,9 @@ from harness import FAILURES, check, passed
 
 FAILURES.extend(report["errors"])
 check("the extension registers", report["registered"], "continuity")
+check("the mutation fixture records, drains, fires and disconnects without shifting resize observers",
+      report.get("mutationHost"),
+      {"queuedOnce": True, "callbackOnce": True, "disconnected": True, "separateRegistry": True})
 
 # Each node's body, and which editor drives it. The H3 pre-stage is the one that
 # differs: its still is a video generation, so it is driven by the Creator's own
@@ -3878,9 +3932,12 @@ check("...takes it off the checkpoint", loras.get("active"), 1)
 check("...and its trigger words off the prompt", loras.get("triggers"), 0)
 check("...in the blob the node queues", loras.get("serialized"), False)
 check("...and the same click brings it back", loras.get("backOn"), True)
-check("the strip names the piece's stack too", loras.get("onStrip"), ["glow", "turbo"])
-check("...and mutes from there", loras.get("stripMuted"), False)
-check("...which is one fewer in the run", loras.get("stripActive"), 1)
+check("the strip no longer duplicates the modal's global LoRA chips", loras.get("onStrip"), [])
+check("...and the empty rail takes no timeline space", loras.get("stripRail"),
+      {"hidden": True, "children": 0})
+check("...preserves every attached LoRA setting", loras.get("stripSettingsPreserved"), True)
+check("...keeps the clickable global LoRA manager pill", loras.get("stripManagerPill"), True)
+check("...keeps both attached LoRAs active on opening", loras.get("stripActive"), 2)
 check("a swap keeps the slot and takes the new file's setup",
       loras.get("swapped"),
       {"order": ["c.safetensors", "b.safetensors"], "strength": 0.55,
@@ -3934,8 +3991,10 @@ check("...leaving the property as it found it",
       (view.get("backAgain") or {}).get("pinGone"), True)
 
 menu = report.get("castMenu", {})
-check("the @ menu groups the cast as who is in the piece",
-      "In this piece" in (menu.get("heads") or []), True)
+check("the @ menu offers the two registered-material categories",
+      menu.get("categories"), ["Cast", "Piece references"])
+check("the @ menu no longer mixes section headings into its results",
+      menu.get("heads"), [])
 check("...a member the sentence writes shows what they are made of",
       (menu.get("subs") or {}).get("@vera"), "cropped hair")
 check("...and one it does not says so",
@@ -4041,10 +4100,16 @@ audio = report.get("audioKept", {})
 check("a reply with no soundscape leaves the one that was typed",
       audio.get("soundscape"), "surf on shingle")
 check("...and the score with it", audio.get("music"), "a low drone")
-check("a reply that carries a soundscape still writes it",
-      audio.get("written"), "wind over the lamp")
+check("a plain prompt reply cannot rewrite another soundscape input",
+      audio.get("written"), "surf on shingle")
 check("...without blanking the score it said nothing about",
       audio.get("musicStill"), "a low drone")
+check("a legacy whole-request panel still applies its audio",
+      audio.get("legacyWritten"), "legacy wind")
+check("a legacy whole-request panel still leaves unreturned music alone",
+      audio.get("legacyMusicKept"), "original score")
+check("a legacy whole-request panel still restores original audio on Revert",
+      audio.get("legacyReverted"), "original surf")
 
 check("switching to an image model rebuilds the body",
       report.get("switch", {}).get("image"), "PreStageEditor")
@@ -4136,8 +4201,8 @@ doors = report.get("doors") or {}
 check("a cast chip on the node face opens somebody", doors.get("onTheFace"), "true")
 check("...and so does one in the timeline's standing prompt",
       doors.get("inTheWindow"), "true")
-check("...and one in a card of the strip, whose cast is owned a level up",
-      doors.get("inACard"), "true")
+check("...and all three section inputs in a strip card, whose cast is owned a level up",
+      doors.get("inACard"), "true,true,true")
 
 summon = report.get("summon") or {}
 check("clicking a name opens that member", summon.get("opened"), "claymation")
@@ -4166,7 +4231,9 @@ check("...leading with what the picture is for, then every narrowing, defaults i
 check("a still can be the drawing the shot is aimed at", sheet.get("guideOpen"), True)
 check("...and picking one lands on the asset", sheet.get("takes"), "style")
 check("...where the chip then says so without being opened again",
-      sheet.get("chipSays"), "style · max")
+      sheet.get("chipSays"), "style")
+check("...and its dedicated size control still says max",
+      sheet.get("sizeSays"), "max")
 # The role is a property of the attachment, not of the pill the file was picked
 # with — so it moves, and the handle the prompt cites moves with it.
 check("a reference narrowed to a part of itself cannot be a whole frame",

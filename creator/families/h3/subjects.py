@@ -157,18 +157,20 @@ class Subject:
     """One member of the cast. Immutable in practice; a plain class rather than
     a dataclass so the optional halves can carry their own docstrings."""
 
-    __slots__ = ("handle", "sources", "takes", "description", "features",
+    __slots__ = ("handle", "sources", "takes", "description", "usage_rules", "features",
                  "motion", "voice", "replaces", "replaces_what", "marker",
-                 "seeded", "notes", "triggers", "loras", "wears", "send")
+                 "seeded", "notes", "triggers", "loras", "wears", "send", "replacement_reference_only")
 
     def __init__(self, handle, sources, takes="person", description="",
                  features=(), motion=(), voice=None, replaces=(),
                  replaces_what="", marker=None, seeded=False, notes=None,
-                 triggers=None, loras=(), wears=None, send=None):
+                 triggers=None, loras=(), wears=None, send=None, usage_rules="",
+                 replacement_reference_only=False):
         self.handle = handle
         self.sources = tuple(sources)      # asset handles defining its appearance
         self.takes = takes                 # one of TAKES
         self.description = description     # the user's own words, folded into the definition
+        self.usage_rules = usage_rules     # user-owned instructions, kept outside definitions
         self.features = tuple(features)    # what the reference shows, one phrase each
         # The reference clips and stills its movement comes from. A tuple like
         # `replaces`, and for the same reason: one person has several actions
@@ -177,7 +179,7 @@ class Subject:
         # A string is still read (`parse`), as the one-element list it meant.
         self.motion = tuple(motion or ())
         self.voice = voice                 # an audio reference that is its voice
-        # The reference videos it stands in for someone in. A tuple, because one
+        # The references identifying who it stands in for. A tuple, because one
         # person can occupy the same role in several clips — a medium shot and a
         # close-up of the same scene is the ordinary case, and while this held a
         # single handle the second clip could only be attached and left
@@ -186,6 +188,7 @@ class Subject:
         # may be spread across several assets.
         self.replaces = tuple(replaces or ())
         self.replaces_what = replaces_what  # who, in that video, in the user's words
+        self.replacement_reference_only = bool(replacement_reference_only)
         # None means "derive it" — see `relationship`. Preserved whole unless a
         # feature is changed; standing in for somebody does not move the marker,
         # because the swap is stated on the clip's own retention line.
@@ -408,12 +411,14 @@ def parse(raw, family=None):
             sources=sources,
             takes=takes,
             description=description,
+            usage_rules=str(item.get("usage_rules") or "").strip(),
             features=features,
             seeded=bool(item.get("seeded")),
             motion=motion,
             voice=voice,
             replaces=replaces,
             replaces_what=str(item.get("replaces_what") or "").strip(),
+            replacement_reference_only=bool(item.get("replacement_reference_only")),
             marker=marker,
             notes=notes,
             triggers=triggers,
@@ -653,7 +658,8 @@ def here(cast, assets):
     picture was muted or was never attached. Words on a row, a description, a
     worded LoRA or somebody to stand in for all do.
     """
-    present = {a.handle for a in assets}
+    present = {handle for asset in assets
+               for handle in (asset.handle, *(panel.handle for panel in asset.panels))}
     out = []
     for subject in cast:
         keep = [h for h in subject.sources if h in present]
@@ -675,8 +681,10 @@ def here(cast, assets):
         out.append(Subject(
             handle=subject.handle, sources=keep, takes=subject.takes,
             description=subject.description, features=subject.features,
+            usage_rules=subject.usage_rules,
             motion=motion, voice=voice, replaces=replaces,
             replaces_what=subject.replaces_what if replaces else "",
+            replacement_reference_only=subject.replacement_reference_only,
             marker=subject.marker, seeded=subject.seeded,
             notes=subject.notes, triggers=subject.triggers, loras=subject.loras,
             wears=subject.wears, send=subject.send))
@@ -725,7 +733,8 @@ def check(cast, assets):
     another card. `here` cuts those away before this runs, and refuses the one
     case that leaves a name standing for nothing.
     """
-    by_handle = {a.handle: a for a in assets}
+    by_handle = {attached.handle: attached for asset in assets
+                 for attached in (asset, *asset.panels)}
     names = {s.handle for s in cast}
     for subject in cast:
         if subject.handle in by_handle:
@@ -768,7 +777,7 @@ def check(cast, assets):
         # actions and poses among what a subject denotes, and a photograph of
         # the swing is one pose of it. A soundtrack is neither.
         pairs = [(handle, "motion", ("image", "video")) for handle in subject.motion]
-        pairs += [(handle, "place", ("video",)) for handle in subject.replaces]
+        pairs += [(handle, "place", ("image", "video")) for handle in subject.replaces]
         for handle, what, kinds in pairs:
             asset = by_handle.get(handle)
             if asset is None:
@@ -916,7 +925,7 @@ def _english(items):
 
 # The baseline attributes each `takes` is made of: what the label denotes when
 # nobody has narrowed it. A cast card seeds one feature row per entry, so the
-# four things a person reference carries are four rows somebody can describe,
+# things a person reference carries are rows somebody can describe,
 # change or drop one at a time — which is the whole of "keep everything except
 # his build". `_RETAINED` below is these same lists said as a sentence, for a
 # subject seeded before this table existed.
@@ -930,7 +939,7 @@ def _english(items):
 # list in two languages and `tests/test_cast_mirror.py` holds them to it.
 ATTRIBUTES = {
     "person": ("their", (("face", "face"), ("hair", "hair"),
-                         ("build", "build"), ("clothing", "clothing"))),
+                         ("build", "build"))),
     "object": ("the object's own", (("form", "form"), ("colour", "colour"),
                                     ("markings", "markings"))),
     "scene": ("the", (("environment", "environment"), ("surfaces", "its surfaces"),
@@ -965,6 +974,22 @@ def _all_attributes(takes):
 _RETAINED = {takes: _all_attributes(takes) for takes in TAKES}
 
 
+def bound_text(text, bindings):
+    """Resolve only known handles in model prose, without editing saved fields.
+
+    A single substitution keeps aliases from cascading. Handle continuations
+    are excluded on both sides, so a known `@ref-1` cannot claim `@ref-10`,
+    `@ref-1_extra`, or an email address. Unbound names remain the user's words.
+    The values are the caller's family citations, not necessarily H3 ordinals.
+    """
+    if not text or not bindings:
+        return text
+    names = sorted(bindings, key=len, reverse=True)
+    pattern = re.compile(r"(?<![\w@])@(" + "|".join(re.escape(name) for name in names)
+                         + r")(?![\w-])")
+    return pattern.sub(lambda match: bindings[match.group(1)], text)
+
+
 def _cite(handles, asset_labels, notes=None):
     """Asset handles -> the labels the tokenizer will see them as.
 
@@ -994,7 +1019,7 @@ def _described_subject(subject):
     return f"{_NOUN[subject.takes]}, {described}"
 
 
-def definitions(cast, asset_labels, extra_lines=(), ids=None):
+def definitions(cast, asset_labels, extra_lines=(), ids=None, reference_annotations=()):
     """The `subject_definitions` section: one line per label, cast first.
 
     `asset_labels` is `compile`'s handle -> `<Picture N>` map, so a definition
@@ -1020,11 +1045,8 @@ def definitions(cast, asset_labels, extra_lines=(), ids=None):
         noun = _NOUN[subject.takes]
         # The relative clauses the guide's combined-source form is made of
         # (§2.1: "the woman whose appearance comes from <Picture 1> and whose
-        # walking motion comes from <Video 1>"). A replacement is one of them,
-        # not a branch of its own: the definition is where the model learns the
-        # appearance and the vacancy belong to one person, and while these were
-        # an either/or a pictured subject's "in place of" clause was written
-        # nowhere at all.
+        # walking motion comes from <Video 1>"). Replacement instructions are
+        # use rules, not an identity description, and belong in retention.
         clauses = []
         notes = subject.notes
         if subject.sources:
@@ -1035,16 +1057,8 @@ def definitions(cast, asset_labels, extra_lines=(), ids=None):
         if subject.motion:
             clauses.append("whose motion comes from "
                            f"{_cite(subject.motion, asset_labels, notes)}")
-        if subject.replaces:
-            # The clips are where the vacancy is. Several of them read as one
-            # list — the same person in a medium shot and a close-up is one
-            # vacancy filmed twice, not two.
-            who = subject.replaces_what or "the corresponding subject"
-            clauses.append(f"who takes the place of {who} in "
-                           f"{_cite(subject.replaces, asset_labels)}"
-                           if subject.sources or subject.motion else
-                           f"the target video puts in place of {who} in "
-                           f"{_cite(subject.replaces, asset_labels)}")
+        if subject.replaces and not subject.sources and not subject.motion:
+            clauses.append(f"identified in {_cite(subject.replaces, asset_labels)}")
         if clauses:
             line = f"{label} is {noun} {_english(clauses)}"
         else:
@@ -1085,13 +1099,15 @@ def definitions(cast, asset_labels, extra_lines=(), ids=None):
         # reference to a target speaker there.
         if subject.voice:
             speaker = voices[subject.handle]
+            explicit = any(row["handle"] == subject.voice and row.get("usage_rules")
+                           for row in reference_annotations)
             lines.append(
                 f"{_cite([subject.voice], asset_labels)} is the voice-timbre "
-                f"reference for {label} ({speaker}), and its own words and "
-                f"background sound are not copied."
+                f"reference for {label} ({speaker})" +
+                ("." if explicit else ", and its own words and background sound are not copied.")
             )
     lines.extend(line for line in extra_lines if line)
-    return "\n".join(lines)
+    return bound_text("\n\n".join(lines), {**asset_labels, **subject_labels})
 
 
 def _feature_texts(features):
@@ -1136,11 +1152,32 @@ def _carried(takes, kept):
     return _english(items), len(items)
 
 
-def retention(cast, asset_labels, body):
+def _remaining_windows(windows, used):
+    """The target intervals where no explicit subject rule applies."""
+    remaining = []
+    for start, end in windows:
+        parts = [(start, end)]
+        for low, high in used:
+            next_parts = []
+            for first, last in parts:
+                if high <= first or low >= last:
+                    next_parts.append((first, last))
+                else:
+                    if first < low:
+                        next_parts.append((first, low))
+                    if high < last:
+                        next_parts.append((high, last))
+            parts = next_parts
+        remaining.extend(parts)
+    return remaining
+
+
+def retention(cast, asset_labels, body, identification_handles=(), scopes=None,
+              explicit_rules=None, target_scopes=None, reference_annotations=()):
     """The `retention_analysis` section: one line per subject.
 
-    `body` is the finished description, with the labels already substituted into
-    it, so the "appears in" half is read off the text rather than guessed.
+    `body` is the finished description, with the labels already substituted.
+    Target-time scopes come from the compiler, never from inferred prose.
 
     Written the way section 6's worked example writes it: the features named in
     `subject_definitions`, named again here, and said to be retained. Positively
@@ -1152,17 +1189,23 @@ def retention(cast, asset_labels, body):
     used, but some defined characteristics are changed": the characteristic has
     to still be there to have been changed, so the line names what it was and
     what it is now.
+
+    Explicit usage rules replace the automatic baseline in their active scope.
+    Described features and saved relationships remain conditional defaults;
+    they cannot silently overrule a user's free-form instruction. The compiler
+    supplies active rules after local overrides, so a disabled inherited rule
+    does not disable the baseline of an otherwise unchanged card.
     """
     subject_labels = labels(cast)
+    # None is the standalone subject API. The compiler supplies the actual
+    # active rules after local overrides, not a guess about their English text.
+    if explicit_rules is None:
+        explicit_rules = {subject.handle: True for subject in cast if subject.usage_rules}
+    target_scopes = target_scopes or {}
     lines = []
     for subject in cast:
         label = subject_labels[subject.handle]
-        where = contextir.appears_in(label, body)
-        # "appears in" is the guide's own wording for a subject entry (4.1), and
-        # it is worth the two words: a bare `(<Shot 1>)` reads as the parenthetical
-        # a *picture* entry takes, where the guide writes what the frame is for
-        # instead ("[Shot 1] first frame").
-        head = f"{label} (appears in {where})" if where else label
+        head = label
         clauses_lead = ""
 
         # What is carried over: the features they were given, or — where nobody
@@ -1198,6 +1241,7 @@ def retention(cast, asset_labels, body):
         clauses = [clauses_lead] if clauses_lead else []
         if carried:
             clauses.append(f"{carried} {verb} retained")
+        baseline_clauses = len(clauses)
         if subject.replaces:
             # The subject is what appears; the person they stand in for is not.
             # This used to read "their face, hair, build, and clothing are
@@ -1209,11 +1253,18 @@ def retention(cast, asset_labels, body):
             # to say (`contextir.retention_lines` names the replacement there),
             # and this one says only whose appearance stands in the shot and
             # whose performance it follows.
-            who = subject.replaces_what or "the corresponding subject"
-            clauses.append(
-                f"they appear in place of {who} in "
-                f"{_cite(subject.replaces, asset_labels)}, taking over the "
-                f"source's action and timing")
+            who = contextir.replacement_target(subject.replaces_what)
+            refs = _cite(subject.replaces, asset_labels)
+            if any(h in identification_handles or asset_labels.get(h, "").startswith("<Picture")
+                   for h in subject.replaces):
+                clauses.append(
+                    f"they replace {who}, identified by {refs}, in the source "
+                    "video; the identification reference "
+                    "does not supply the target video's motion or timing")
+            else:
+                clauses.append(
+                    f"they appear in place of {who} in {refs}, taking over the "
+                    f"source's action and timing")
 
         for feature in subject.changed:
             clauses.append(
@@ -1225,20 +1276,70 @@ def retention(cast, asset_labels, body):
         # rest: the performer, the setting and the camera of the source are not
         # named as losses, because section 4.1 says not to count them.
         if subject.motion:
-            clauses.append(
-                f"the movement in {_cite(subject.motion, asset_labels, subject.notes)}, "
-                f"its path, its timing and its weight, is followed by {label}")
+            motion = []
+            for handle in subject.motion:
+                own = [row for row in reference_annotations
+                       if row["handle"] == handle and row.get("usage_rules")]
+                if not own:
+                    motion.append(handle)
+                    continue
+                windows = target_scopes.get(subject.handle, ())
+                if windows and all(row["intervals"] for row in own):
+                    remaining = _remaining_windows(windows,
+                        [window for row in own for window in row["intervals"]])
+                    if remaining:
+                        clauses.append(contextir.target_scope(remaining) + ", "
+                            f"the movement in {_cite([handle], asset_labels, subject.notes)}, "
+                            f"its path, its timing and its weight, is followed by {label}")
+            if motion:
+                clauses.append(
+                    f"the movement in {_cite(motion, asset_labels, subject.notes)}, "
+                    f"its path, its timing and its weight, is followed by {label}")
 
         # A subject with nothing to say still has to say something: the marker
         # is not a sentence and a line that is only a marker claims a scope it
         # never states.
         said = "; ".join(clauses) or "the definition above is what is carried over"
-        lines.append(f"{head}: {subject.relationship} - {said}.")
+        rule_scope = explicit_rules.get(subject.handle)
+        if rule_scope:
+            # User rules are appended by the compiler. Keep the fixed marker
+            # and source relationships here without asserting an automatic
+            # appearance baseline over those rules.
+            rules = clauses[baseline_clauses:]
+            paragraphs = []
+            if rule_scope is not True:
+                remaining = _remaining_windows(target_scopes.get(subject.handle, ()),
+                                               rule_scope)
+                if remaining:
+                    paragraphs.append(contextir.target_scope(remaining) + "\n"
+                                      f"{subject.relationship} - {said}.")
+            intervals = target_scopes.get(subject.handle) if rule_scope is True else rule_scope
+            prefix = contextir.target_scope(intervals)
+            rule_text = "; ".join(rules) + "." if rules else ""
+            paragraphs.append((prefix + "\n" if prefix else "")
+                              + f"{subject.relationship} - " + rule_text)
+            # Keep a partial baseline's marker inside its time-bound paragraph:
+            # promoting it to the shared subject heading would apply it globally.
+            if rule_scope is True and not prefix:
+                lines.append(f"{head}: {subject.relationship} - " + rule_text)
+            else:
+                lines.append(f"{head}:\n" + "\n\n".join(paragraphs))
+        else:
+            prefix = contextir.target_scope(target_scopes.get(subject.handle))
+            lines.append(f"{head}: {subject.relationship} - "
+                         + (prefix + "\n" if prefix else "") + said + ".")
 
         if subject.voice:
             voice_label = _cite([subject.voice], asset_labels)
-            lines.append(
-                f"{voice_label}: reference - its vocal timbre guides how {label} "
-                f"speaks, without copying the original signal."
-            )
-    return "\n".join(lines)
+            rules = [row for row in reference_annotations if row["handle"] == subject.voice
+                     and row.get("usage_rules")]
+            remaining = (_remaining_windows(target_scopes.get(subject.handle) or
+                                            target_scopes.get(subject.voice, ()),
+                         [window for row in rules for window in row["intervals"]])
+                         if rules and all(row["intervals"] for row in rules) else [])
+            if not rules or remaining:
+                scope = contextir.target_scope(remaining)
+                lines.append((scope + ":\n" if scope else "") +
+                    f"{voice_label}: reference - its vocal timbre guides how {label} "
+                    f"speaks, without copying the original signal.")
+    return bound_text("\n\n".join(lines), {**asset_labels, **subject_labels})

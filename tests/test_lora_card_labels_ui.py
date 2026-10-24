@@ -131,6 +131,9 @@ fire(search, "input", { target: {value: "Softbox"} });
 out.searchSubtitle = { count: cards().length, labels: labels(v1) };
 fire(search, "input", { target: {value: "Studio illumination"} });
 out.searchTitle = labels(v1);
+// The following phase checks metadata-label settings, not remembered filters.
+// Clear through the real editing path now that browsing queries survive reopen.
+fire(search, "input", { target: {value: ""} });
 close();
 noteSettings({lora_skip_metadata: false});
 await open(state);

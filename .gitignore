@@ -17,6 +17,31 @@ continuity.credentials.json
 continuity.settings.json
 continuity.presets.json
 continuity.preset.*.json
+# Personal cast/sheet phrases, conversations, folder grants and UI preferences.
+# These are userdata exports, not the shipped builtin preset source modules.
+continuity.cast-presets.json
+continuity.sheet-prompt-presets.json
+continuity.folders.json
+continuity.picker.json
+continuity.loras.json
+continuity.chats.json
+continuity.chat.*.json
+minimax_creator.*.json
+
+# A copied ComfyUI working directory must not become package source.
+/user/
+/users/
+/user_data/
+/userdata/
+/input/
+/output/
+/temp/
+/tmp/
+/workflows/
+/cache/
+/logs/
+/backup/
+/backups/
 .env
 .env.*
 

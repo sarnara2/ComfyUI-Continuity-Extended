@@ -4,42 +4,54 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const root = path.resolve(__dirname, '../../web/creator');
+// The same repaired extraction harness can inspect an untouched snapshot.
+const sourceRoot = process.env.CONTINUITY_SOURCE_ROOT
+  ? path.resolve(process.env.CONTINUITY_SOURCE_ROOT) : path.resolve(__dirname, '../..');
+const root = path.join(sourceRoot, 'web/creator');
+const baselineFixture = process.env.CONTINUITY_BASELINE_FIXTURE === '1';
 const read = p => fs.readFileSync(path.join(root, p), 'utf8');
 const source = read('timeline.js');
 const castSource = read('cast.js');
-const creatorSource = fs.readFileSync(path.join(root, '../creator.js'), 'utf8');
-const sectionState = creatorSource.match(/^const SECTION_STATE = .*;$/m);
-const sectionAdapter = creatorSource.match(/^const sectionControls = \(node\) => \(\{[^]*?^\}\);/m);
-assert.ok(sectionState && sectionAdapter, 'node-owned section controls');
-const method = (name, code = source) => {
+const method = (name, code = source, optional = false) => {
   const found = code.match(new RegExp(`^  (?:async )?${name}\\([^]*?^  \\}`, 'm'));
+  if (optional && !found) return '';
   assert.ok(found, name); return found[0];
 };
+const uxMethods = ['sectionPreview','updateSectionSummaries','fieldValue','fieldRefineButton','refineTimelineField','audioEdited',
+  'clearAudioUndo','showAudioUndo','undoAudioField','segmentNavigator','jumpToSegment'];
 const helper = read('disclosure.js').replace(/^import .*;\r?\n/gm, '').replace(/^export /gm, '');
+const countsHelper=fs.existsSync(path.join(root,'media-counts.js'))?read('media-counts.js').replace(/^import .*;\r?\n/gm,'').replace(/^export /gm,''):'';
+const countStateHelpers=['motionOf','subjectFiles','replacesOf'].map(name=>read('state.js').match(new RegExp(`^export function ${name}\\([^]*?^\\}`,'m'))[0].replace(/^export /,'')).join('\n');
+const countHeaders=method('renderPool').includes('.setHintNodes(mediaCountPills(assets))');
 const domSource = read('dom.js');
 const dom = domSource.match(/export function el\([^]*?^\}/m)[0].replace(/^export /, '');
 const popovers = [
   domSource.match(/const popoverOwners[^]*?(?=\/\*\* Close-on-outside-click)/)[0],
   ...['floatAbove','dismissable','placeNear'].map(name => domSource.match(new RegExp(`export function ${name}\\([^]*?^\\}`, 'm'))[0].replace(/^export /,'')),
 ].join('\n').replace(/^export /gm,'');
-const css = ['base', 'editor', 'timeline'].map(name => read(`styles/${name}.js`).match(/export const css = `([^]*)`;\s*$/)[1]).join('\n');
+const css = ['base', 'timeline'].map(name => read(`styles/${name}.js`).match(/export const css = `([^]*)`;\s*$/)[1]).join('\n');
 const code = `
 ${dom}
 ${popovers}
 ${helper}
-${sectionState[0]}
-${sectionAdapter[0]}
 const t = (text, vars = {}) => text.replace(/\\{([^}]+)\\}/g, (_, key) => vars[key] ?? key);
+${countsHelper}
+${countStateHelpers}
+window.countHeaders=${JSON.stringify(countHeaders)};
 const icon = () => el('span', { text: '·' });
+let armedRefine=null;
+const chosenModel=()=>null,queueBusy=()=>false,spinner=()=>el('span',{class:'mmc-spin'}),DEFAULT_VIDEO_FAMILY='h3',openSettings=()=>{};
+const refineField=()=>{throw new Error('No refiner execution in the sections/seams fixture');};
+${read('refine.js').match(/^export function refineButton\([^]*?^\}/m)[0].replace(/^export /,'')}
 const seamGroup = children => children.length ? el('div', {class:'mmc-tl-seam-group'}, children) : null;
 const blendSeconds = (frames, rules) => (frames / rules.fps).toFixed(1);
 const blendSetsTail = (segment, piece) => S.continuesAudio(segment) && S.feather(segment, piece) > 1;
 const passNumbers = () => '1';
 const rulesFor = () => ({fps:24});
-const SoundLane = class { constructor(options) { this.options=options; this.host = el('div'); } };
+const SoundLane = class { constructor() { this.host = el('div'); } };
 const mountOverlay = (node) => { document.body.append(node); return () => node.remove(); };
 const S = {
+  subjectFiles,replacesOf,
   takesReferences: state => state.takesRefs !== false,
   familyOf: () => ({label:'Fixture'}),
   pieceFamily: () => 'fixture',
@@ -60,7 +72,8 @@ const S = {
 let pickerAnswer = null;
 const openPicker = async () => pickerAnswer;
 class Subject {
- ${['sectionOptions','noAudioButton','mount','textBox','setGlobalPrompt','renderPool','openCastMember','renderClipJoin','renderJoin','citeName','citeInGlobal','addPoolAssets'].map(name=>method(name)).join('\n')}
+ ${['mount','sectionOptions','noAudioButton','textBox','setGlobalPrompt','renderPool','openCastMember','renderClipJoin','renderJoin','citeName','citeInGlobal','addPoolAssets'].map(name=>method(name)).join('\n')}
+ ${uxMethods.map(name=>method(name,source,baselineFixture)).join('\n')}
  globalPromptBox() {
    const root = el('div', {contenteditable:'true',class:'mmc-prompt'});
    return {root, frame:el('div',{class:'mmc-tl-prompt-frame'},[root]),
@@ -101,28 +114,6 @@ class FixtureCast {
  card(subject) { return el('div',{text:subject.handle+(this.opened===subject?' open':' shut')}); }
 }
 window.FixtureCast=FixtureCast;
-const CastShelf=FixtureCast;
-class PersistentSubject extends Subject {
- ${method('constructor').replace(/\{\r?\n/, '{\n    super();\n')}
- ${method('renderCast')}
- render() { this.renderPool(); this.renderCast(); }
-}
-const openTimeline = options => { window.openedOptions=options; };
-class FixtureBody {
- ${method('open')}
- commit() {}
- widgetIO() { return {}; }
-}
-window.sectionKeys=['global_prompt','overall_soundscape','non_diegetic_music','references','cast'];
-window.fixtureNode=properties => ({properties,widgets:[{name:'creator_data',value:'unchanged generation blob'}],dirty:0,graph:{setDirtyCanvas(){this.owner.dirty++;}}});
-window.makePersistent = (node, soundSnaps = null) => {
- node.graph.owner=node;
- const view=new PersistentSubject({timeline:{prompt:'Standing scene',soundscape:'Room tone',music:'N/A',assets:[],subjects:[],segments:[{},{}]},sections:sectionControls(node),soundSnaps},()=>{});
- view.commits=0; view.mount(); return view;
-};
-window.sectionList=view => [view.promptSection,view.soundscapeSection,view.musicSection,view.poolSection,view.castShelf.section];
-window.FixtureBody=FixtureBody;
-window.sectionControls=sectionControls;
 subject.mount();
 `;
 const results = [];
@@ -136,7 +127,7 @@ async function check(name, fn) { await fn(); results.push({name,passed:true}); }
   await page.setContent(`<html><head><style>${css}</style></head><body style="--mmc-type:1;--mmc-surface:#242424;--mmc-surface-2:#333;--mmc-line:#555;--mmc-line-2:#777;--mmc-text:#eee;--mmc-dim:#bbb;--mmc-accent:#acf;background:#111;font-family:Arial"></body></html>`);
   await page.evaluate(`(() => { ${code} })()`);
   await check('Four Timeline shells open by default and global label retains prompt value', async () => {
-    assert.deepEqual(await page.evaluate(() => ({states:[subject.promptSection,subject.soundscapeSection,subject.musicSection,subject.poolSection].map(s=>s.isOpen()),label:subject.promptSection.toggle.textContent,prompt:subject.timeline.prompt,aria:subject.soundscapeBox.getAttribute('aria-labelledby')===subject.soundscapeSection.titleId})),{states:[true,true,true,true],label:'⌄global_prompt',prompt:'Standing scene',aria:true});
+    assert.deepEqual(await page.evaluate(() => ({states:[subject.promptSection,subject.soundscapeSection,subject.musicSection,subject.poolSection].map(s=>s.isOpen()),label:subject.promptSection.toggle.querySelector('.mmc-tl-section-title').textContent,arrow:subject.promptSection.toggle.querySelector('.mmc-tl-section-arrow').textContent,prompt:subject.timeline.prompt,aria:subject.soundscapeBox.getAttribute('aria-labelledby')===subject.soundscapeSection.titleId})),{states:[true,true,true,true],label:'global_prompt',arrow:'⌄',prompt:'Standing scene',aria:true});
   });
   await check('Independent folding retains textarea DOM, values and serialized state', async () => {
     assert.equal(await page.evaluate(() => {
@@ -174,7 +165,7 @@ async function check(name, fn) { await fn(); results.push({name,passed:true}); }
       subject.timeline.takesRefs=false; subject.renderPool();
       const hidden=getComputedStyle(subject.poolHost).display==='none';
       subject.timeline.assets=[{handle:'ref-1'}]; subject.renderPool();
-      const good=hidden&&!subject.poolHost.hidden&&subject.poolSection.toggle.textContent.includes('reads no attached references');
+      const good=hidden&&!subject.poolHost.hidden&&(countHeaders?subject.poolWarning:subject.poolSection.toggle).textContent.includes('reads no attached references');
       subject.timeline.takesRefs=true; subject.renderPool();return good;
     }),true);
   });
@@ -230,7 +221,7 @@ async function check(name, fn) { await fn(); results.push({name,passed:true}); }
       // Ownership must survive ordinary chip refresh detaching the anchor.
       anchor.remove();
     });
-    await page.evaluate(()=>new Promise(resolve=>setTimeout(resolve,0)));
+    await page.waitForTimeout(20);
     assert.equal(await page.evaluate(() => {
       childPop.node.firstChild.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
       return parentPop.node.isConnected&&childPop.node.isConnected;
@@ -249,7 +240,7 @@ async function check(name, fn) { await fn(); results.push({name,passed:true}); }
   });
   await check('Default outside pointer dismissal still disposes once after deferred registration', async () => {
     await page.evaluate(()=>{window.regularPop=makePopover(subject.musicBox,'regular');});
-    await page.evaluate(()=>new Promise(resolve=>setTimeout(resolve,0)));
+    await page.waitForTimeout(20);
     await page.evaluate(()=>document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true})));
     assert.equal(await page.evaluate(()=>!regularPop.node.isConnected&&popoverClosed.filter(x=>x==='regular').length===1),true);
   });
@@ -293,117 +284,6 @@ async function check(name, fn) { await fn(); results.push({name,passed:true}); }
       }return results;
     });assert.ok(rows.every(r=>!r.overlap&&!r.overflow),JSON.stringify(rows));
   });
-  await check('Restoring a closed disclosure is inert; callbacks run only on actual changes', async () => {
-    assert.deepEqual(await page.evaluate(() => {
-      const changes=[];let before=0;
-      const d=createDisclosure({title:'Stored closed',content:document.createElement('textarea'),initialOpen:false,onOpenChange:value=>changes.push(value),onBeforeCollapse:()=>before++});
-      document.body.append(d.root);
-      const initial={open:d.isOpen(),hidden:d.body.hidden,aria:d.toggle.getAttribute('aria-expanded'),before,changes:changes.length};
-      d.setOpen(false);d.setOpen(true);d.setOpen(true);d.setOpen(false);d.setOpen(false);
-      d.root.remove();return {initial,before,changes};
-    }),{initial:{open:false,hidden:true,aria:'false',before:0,changes:0},before:1,changes:[true,false]});
-  });
-  await check('All five sections remain open by default and initialization writes no preferences', async () => {
-    assert.deepEqual(await page.evaluate(() => {
-      const node=fixtureNode(undefined),view=makePersistent(node);
-      const result={open:sectionList(view).map(d=>d.isOpen()),properties:node.properties??null,dirty:node.dirty,blob:node.widgets[0].value};
-      view.close();return result;
-    }),{open:[true,true,true,true,true],properties:null,dirty:0,blob:'unchanged generation blob'});
-  });
-  await check('All five collapsed sections survive modal close/reopen without changing creator_data', async () => {
-    assert.deepEqual(await page.evaluate(() => {
-      const node=fixtureNode({mmc_face_piece:true,mmc_timeline_sections:{}}),oldMap=node.properties.mmc_timeline_sections;
-      const view=makePersistent(node),before=JSON.stringify(view.timeline);
-      for(const d of sectionList(view))d.toggle.click();
-      const original=JSON.stringify(view.timeline)===before&&node.widgets[0].value==='unchanged generation blob';
-      view.close();const reopened=makePersistent(node);
-      const result={open:sectionList(reopened).map(d=>d.isOpen()),states:sectionKeys.map(key=>node.properties.mmc_timeline_sections[key]),dirty:node.dirty,oldMapKeys:Object.keys(oldMap).length,original,face:node.properties.mmc_face_piece};
-      reopened.close();return result;
-    }),{open:[false,false,false,false,false],states:[false,false,false,false,false],dirty:5,oldMapKeys:0,original:true,face:true});
-  });
-  await check('Mixed section states survive workflow-properties JSON roundtrip and reload', async () => {
-    assert.deepEqual(await page.evaluate(() => {
-      const node=fixtureNode({mmc_timeline_sections:{}}),view=makePersistent(node);
-      sectionList(view).forEach((d,index)=>d.setOpen(index%2===0));view.close();
-      const saved=JSON.stringify({properties:node.properties,widgets_values:[node.widgets[0].value]}),loaded=JSON.parse(saved);
-      const restored=fixtureNode({}),adapter=sectionControls(restored);
-      restored.properties=loaded.properties;
-      const reopened=makePersistent(restored),result={open:sectionList(reopened).map(d=>d.isOpen()),lateRead:sectionKeys.map(key=>adapter.read(key)),dirty:restored.dirty,blob:loaded.widgets_values[0]};
-      reopened.close();return result;
-    }),{open:[true,false,true,false,true],lateRead:[true,false,true,false,true],dirty:0,blob:'unchanged generation blob'});
-  });
-  await check('Section preferences are node-local and only explicit false restores closed', async () => {
-    assert.deepEqual(await page.evaluate(() => {
-      const first=fixtureNode({}),second=fixtureNode({mmc_timeline_sections:{global_prompt:'false',overall_soundscape:0,non_diegetic_music:null,references:true}});
-      const a=makePersistent(first),b=makePersistent(second);sectionList(a).forEach(d=>d.setOpen(false));
-      const result={first:sectionList(a).map(d=>d.isOpen()),second:sectionList(b).map(d=>d.isOpen()),secondDirty:second.dirty,shared:first.properties.mmc_timeline_sections===second.properties.mmc_timeline_sections};
-      a.close();b.close();return result;
-    }),{first:[false,false,false,false,false],second:[true,true,true,true,true],secondDirty:0,shared:false});
-  });
-  await check('Programmatic prompt, reference and Cast reveals update stored state for next reopen', async () => {
-    assert.deepEqual(await page.evaluate(async () => {
-      const closed=Object.fromEntries(sectionKeys.map(key=>[key,false])),node=fixtureNode({mmc_timeline_sections:closed}),view=makePersistent(node);
-      view.citeName('subject');setPickerAnswer([{path:'preserved.png',kind:'image'}]);await view.addPoolAssets();
-      view.timeline.subjects=[{handle:'subject'}];view.renderCast();view.openCastMember('subject');
-      view.close();const reopened=makePersistent(node),result={open:sectionList(reopened).map(d=>d.isOpen()),stored:sectionKeys.map(key=>node.properties.mmc_timeline_sections[key]),dirty:node.dirty};
-      reopened.close();return result;
-    }),{open:[true,false,false,true,true],stored:[true,false,false,true,true],dirty:3});
-  });
-  await check('TimelineBody passes its node-owned section adapter through every modal open', async () => {
-    assert.equal(await page.evaluate(() => {
-      const sections=sectionControls(fixtureNode({})),soundSnaps=new Set(),body=Object.assign(new FixtureBody(),{timeline:{segments:[]},sections,soundSnaps});
-      body.open();const first=openedOptions.sections===sections&&openedOptions.edit===null&&openedOptions.soundSnaps===soundSnaps;
-      body.open({edit:2});const passed=first&&openedOptions.sections===sections&&openedOptions.edit===2&&openedOptions.soundSnaps===soundSnaps;
-      const view=makePersistent(fixtureNode({}),soundSnaps),lane=view.sound.options.snaps===soundSnaps;view.close();return passed&&lane;
-    }),true);
-  });
-  await check('Each N/A button changes only its own field and commits once without unfolding it', async () => {
-    assert.deepEqual(await page.evaluate(() => {
-      const node=fixtureNode({mmc_timeline_sections:{overall_soundscape:false,non_diegetic_music:false}}),view=makePersistent(node);
-      view.timeline.music='Original score';view.musicBox.value='Original score';
-      const other=JSON.stringify({prompt:view.timeline.prompt,assets:view.timeline.assets,subjects:view.timeline.subjects,segments:view.timeline.segments});
-      const sound=view.soundscapeSection.head.querySelector('.mmc-tl-na'),music=view.musicSection.head.querySelector('.mmc-tl-na');
-      sound.click();const first={sound:view.timeline.soundscape,music:view.timeline.music,commits:view.commits,closed:!view.soundscapeSection.isOpen()&&!view.musicSection.isOpen()};
-      view.timeline.music='Original score';view.musicBox.value='Original score';music.click();
-      const result={first,sound:view.soundscapeBox.value,music:view.musicBox.value,commits:view.commits,dirty:node.dirty,closed:!view.soundscapeSection.isOpen()&&!view.musicSection.isOpen(),preserved:other===JSON.stringify({prompt:view.timeline.prompt,assets:view.timeline.assets,subjects:view.timeline.subjects,segments:view.timeline.segments})};
-      view.close();return result;
-    }),{first:{sound:'N/A',music:'Original score',commits:1,closed:true},sound:'N/A',music:'N/A',commits:2,dirty:0,closed:true,preserved:true});
-  });
-  await check('Inline audio heading whitespace toggles once while N/A Enter and Space never toggle', async () => {
-    await page.evaluate(()=>{
-      window.audioNode=fixtureNode({}),window.audioView=makePersistent(audioNode);
-      audioView.soundscapeSection.head.id='audio-sound-head';audioView.musicSection.head.id='audio-music-head';
-    });
-    await page.locator('#audio-sound-head').click({position:{x:470,y:12}});
-    assert.deepEqual(await page.evaluate(()=>[audioView.soundscapeSection.isOpen(),audioNode.dirty,audioView.commits]),[false,1,0]);
-    const soundNA=page.locator('#audio-sound-head .mmc-tl-na');await soundNA.focus();await page.keyboard.press('Enter');await page.keyboard.press('Space');
-    assert.deepEqual(await page.evaluate(()=>[audioView.soundscapeSection.isOpen(),audioNode.dirty,audioView.commits,audioView.timeline.soundscape]),[false,1,2,'N/A']);
-    await page.locator('#audio-sound-head .mmc-tl-section-toggle').click();
-    assert.deepEqual(await page.evaluate(()=>[audioView.soundscapeSection.isOpen(),audioNode.dirty,audioView.commits]),[true,2,2]);
-    await page.evaluate(()=>audioView.close());
-  });
-  await check('24px audio pills stay beside labels and clear header outlines at narrow widths and text scales', async () => {
-    const rows=await page.evaluate(()=>{
-      const node=fixtureNode({}),view=makePersistent(node),results=[];
-      for(const width of [850,285,220])for(const scale of [1,1.25,1.5])for(const section of [view.soundscapeSection,view.musicSection]){
-        section.root.style.width=width+'px';section.root.style.setProperty('--mmc-type',String(scale));
-        const pill=section.head.querySelector('.mmc-tl-na'),label=section.head.querySelector('.mmc-tl-section-title');
-        const h=section.head.getBoundingClientRect(),p=pill.getBoundingClientRect(),l=label.getBoundingClientRect();
-        results.push({width,scale,title:label.textContent,height:p.height,topGap:p.top-h.top,bottomGap:h.bottom-p.bottom,rightGap:h.right-p.right,labelGap:p.left-l.right,overflow:section.head.scrollWidth>h.width+1,font:Number.parseFloat(getComputedStyle(pill).fontSize)});
-      }view.close();return results;
-    });
-    assert.ok(rows.every(r=>r.height===24&&r.topGap>=2&&r.bottomGap>=2&&r.rightGap>=2&&r.labelGap>=2&&!r.overflow&&Math.abs(r.font-13*r.scale)<0.01),JSON.stringify(rows));
-  });
-  if(process.env.SCREENSHOT_PATH){
-    await page.evaluate(()=>{
-      const view=makePersistent(fixtureNode({mmc_timeline_sections:{overall_soundscape:false,non_diegetic_music:false}}));
-      const host=document.createElement('div');host.id='sound-heads-proof';
-      host.append(view.soundscapeSection.root,view.musicSection.root);
-      Object.assign(host.style,{width:'1000px',display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px',padding:'24px',background:'#181818'});
-      document.body.replaceChildren(host);
-    });
-    await page.locator('#sound-heads-proof').screenshot({path:process.env.SCREENSHOT_PATH});
-  }
   assert.equal(requests,0);
   console.log(JSON.stringify({passed:results.length,requests,results},null,2));
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(async()=>{await browser?.close();});

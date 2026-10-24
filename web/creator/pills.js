@@ -11,7 +11,7 @@ import { rulesFor } from "./canvas.js";
 import { UPSCALE_MODES, DEFAULT_REFINE_DENOISE, MIN_REFINE_DENOISE, MAX_REFINE_DENOISE,
          DEFAULT_REFINE_UPSCALER, DEFAULT_REFINE_STEPS, MAX_REFINE_STEPS,
          TRAINED_REFINE, BICUBIC_REFINE,
-         twoPass, sampleEdge, emptyFace, isClip, pieceFamily, refineOf,
+         twoPass, sampleEdge, emptyFace, parseFace, isClip, pieceFamily, canDo, refineOf,
          redetailTarget, capabilityOf,
          MIN_FACE_CANVAS, MAX_FACE_CANVAS,
          MIN_FACE_DENOISE, MAX_FACE_DENOISE,
@@ -962,10 +962,12 @@ export function openResolutionPopover(anchor, target, geometry, commit) {
  * @param {object} spec.target  the piece or timeline, mutated in place
  * @param {() => void} spec.commit
  */
-export function facesPill({ target, commit }) {
+export function facesPill({ target, piece = target, commit, valid = () => true,
+                            className = "mmc-pill mmc-shot-face" }) {
   const face = target.face ?? emptyFace();
   return el("button", {
-    class: `mmc-pill${face.on ? " accel-on" : ""}`,
+    class: `${className}${face.on ? " on" : ""}`,
+    type: "button", "aria-pressed": face.on === true,
     title: face.on
       ? t("The face pass is on: every pass has its face re-drawn at {edge} px and "
         + "composited back. Needs a SAM3 checkpoint in the weights control.",
@@ -973,8 +975,11 @@ export function facesPill({ target, commit }) {
       : t("The face pass is off. Switch it on for shots where the head is small in "
         + "frame — that is where H3 draws a face worst, and it is not something a "
         + "bigger canvas fixes."),
-    onclick: (event) => openFacesPopover(event.currentTarget, { target, commit }),
-  }, [el("span", { text: face.on ? t("faces") : t("faces off") })]);
+    onclick: (event) => {
+      event.stopPropagation();
+      openFacesPopover(event.currentTarget, { target, piece, commit, valid });
+    },
+  }, [el("span", { text: t("Face pass") })]);
 }
 
 
@@ -1000,18 +1005,28 @@ export function motionPill({ segment, on, commit }) {
 
 
 /** On or off, and — on — the two knobs. The card switches are on the cards. */
-export function openFacesPopover(anchor, { target, commit }) {
+export function openFacesPopover(anchor, { target, piece = target, commit, valid = () => true }) {
+  const current = () => valid() && !isClip(target) && canDo(piece, "face");
+  if (!current()) return;
   const pop = el("div", { class: "mmc-pop mmc-faces-pop" });
   const body = el("div");
+  let close = () => pop.remove();
+  const change = (patch) => {
+    // An open menu never owns a deleted/replaced card, even at the same index.
+    if (!current()) { close(); return; }
+    target.face = { ...parseFace(target.face), ...patch };
+    render();
+    commit();
+  };
 
   const render = () => {
-    const face = target.face ?? (target.face = emptyFace());
+    const face = parseFace(target.face);
     const rows = [
       el("div", { class: "mmc-pop-title", text: t("Face pass") }),
       el("button", {
         class: "mmc-opt",
         "aria-checked": !face.on,
-        onclick: () => { face.on = false; render(); commit(); },
+        onclick: () => change({ on: false }),
       }, [
         el("span", { class: "mmc-opt-label mmc-opt-col" }, [
           el("span", { text: t("off") }),
@@ -1022,7 +1037,7 @@ export function openFacesPopover(anchor, { target, commit }) {
       el("button", {
         class: "mmc-opt",
         "aria-checked": face.on,
-        onclick: () => { face.on = true; render(); commit(); },
+        onclick: () => change({ on: true }),
       }, [
         el("span", { class: "mmc-opt-label mmc-opt-col" }, [
           el("span", { text: t("on") }),
@@ -1038,12 +1053,12 @@ export function openFacesPopover(anchor, { target, commit }) {
         stepperPill({
           value: face.canvas,
           min: MIN_FACE_CANVAS, max: MAX_FACE_CANVAS,
-          step: rulesFor(pieceFamily(target)).multiple, width: "56px",
+          step: rulesFor(pieceFamily(piece)).multiple, width: "56px",
           title: t("The canvas each face crop is generated at. Bigger is more faithful "
                + "and costs the square of it — the face fills this either way, so most "
                + "of what a larger one buys is the hair around it."),
           format: (n) => `${n} px`,
-          onChange: (next) => { face.canvas = next; render(); commit(); },
+          onChange: (next) => change({ canvas: next }),
         }),
       ]));
       rows.push(el("div", { class: "mmc-refine-row" }, [
@@ -1056,7 +1071,7 @@ export function openFacesPopover(anchor, { target, commit }) {
                + "already is. Higher synthesises more and drifts further from the head "
                + "that is there."),
           format: (n) => n.toFixed(2),
-          onChange: (next) => { face.denoise = next; render(); commit(); },
+          onChange: (next) => change({ denoise: next }),
         }),
       ]));
       rows.push(el("div", { class: "mmc-pop-note",
@@ -1070,7 +1085,8 @@ export function openFacesPopover(anchor, { target, commit }) {
   pop.appendChild(body);
   document.body.appendChild(pop);
   placeNear(pop, anchor);
-  dismissable(pop);
+  close = dismissable(pop);
+  return close;
 }
 
 

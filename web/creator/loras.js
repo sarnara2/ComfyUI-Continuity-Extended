@@ -27,10 +27,12 @@
 // a set of sections, and a LoRA stack is one of its sections; a second store for
 // the same data would be a second set of those answers to keep in step.
 
-import { el, ICONS, svg, drawFrame, mountOverlay } from "./dom.js";
+import { el, ICONS, svg, mountOverlay } from "./dom.js";
+import { readViewPrefs, patchViewPrefs } from "./viewprefs.js";
 import { listLoras, listLorasNamed, loraPreviewUrl, loadLoraPrefs, loraPrefsNow, saveLoraPrefs,
          primeSettings, uiSetting } from "./api.js";
 import { openLoraDetail } from "./loradetail.js";
+import { LoraThumbnails } from "./lora-thumbnails.js";
 import { forgetLoraNames } from "./turbo.js";
 import { listPresets, loadBody, savePreset, deletePreset } from "./presets.js";
 import { t } from "./i18n.js";
@@ -423,7 +425,7 @@ export function loraBlock(state, spec) {
   // prefix is the difference between that and the prompt quietly not being
   // what the box says it is.
   const triggers = spec.triggers === false
-    ? [] : S.promptTriggers(state, spec.family ?? S.DEFAULT_VIDEO_FAMILY);
+    ? [] : S.promptTriggers(state, spec.family ?? S.DEFAULT_VIDEO_FAMILY, spec.targets);
   if (triggers.length) {
     parts.push(el("div", {
       class: "mmc-note",
@@ -613,11 +615,32 @@ function swapLoraButton(entry, onclick) {
  * @param {string} [options.scope]     which kind of node this stack belongs to,
  *                                     for a stack saved from here: "piece",
  *                                     "shot" or "prestage".
+ * @param {boolean} [options.unified] timeline-only view: separate attached LoRAs
+ *                                     and the library into tabs. Not serialized.
  */
 export function openLoras(options) {
-  return new Promise((resolve) => {
-    new LoraManager(options, resolve).mount();
+  return new Promise((resolve, reject) => {
+    let manager;
+    try {
+      manager = new LoraManager(options, resolve);
+      manager.mount();
+    } catch (error) {
+      manager?.dispose();
+      reject(error);
+    }
   });
+}
+
+export function globalLoraOptions(piece) {
+  return {
+    state: piece,
+    family: S.pieceFamily(piece),
+    targets: S.timelineCheckpoints(piece),
+    scope: "piece",
+    unified: true,
+    contextLabel: t("Global LoRAs · all segments"),
+    turbo: piece.turbo?.lora || null,
+  };
 }
 
 class LoraManager {
@@ -626,7 +649,7 @@ class LoraManager {
    *  checkpoint does this LoRA claim" is not a question there. */
   constructor({ state, onChange, targets, family = S.DEFAULT_VIDEO_FAMILY,
                 checkpointModes = true, swapping = null, reveal = null,
-                scope = "piece" }, resolve) {
+                scope = "piece", unified = false, turbo = null, contextLabel = "" }, resolve) {
     this.state = state;
     this.family = family;
     this.presetScope = scope;
@@ -639,15 +662,57 @@ class LoraManager {
     // rather than a second browser that would need its own folder memory,
     // chunking, previews and sidecar reading.
     this.swapping = swapping;
+    this.unified = unified && !swapping;
+    this.turbo = turbo;
+    this.contextLabel = contextLabel;
+    this.attachedRows = new Map();
+    this.attachedMissing = new Set();
+    this.attachedPending = new Set();
+    this.attachedFailed = new Set();
+    this.attachedReads = 0;
+    this.addedCards = new Map();
+    this.refreshingAdded = new Set();
+    this.thumbnails = new LoraThumbnails();
+    this.heldLabels = new Set();
+    this.draggedLabel = null;
+    this.labelFit = new ResizeObserver((entries) => {
+      for (const { target } of entries) {
+        const label = target.classList.contains("mmc-lora-label-track") ? target.parentElement : target;
+        if (!label?.isConnected) continue;
+        const width = label.firstElementChild.getBoundingClientRect().width;
+        label.classList.toggle("scrolling", width > label.clientWidth + 1);
+        label.style.setProperty("--mmc-lora-label-distance", `${width + 48}px`);
+        label.style.setProperty("--mmc-lora-label-duration", `${Math.max(10, (width + 48) / 28)}s`);
+      }
+    });
+    this.onLabelSelection = () => {
+      if (this.draggedLabel) return;
+      const selection = window.getSelection();
+      for (const label of this.heldLabels) {
+      if (selection && !selection.isCollapsed && selection.containsNode(label, true)) continue;
+        label.classList.remove("held");
+        this.heldLabels.delete(label);
+      }
+    };
+    this.onLabelEnd = () => { this.draggedLabel = null; this.onLabelSelection(); };
     // Which card to scroll to once the grid has one. Cleared the moment it is
     // spent, so that typing in the search box does not keep jumping back.
     this.reveal = swapping ? null : reveal;
+    // An attached file belongs to the editing tab now. Do not scroll its hidden
+    // library counterpart (or change the remembered library query/folder).
+    this.revealAdded = this.unified && this.reveal && S.findLora(state, this.reveal)
+      ? this.reveal : null;
+    if (this.revealAdded) this.reveal = null;
     this.revealTried = false;
     this.targets = targets ?? (this.checkpointModes
       ? S.checkpointsFor(state, family) : [...S.checkpointsOf(family)]);
     this.onChange = onChange;
     this.resolve = resolve;
-    this.query = "";
+    this.viewContext = swapping ? "loras:swap" : "loras:normal";
+    this.viewPrefs = readViewPrefs(this.viewContext);
+    // A reveal is a navigation request, not a new ordinary landing preference.
+    this.viewQuery = this.reveal ? "" : (this.viewPrefs.query ?? "");
+    this.query = this.viewQuery.toLowerCase();
     this.rows = [];
     this.folders = [];
     this.missing = [];
@@ -668,7 +733,10 @@ class LoraManager {
     // sidecar, so the card can say so — a slider sitting somewhere the file's
     // author did not put it is otherwise unexplained.
     this.restored = new Set();
-    this.tab = "loras";
+    const tabs = this.unified ? ["loras", "library", "stacks"] : ["loras", "stacks"];
+    this.tab = swapping || this.revealAdded ? "loras"
+      : this.reveal ? (this.unified ? "library" : "loras")
+      : tabs.includes(this.viewPrefs.tab) ? this.viewPrefs.tab : "loras";
     // Until the prefs land: no favorites, nothing remembered, browsing
     // everything. The grid says "Loading…" over all of it anyway.
     this.prefs = { folder: "", favorites: [], used: {}, pinned: {} };
@@ -676,13 +744,16 @@ class LoraManager {
   }
 
   mount() {
-    this.stillWatch = this.watchStills();
+    document.addEventListener("selectionchange", this.onLabelSelection);
+    document.addEventListener("pointerup", this.onLabelEnd);
+    document.addEventListener("pointercancel", this.onLabelEnd);
     this.grid = el("div", {
       class: "mmc-grid mmc-lora-grid",
       onscroll: () => this.fill(),
     });
     this.picker = el("select", {
       class: "mmc-folder",
+      "aria-label": t("LoRA folder"),
       title: t("What the grid shows: a shelf of your own, or a folder under models/loras."),
       onchange: (event) => this.setScope(event.target.value),
     });
@@ -690,7 +761,13 @@ class LoraManager {
       class: "mmc-search",
       type: "search",
       placeholder: t("Search LoRAs..."),
-      oninput: (event) => { this.query = event.target.value.toLowerCase(); this.renderGrid(); },
+      "aria-label": t("Search LoRAs..."),
+      value: this.viewQuery,
+      oninput: (event) => {
+        this.query = event.target.value.toLowerCase();
+        patchViewPrefs(this.viewContext, { query: event.target.value });
+        this.renderGrid();
+      },
     });
     this.foot = el("div", { class: "mmc-modal-foot" }, [
       this.slots = el("span", { class: "mmc-slots" }),
@@ -702,13 +779,43 @@ class LoraManager {
       }),
     ]);
 
-    this.bar = el("div", { class: "mmc-modal-bar" }, [
+    // This overlay lives beside ComfyUI's canvas, but some host builds attach
+    // global pointer/keyboard handlers that can steal native input focus or
+    // selection. Let the controls keep their browser defaults while keeping
+    // their interaction events inside the modal bar. (Escape still reaches
+    // mountOverlay's capture-phase handler and closes the topmost dialog.)
+    const keepBarEventLocal = (event) => event.stopPropagation();
+    this.bar = el("div", {
+      class: "mmc-modal-bar",
+      onpointerdown: keepBarEventLocal,
+      onmousedown: keepBarEventLocal,
+      onclick: keepBarEventLocal,
+      onfocusin: keepBarEventLocal,
+      oninput: keepBarEventLocal,
+      onchange: keepBarEventLocal,
+      onkeydown: (event) => { if (event.key !== "Escape") event.stopPropagation(); },
+    }, [
       this.picker,
       this.search,
       el("button", { class: "mmc-ghost", text: t("Rescan"), onclick: () => this.load({ force: true }) }),
     ]);
     this.stacksPane = el("div", { class: "mmc-stacks", style: { display: "none" } });
     this.stacks = [];
+    if (this.unified) {
+      this.addedGrid = el("div", { class: "mmc-lora-added-grid", tabindex: "0",
+        "aria-label": t("Added LoRAs") });
+      this.addedPane = el("section", { class: "mmc-lora-added" }, [
+        el("div", { class: "mmc-lora-section-head" }, [
+          el("h3", { text: t("Added LoRAs") }),
+          this.addedCount = el("span", { class: "mmc-lora-added-count" }),
+        ]),
+        el("p", { class: "mmc-lora-section-hint",
+          text: t("Adjust the LoRAs already added here. Add or remove files on the LoRA library tab.") }),
+        this.addedGrid,
+      ]);
+      this.pinNotice = el("div", { class: "mmc-lora-pin-notice", role: "status",
+        "aria-live": "polite", "aria-atomic": "true", style: { display: "none" } });
+    }
 
     // A swap is one question with one answer in it — "which file instead" — so
     // it gets the title it always had and none of the tabs. Applying a whole
@@ -723,6 +830,10 @@ class LoraManager {
             class: "mmc-tab", "aria-selected": true, text: t("LoRAs"),
             onclick: () => this.setTab("loras"),
           }),
+          ...(this.unified ? [this.libraryTab = el("button", {
+            class: "mmc-tab", "aria-selected": false, text: t("LoRA library"),
+            onclick: () => this.setTab("library"),
+          })] : []),
           this.stackTab = el("button", {
             class: "mmc-tab", "aria-selected": false, text: t("Stacks"),
             title: t("Whole stacks you have saved, kept with your presets."),
@@ -730,15 +841,18 @@ class LoraManager {
           }),
         ];
 
-    this.modal = el("div", { class: "mmc-modal" }, [
+    this.modal = el("div", { class: `mmc-modal${this.unified ? " mmc-lora-unified" : ""}` }, [
       el("div", { class: "mmc-modal-head" }, [
         ...this.tabs,
+        ...(this.contextLabel ? [el("span", { class: "mmc-pill", text: this.contextLabel })] : []),
         el("button", { class: "mmc-close", text: "✕", onclick: () => this.close() }),
       ]),
+      ...(this.unified ? [this.addedPane] : []),
       this.bar,
       this.grid,
       this.stacksPane,
       this.foot,
+      ...(this.unified ? [this.pinNotice] : []),
     ]);
     this.modal.style.position = "relative";
 
@@ -750,8 +864,13 @@ class LoraManager {
     this.unmount = mountOverlay(this.overlay, () => this.close());
 
     this.renderFoot();
+    if (this.unified) this.renderAdded();
+    this.setTab(this.tab, { remember: false });
     this.start();
-    setTimeout(() => { if (!this.closed) this.search.focus(); }, 30);
+    setTimeout(() => {
+      if (!this.closed) (this.tab === "stacks" ? this.stackTab
+        : this.unified && this.tab === "loras" ? this.loraTab : this.search)?.focus();
+    }, 30);
   }
 
   /** Read the saved scope and display setting before drawing the first cards.
@@ -766,7 +885,8 @@ class LoraManager {
     // A LoRA asked for by name is the whole reason the window is open, and it
     // will not be on a shelf that does not hold it. Its own folder is where it
     // certainly is.
-    this.scope = this.reveal ? folderOf(this.reveal) : this.prefs.folder;
+    this.scope = this.reveal ? folderOf(this.reveal) : (this.viewPrefs.folder ?? this.prefs.folder);
+    if (this.unified) this.loadAttached();
     this.load();
   }
 
@@ -794,7 +914,22 @@ class LoraManager {
     // A slow folder answering after you have already moved on would otherwise
     // repaint the grid with the wrong folder's cards.
     if (this.closed || scope !== this.scope) return;
+    // Validate only a successful, current real-folder inventory. Virtual
+    // shelves are meaningful even when empty; a failed scan is not deletion.
+    if (!this.loadError && Array.isArray(body.folders)) {
+      this.folders = body.folders;
+      if (scope && !isShelf(scope) && !this.reveal
+          && !this.folders.some((entry) => entry.path === scope)) {
+        this.scope = "";
+        return this.load();
+      }
+    }
     this.rows = body.loras ?? [];
+    if (this.unified) {
+      for (const row of this.rows) this.attachedRows.set(row.name, row);
+      this.renderAdded();
+      this.loadAttached({ force });
+    }
     this.folders = body.folders ?? this.folders;
     this.missing = body.missing ?? [];
     this.matched = body.matched ?? this.rows.length;
@@ -827,6 +962,7 @@ class LoraManager {
 
   setScope(scope) {
     this.scope = scope;
+    patchViewPrefs(this.viewContext, { folder: scope });
     // Only a folder is a place to open on next time. A shelf is a way of
     // looking at the collection rather than part of it, and landing on an empty
     // Favorites every morning is not where anyone means to start.
@@ -872,6 +1008,241 @@ class LoraManager {
     this.rememberAll();
     this.onChange?.();
     this.renderFoot();
+    if (this.unified) {
+      this.renderAdded();
+      this.loadAttached();
+    }
+  }
+
+  /** Read only the files already attached, even when the library browses a
+   *  different folder. Failure is a view status, never a reason to drop data. */
+  async loadAttached({ force = false } = {}) {
+    const names = (this.state.loras ?? []).map((entry) => entry.name);
+    if (!force) {
+      const unknown = names.filter((name) => !this.attachedRows.has(name)
+        && !this.attachedMissing.has(name) && !this.attachedFailed.has(name)
+        && !this.attachedPending.has(name));
+      if (!unknown.length) return;
+      this.attachedPending = new Set([...this.attachedPending, ...unknown]);
+    } else {
+      this.attachedPending = new Set(names);
+      this.attachedFailed.clear();
+      this.attachedMissing.clear();
+    }
+    const asked = [...this.attachedPending];
+    if (!asked.length) return;
+    const ticket = ++this.attachedReads;
+    this.renderAdded();
+    try {
+      const body = await listLorasNamed(asked, { force });
+      if (this.closed || ticket !== this.attachedReads) return;
+      const found = new Set();
+      for (const row of body.loras ?? []) {
+        found.add(row.name);
+        this.attachedRows.set(row.name, row);
+        this.attachedMissing.delete(row.name);
+        this.attachedFailed.delete(row.name);
+      }
+      for (const name of asked) {
+        if (!found.has(name)) this.attachedMissing.add(name);
+        this.attachedPending.delete(name);
+      }
+    } catch (_error) {
+      if (this.closed || ticket !== this.attachedReads) return;
+      for (const name of asked) {
+        this.attachedFailed.add(name);
+        this.attachedPending.delete(name);
+      }
+    }
+    this.renderAdded();
+  }
+
+  attachedRow(entry) {
+    return this.attachedRows.get(entry.name) ?? {
+      name: entry.name, base: baseName(entry.name), trained_words: [], sources: [],
+    };
+  }
+
+  /** Keep controls and their text caret mounted during ordinary edits. The
+   *  list is canonical state order; searching the library cannot filter it. */
+  renderAdded() {
+    if (!this.unified || !this.addedGrid || this.closed) return;
+    const entries = this.state.loras ?? [];
+    this.addedCount.textContent = String(entries.length);
+    const wanted = new Set(entries.map((entry) => entry.name));
+    for (const [name, held] of this.addedCards) {
+      if (!wanted.has(name)) {
+        this.addedCards.delete(name); this.disposeCard(held.card); held.card.remove();
+      }
+    }
+    this.addedEmpty?.remove();
+    if (!entries.length) {
+      this.addedEmpty = el("div", { class: "mmc-lora-added-empty",
+        text: t("No LoRAs added yet. Choose one on the LoRA library tab.") });
+      this.addedGrid.replaceChildren(this.addedEmpty);
+      return;
+    }
+    for (let at = 0; at < entries.length; at += 1) {
+      const entry = entries[at];
+      const row = this.attachedRows.get(entry.name);
+      const status = this.attachedPending.has(entry.name) ? "pending"
+        : this.attachedMissing.has(entry.name) || this.attachedFailed.has(entry.name) ? "missing" : "";
+      let held = this.addedCards.get(entry.name);
+      if (!held || held.entry !== entry || held.row !== row || held.status !== status) {
+        // Slow metadata may arrive while a trigger or typed weight is being
+        // edited. Let that interaction finish before replacing its controls.
+        if (!held?.card.contains(document.activeElement)) {
+          const card = this.addedCard(entry, this.attachedRow(entry), status);
+          if (held) this.disposeCard(held.card);
+          held?.card.replaceWith(card);
+          held = { card, entry, row, status };
+          this.addedCards.set(entry.name, held);
+        }
+      }
+      const before = this.addedGrid.children[at];
+      if (held.card !== before) this.addedGrid.insertBefore(held.card, before ?? null);
+    }
+    this.revealAddedNow();
+    this.thumbnails.sync();
+  }
+
+  revealAddedNow() {
+    if (!this.revealAdded || this.tab !== "loras") return;
+    const card = this.addedCards.get(this.revealAdded)?.card;
+    if (!card?.isConnected) return;
+    this.revealAdded = null;
+    card.scrollIntoView({ block: "center" });
+    card.classList.add("mmc-lora-found");
+    setTimeout(() => card.classList.remove("mmc-lora-found"), 1600);
+  }
+
+  addedCard(entry, row, status) {
+    const pinned = isPinned(entry.name, this.family);
+    const actions = [];
+    if (loraPrefsNow() && entry.name !== this.turbo) {
+      actions.push(el("button", {
+        class: `mmc-lora-added-action${pinned ? " on" : ""}`,
+        "aria-pressed": pinned,
+        title: pinned
+          ? t("Pinned to {family}. Click to unpin — it stays in this stack as an ordinary LoRA.", { family: familyLabel(this.family) })
+          : t("Pin {name} to {family}: always in this family's stack, at these settings, on every machine restart. Takes it off any other family.",
+              { name: baseName(entry.name), family: familyLabel(this.family) }),
+        onclick: () => {
+          if (pinned) unpinLora(entry.name, this.family); else pinLora(entry, this.family);
+          this.prefs = { ...loraPrefsNow() };
+          this.refreshCard(row); this.changed();
+        },
+      }, [svg(ICONS.pin, 13)]));
+    }
+    actions.push(el("button", {
+      class: "mmc-lora-added-action", title: t("Preview and details"),
+      onclick: () => {
+        const group = groupRows([row])[0];
+        this.openDetail(group, row);
+      },
+    }, [svg(ICONS.effect, 13)]));
+    if (!pinned) {
+      actions.push(swapLoraButton(entry, async () => {
+        this.thumbnails.setSuspended(true);
+        try {
+          await openLoras({ state: this.state, onChange: () => {
+            this.prefs = { ...loraPrefsNow() }; this.changed();
+          },
+            targets: this.targets, family: this.family, checkpointModes: this.checkpointModes,
+            swapping: entry.name, scope: this.presetScope });
+        } finally {
+          this.thumbnails.setSuspended(false);
+        }
+        if (!this.closed) {
+          this.prefs = { ...loraPrefsNow() }; this.renderAdded(); this.renderGrid();
+        }
+      }));
+      actions.push(el("button", {
+        class: "mmc-lora-added-action", text: "✕",
+        title: t("Remove {name}", { name: entry.name }),
+        onclick: () => this.toggle(row),
+      }));
+    }
+    const thumb = el("button", { class: "mmc-lora-added-thumb", type: "button",
+      title: t("Preview and details"),
+      "aria-label": t("Preview and details") + ": " + baseName(entry.name),
+      onclick: () => this.openDetail(groupRows([row])[0], row) }, [
+      el("div", { class: "mmc-cell-fallback" }, [svg(ICONS.effect, 24)]),
+    ]);
+    if (row.preview === "image" || row.preview === "video") {
+      thumb.appendChild(this.thumbnails.create(row.preview, loraPreviewUrl(row.name)));
+    }
+    const card = el("article", { class: "mmc-lora-added-card", "data-lora-name": entry.name,
+      onfocusout: () => setTimeout(() => { if (!this.closed) this.renderAdded(); }, 0) }, [
+      el("div", { class: "mmc-lora-added-heading" }, [
+        this.loopingLabel("mmc-lora-added-name", uiSetting("lora_skip_metadata", false) === true
+          ? row.card_title || row.base || baseName(row.name)
+          : row.title || row.base || baseName(row.name), entry.name),
+        el("div", { class: "mmc-lora-added-actions" }, actions),
+      ]),
+      this.loopingLabel("mmc-lora-sub", entry.name),
+      thumb,
+      ...(status ? [el("div", { class: "mmc-lora-added-status", text: status === "pending"
+        ? t("Checking this file…") : t("Metadata unavailable — the saved settings are kept.") })] : []),
+      this.controls(entry, row),
+    ]);
+    card.classList.toggle("muted", entry.enabled === false);
+    return card;
+  }
+
+  refreshAdded(name) {
+    const held = this.addedCards.get(name);
+    if (!held || this.refreshingAdded.has(name)) return;
+    this.refreshingAdded.add(name);
+    try {
+      // Removing a focused typed weight can fire its native change handler.
+      // Forget the old card first, so that re-entry cannot remove it twice.
+      this.addedCards.delete(name);
+      this.disposeCard(held.card);
+      held.card.remove();
+      this.renderAdded();
+    } finally {
+      this.refreshingAdded.delete(name);
+    }
+  }
+
+  /** A single click toggles this exact file; a double-click inspects it without
+   *  changing selection. A delayed gesture must not act on a replacement entry
+   *  created by an X, stack application or another editor in the meantime. */
+  libraryClick(group, row) {
+    const now = Date.now();
+    const double = this.lastClick && this.lastClick.name === row.name && now - this.lastClick.at < 400;
+    if (double) {
+      clearTimeout(this.libraryClickTimer);
+      this.pendingLibraryToggle = null;
+      this.lastClick = null;
+      this.openDetail(group, row);
+      return;
+    }
+    clearTimeout(this.libraryClickTimer);
+    // Complete an earlier single click on another file before starting this
+    // one, so fast deliberate multi-add clicks do not cancel each other.
+    this.pendingLibraryToggle?.();
+    this.lastClick = { name: row.name, at: now };
+    const held = S.findLora(this.state, row.name);
+    this.pendingLibraryToggle = () => {
+      this.pendingLibraryToggle = null;
+      if (!this.closed && S.findLora(this.state, row.name) === held) this.toggle(row);
+    };
+    this.libraryClickTimer = setTimeout(() => {
+      this.lastClick = null;
+      this.pendingLibraryToggle?.();
+    }, 400);
+  }
+
+  pinRequiredNotice() {
+    if (!this.pinNotice || this.closed) return;
+    clearTimeout(this.pinNoticeTimer);
+    this.pinNotice.textContent = t("Unpin this LoRA first.");
+    this.pinNotice.style.display = "";
+    this.pinNoticeTimer = setTimeout(() => {
+      if (!this.closed) { this.pinNotice.style.display = "none"; this.pinNotice.textContent = ""; }
+    }, 3000);
   }
 
   // ---- memory --------------------------------------------------------------
@@ -900,7 +1271,8 @@ class LoraManager {
     const now = Date.now();
     for (const entry of this.state.loras ?? []) {
       const previous = this.memoryOf(entry.name);
-      const row = this.rows.find((candidate) => candidate.name === entry.name);
+      const row = this.rows.find((candidate) => candidate.name === entry.name)
+        ?? (this.unified ? this.attachedRows.get(entry.name) : null);
       const custom = [...(previous?.custom ?? [])];
       if (row) {
         const sidecar = row.trained_words || [];
@@ -937,6 +1309,12 @@ class LoraManager {
   toggle(row) {
     if (this.swapping) return this.swapTo(row);
     if (S.findLora(this.state, row.name)) {
+      // A family pin is deliberately absent from the attached card's X actions.
+      // Library deselection must not quietly undo that persistent preference.
+      if (this.unified && isPinned(row.name, this.family)) {
+        this.pinRequiredNotice();
+        return;
+      }
       // Remembered on the way out, which is the whole point: the setup survives
       // the removal, and putting the LoRA back brings it with it.
       this.rememberAll();
@@ -1038,7 +1416,7 @@ class LoraManager {
   pick(group, name) {
     this.picked.set(group.key, name);
     const active = group.members.find((row) => S.findLora(this.state, row.name));
-    if (active && active.name !== name) this.switchTo(active.name, name);
+    if (!this.unified && active && active.name !== name) this.switchTo(active.name, name);
     this.refreshCard(group.members[0]);
   }
 
@@ -1111,7 +1489,7 @@ class LoraManager {
         "aria-pressed": here,
         title: here ? row.name
           : active ? t("{name} — in the stack.", { name: row.name })
-          : running ? t("Run {name} instead. The strength and the checkpoint come with it.",
+          : running && !this.unified ? t("Run {name} instead. The strength and the checkpoint come with it.",
                         { name: row.name })
           : t("Show {name}", { name: row.name }),
         text: label(row),
@@ -1135,6 +1513,7 @@ class LoraManager {
   /** The sheet, told what else this model has on disk so its Versions list can
    *  be the thing you switch with rather than a list of what exists. */
   openDetail(group, row) {
+    this.thumbnails.setSuspended(true);
     return openLoraDetail(row, {
       versions: group.members.map((member) => ({
         row: member,
@@ -1144,12 +1523,16 @@ class LoraManager {
       isActive: (name) => Boolean(S.findLora(this.state, name)),
       onPick: (name) => this.pick(group, name),
       onPin: (name) => this.togglePin(group, name),
-    });
+    }).finally(() => this.thumbnails.setSuspended(false));
   }
 
   /** Neither of these re-renders the grid: the trigger row owns a text input,
    *  and rebuilding the card under it would take the caret away between words. */
   toggleTrigger(entry, word) {
+    // A workflow opened on another machine may carry custom words before any
+    // preference memory exists here. Preserve that vocabulary before an upper
+    // control switches a word off, just as removal remembers the whole setup.
+    if (this.unified) this.rememberAll();
     const at = entry.triggers.findIndex((w) => w.toLowerCase() === word.toLowerCase());
     if (at >= 0) entry.triggers.splice(at, 1);
     else entry.triggers.push(word);
@@ -1200,11 +1583,13 @@ class LoraManager {
    *  every chunk appended to reach it.
    */
   refreshCard(row) {
+    if (this.unified) this.refreshAdded(row.name);
     const group = this.groupAt.get(row.name);
     if (!group) return;
     const current = this.cards.get(group.key);
     if (!current) return;
     const next = this.card(group);
+    this.disposeCard(current);
     current.replaceWith(next);
     this.cards.set(group.key, next);
     // A card that just lost its controls is shorter, which can uncover room the
@@ -1213,6 +1598,7 @@ class LoraManager {
   }
 
   message(text) {
+    for (const card of this.cards.values()) this.disposeCard(card);
     this.grid.replaceChildren(el("div", { class: "mmc-empty", text }));
     this.cards.clear();
     this.pending = null;
@@ -1250,6 +1636,7 @@ class LoraManager {
     }
     this.pending = this.groups;
     this.shown = 0;
+    for (const card of this.cards.values()) this.disposeCard(card);
     this.cards.clear();
     this.note = el("div", { class: "mmc-grid-note" });
     this.grid.replaceChildren(this.note);
@@ -1279,6 +1666,8 @@ class LoraManager {
    * typing in the search box afterwards does not keep dragging the grid back.
    */
   revealNow() {
+    if (this.unified && this.tab !== "library") return;
+    if (!this.pending) return;
     const name = this.reveal;
     if (!name) return;
     this.reveal = null;
@@ -1299,6 +1688,9 @@ class LoraManager {
 
   /** Append chunks until the note sits far enough below the fold. */
   fill() {
+    // A hidden grid has zero rectangles, which otherwise drains every chunk
+    // eagerly. The library resumes filling once its tab is actually visible.
+    if (this.unified && this.tab !== "library") return;
     if (!this.pending || this.shown >= this.pending.length) return;
     const bottom = this.grid.getBoundingClientRect().bottom + LOOKAHEAD;
     while (this.shown < this.pending.length
@@ -1346,108 +1738,38 @@ class LoraManager {
     }
   }
 
-  /**
-   * A still of the showcase clip, so a video card shows something before
-   * anyone hovers it: an in-page <video> whose src carries a media fragment.
-   * `#t=0.12` makes the browser itself display the frame at 0.12s — a beat
-   * past the black or mid-fade these clips routinely open on — with no canvas
-   * capture at all. Every capture route tried here (frame counting, seek +
-   * drawImage) worked on one browser and not another; the fragment is the one
-   * the CiviMeta browser in roadmaus-utils has already proven on every
-   * machine this runs on.
-   *
-   * Lazy through an IntersectionObserver, for the reason hoverClip tears its
-   * decoder down: a folder of hundreds of cards each opening a connection at
-   * once is the media-element cap and the six-per-host budget both blown in
-   * one scroll. Only cards that reach the viewport ever get a src, and the
-   * grid already appends in viewport-sized chunks. The observer is the
-   * manager's own and is disconnected with it — a shared one would keep every
-   * dead card of every closed modal alive.
-   */
-  still(source) {
-    const video = el("video");
-    video.muted = true;
-    video.playsInline = true;
-    video.preload = "metadata";
-    video.dataset.src = `${source}#t=0.12`;
-    this.stillWatch.observe(video);
-    return video;
+  loopingLabel(className, text, title = text) {
+    const track = el("span", { class: "mmc-lora-label-track", text,
+      "aria-hidden": true, "data-mmc-loop-label": text });
+    const label = el("div", { class: `${className} mmc-lora-label-loop`, title,
+      "aria-label": text,
+      onpointerdown: (event) => {
+        if (event.button !== 0) return;
+        this.draggedLabel = label;
+        this.heldLabels.add(label);
+        label.classList.add("held");
+      },
+    }, [track]);
+    this.labelFit.observe(label);
+    this.labelFit.observe(track);
+    return label;
   }
 
-  watchStills() {
-    return new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        const video = entry.target;
-        this.stillWatch.unobserve(video);
-        if (video.dataset.src) {
-          video.src = video.dataset.src;
-          delete video.dataset.src;
-        }
-      }
-    }, { rootMargin: "300px" });
-  }
-
-  /**
-   * Run a showcase clip inside `art` for as long as the pointer is over it,
-   * drawn onto a canvas inserted ahead of `before`.
-   *
-   * Decoder and canvas are both built on hover and torn down on leave, so the
-   * grid never holds more than the one clip under the pointer: browsers cap how
-   * many media elements a page may have, and in a folder of hundreds every card
-   * past the cap silently stays blank.
-   */
-  hoverClip(art, before, source) {
-    let video = null;
-    let stage = null;
-    let timer = null;
-
-    const follow = () => {
-      timer = null;
-      if (!video || video.paused) return;
-      // 480 rather than the default cap: the card is 230 px wide and the canvas
-      // is a hover preview nobody inspects closely.
-      drawFrame(stage, video, 480);
-      timer = requestAnimationFrame(follow);
-    };
-
-    art.addEventListener("pointerenter", () => {
-      if (!video) {
-        stage = el("canvas");
-        art.insertBefore(stage, before);
-        video = document.createElement("video");
-        video.muted = true;
-        video.loop = true;
-        video.playsInline = true;
-        // The clip is going to be decoded the moment it arrives, so there is
-        // nothing for `metadata` to save here.
-        video.preload = "auto";
-        video.src = source;
-      }
-      video.play().then(follow, () => {});
-    });
-
-    art.addEventListener("pointerleave", () => {
-      if (timer) cancelAnimationFrame(timer);
-      timer = null;
-      if (video) {
-        video.pause();
-        // Stop the download too: leaving the src on a dropped element keeps a
-        // connection out of the browser's six-per-host budget until it finishes.
-        video.removeAttribute("src");
-        video.load();
-        video = null;
-      }
-      stage?.remove();
-      stage = null;
-    });
+  disposeCard(card) {
+    this.thumbnails.release(card);
+    for (const label of card.querySelectorAll(".mmc-lora-label-loop")) {
+      this.labelFit.unobserve(label);
+      this.labelFit.unobserve(label.firstElementChild);
+      this.heldLabels.delete(label);
+      if (this.draggedLabel === label) this.draggedLabel = null;
+    }
   }
 
   card(group) {
     const name = this.shownIn(group);
     const row = group.members.find((candidate) => candidate.name === name) ?? group.members[0];
     const entry = S.findLora(this.state, row.name);
-    const card = el("div", { class: "mmc-lora", "aria-selected": !!entry });
+    const card = el("div", { class: "mmc-lora", "aria-selected": !!entry, "data-lora-name": row.name });
 
     const art = el("div", {
       class: "mmc-lora-art",
@@ -1455,6 +1777,8 @@ class LoraManager {
       tabindex: "0",
       title: this.swapping
         ? t("Use {name} instead", { name: row.name })
+        : this.unified && entry && isPinned(row.name, this.family) ? t("Unpin this LoRA first.")
+        : this.unified && entry ? t("{name} — click to remove; double-click for details", { name: row.name })
         : t("{name} — double-click for details", { name: row.name }),
       // Double-clicks are detected by hand, same as the picker's cells: the
       // first click's toggle rebuilds the card, so the second click lands on a
@@ -1465,6 +1789,7 @@ class LoraManager {
         // One click is the whole gesture while swapping, and it closes the
         // grid — there is no second one for a details view to arrive on.
         if (this.swapping) return this.toggle(row);
+        if (this.unified) return this.libraryClick(group, row);
         const now = Date.now();
         const double = this.lastClick
           && this.lastClick.name === row.name && now - this.lastClick.at < 400;
@@ -1473,24 +1798,24 @@ class LoraManager {
         if (double) this.openDetail(group, row);
       },
       onkeydown: (event) => {
-        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); this.toggle(row); }
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          if (this.unified) {
+            if (event.repeat) return;
+            clearTimeout(this.libraryClickTimer);
+            // A keyboard gesture supersedes a pending click on this file, but
+            // should not discard a deliberate earlier click on another file.
+            if (this.lastClick?.name !== row.name) this.pendingLibraryToggle?.();
+            this.pendingLibraryToggle = null;
+            this.lastClick = null;
+          }
+          this.toggle(row);
+        }
       },
     });
-    // The preview kind is decided server-side from what was actually found: an
-    // H3 LoRA usually showcases clips, CiviMeta only generates still thumbnails
-    // for still media, and `{name}.preview.mp4` is a video by definition — so a
-    // video card shows a still of its clip (see `still`) and plays it on hover.
-    if (row.preview === "image") {
-      art.appendChild(el("img", { src: loraPreviewUrl(row.name), loading: "lazy", alt: "" }));
-    } else {
-      // Underneath the still and the clip, and on its own when there is no
-      // preview at all.
-      art.appendChild(el("div", { class: "mmc-cell-fallback" }, [svg(ICONS.effect, 26)]));
-    }
-    // The still sits over the fallback and under the hover clip, all three
-    // stacked by the art box's absolute positioning.
-    if (row.preview === "video") {
-      art.appendChild(this.still(loraPreviewUrl(row.name)));
+    art.appendChild(el("div", { class: "mmc-cell-fallback" }, [svg(ICONS.effect, 26)]));
+    if (row.preview === "image" || row.preview === "video") {
+      art.appendChild(this.thumbnails.create(row.preview, loraPreviewUrl(row.name)));
     }
     const check = el("div", { class: "mmc-check" });
     art.appendChild(check);
@@ -1506,7 +1831,6 @@ class LoraManager {
         onclick: (event) => { event.stopPropagation(); this.toggleFavorite(row); },
       }, [svg(ICONS.star, 13)]));
     }
-    if (row.preview === "video") this.hoverClip(art, check, loraPreviewUrl(row.name));
     card.appendChild(art);
 
     // Metadata remains the default. The optional display describes the exact
@@ -1518,8 +1842,8 @@ class LoraManager {
       ? row.card_subtitle || row.name
       : [row.base_model, row.version].filter(Boolean).join(" · ") || row.name;
     const body = el("div", { class: "mmc-lora-body" }, [
-      el("div", { class: "mmc-lora-name", text: title, title: row.name }),
-      el("div", { class: "mmc-lora-sub", text: subtitle, title: row.name }),
+      this.loopingLabel("mmc-lora-name", title, row.name),
+      this.loopingLabel("mmc-lora-sub", subtitle, row.name),
     ]);
     if (group.members.length > 1) body.appendChild(this.versionRow(group, row));
     // Until the LoRA is active its trigger words are just information; once it
@@ -1543,7 +1867,11 @@ class LoraManager {
     }
     // Not while swapping: the controls edit an entry, and every card in that
     // grid is a candidate rather than something in the stack.
-    if (entry && !this.swapping) body.appendChild(this.controls(entry, row));
+    if (entry && !this.swapping && !this.unified) body.appendChild(this.controls(entry, row));
+    if (this.unified) body.appendChild(el("div", {
+      class: `mmc-lora-library-state${entry ? " on" : ""}`,
+      text: entry ? t("Added") : t("Add LoRA"),
+    }));
     card.appendChild(body);
     return card;
   }
@@ -1894,16 +2222,27 @@ class LoraManager {
   // the library is only a question of where you are standing when you want one:
   // you build a stack in this window, and this is where you reach for one.
 
-  setTab(tab) {
+  setTab(tab, { remember = true } = {}) {
+    const tabs = this.unified ? ["loras", "library", "stacks"] : ["loras", "stacks"];
+    if (!tabs.includes(tab) || (this.swapping && tab !== "loras")) return;
     this.tab = tab;
+    if (remember) patchViewPrefs(this.viewContext, { tab });
     this.loraTab?.setAttribute("aria-selected", String(tab === "loras"));
+    this.libraryTab?.setAttribute("aria-selected", String(tab === "library"));
     this.stackTab?.setAttribute("aria-selected", String(tab === "stacks"));
     const stacks = tab === "stacks";
-    this.bar.style.display = stacks ? "none" : "";
-    this.grid.style.display = stacks ? "none" : "";
+    const library = this.unified ? tab === "library" : !stacks;
+    this.bar.style.display = library ? "" : "none";
+    this.grid.style.display = library ? "" : "none";
     this.stacksPane.style.display = stacks ? "" : "none";
+    if (this.unified) {
+      this.addedPane.style.display = tab === "loras" ? "" : "none";
+      if (tab === "loras") this.revealAddedNow();
+    }
+    this.thumbnails.sync();
     this.renderFoot();
     if (stacks) this.loadStacks();
+    else if (library) { this.fill(); this.revealNow(); }
   }
 
   /** Only the ones that are a stack and nothing else. A piece preset carrying
@@ -2079,12 +2418,28 @@ class LoraManager {
     this.slots.classList.toggle("full", false);
   }
 
+  dispose() {
+    if (this.closed) return;
+    clearTimeout(this.libraryClickTimer);
+    this.pendingLibraryToggle?.();
+    this.pendingLibraryToggle = null;
+    clearTimeout(this.pinNoticeTimer);
+    this.closed = true;
+    this.thumbnails.close();
+    this.labelFit.disconnect();
+    this.heldLabels.clear();
+    this.draggedLabel = null;
+    document.removeEventListener("selectionchange", this.onLabelSelection);
+    document.removeEventListener("pointerup", this.onLabelEnd);
+    document.removeEventListener("pointercancel", this.onLabelEnd);
+    this.cards.clear();
+    this.addedCards.clear();
+    this.unmount?.();
+  }
+
   close() {
     if (this.closed) return;
-    this.closed = true;
-    // The observer holds strong references to every card it still watches.
-    this.stillWatch.disconnect();
-    this.unmount();
+    this.dispose();
     this.resolve();
   }
 }

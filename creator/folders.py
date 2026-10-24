@@ -19,6 +19,8 @@ from . import assets, refmod
 FILE = "continuity.folders.json"
 SCHEME = "external:"
 MAX_ASSETS = 20000
+MAX_CHECKS = 256
+MAX_RELATIVE = 4096
 KINDS = ("image", "video", "audio", "renders", "refmods")
 _ID = re.compile(r"^[a-f0-9]{32}$")
 _imports = threading.Lock()
@@ -118,7 +120,11 @@ def resolve(filename, token):
     return row, name, path
 
 
-def listing(filename, folder_id, kind):
+def listing(filename, folder_id, kind, directory=None):
+    # An omitted directory retains the original recursive contract. The shared
+    # picker opts into immediate-child browsing with an explicit root "".
+    if directory is not None:
+        return directory_listing(filename, folder_id, kind, directory)
     if kind not in KINDS:
         raise FolderError("not a picker tab")
     selected = folder(filename, folder_id)
@@ -165,6 +171,93 @@ def listing(filename, folder_id, kind):
             if len(rows) >= MAX_ASSETS:
                 return {"assets": sorted(rows, key=lambda row: row["mtime"], reverse=True), "truncated": True}
     return {"assets": sorted(rows, key=lambda row: row["mtime"], reverse=True), "truncated": False}
+
+
+def _directory(filename, folder_id, directory):
+    if not isinstance(directory, str) or len(directory) > MAX_RELATIVE:
+        raise FolderError("not a directory in the selected folder")
+    name = relative(directory) if directory else ""
+    selected = folder(filename, folder_id)
+    root = os.path.realpath(selected["path"])
+    path = os.path.realpath(os.path.join(root, *name.split("/"))) if name else root
+    if not folder_paths.is_within_directory(root, path) or not os.path.isdir(path):
+        raise FolderError("not a directory in the selected folder")
+    return selected, name, root, path
+
+
+def _asset_row(path, name, kind):
+    """Fresh listing metadata only; never import, decode, probe or build media."""
+    if kind == "refmods":
+        if not name.lower().endswith(refmod.EXT) or not path.lower().endswith(refmod.EXT):
+            return None
+        return refmod.row_for(path, name[:-len(refmod.EXT)])
+    media_kind = assets.classify(path)
+    if name.lower().endswith(".svg") or path.lower().endswith(".svg") or media_kind not in (("image", "video") if kind == "renders" else (kind,)):
+        return None
+    stat = os.stat(path)
+    return {"name": name.rsplit("/", 1)[-1], "kind": media_kind, "size": stat.st_size,
+            "mtime": stat.st_mtime, "subfolder": name.rpartition("/")[0]}
+
+
+def directory_listing(filename, folder_id, kind, directory):
+    if kind not in KINDS:
+        raise FolderError("not a picker tab")
+    selected, name, root, path = _directory(filename, folder_id, directory)
+    rows, children, truncated = [], [], False
+    with os.scandir(path) as scan:
+        entries = sorted(scan, key=lambda entry: entry.name)
+    for entry in entries:
+        try:
+            resolved = os.path.realpath(entry.path)
+            if entry.name.startswith(".") or not folder_paths.is_within_directory(root, resolved):
+                continue
+            child = relative(f"{name}/{entry.name}" if name else entry.name)
+            if entry.is_dir(follow_symlinks=True):
+                children.append({"name": entry.name, "directory": child})
+            elif entry.is_file(follow_symlinks=True):
+                row = _asset_row(resolved, child, kind)
+                if row is None:
+                    continue
+                row["path"] = f"{SCHEME}{selected['id']}/{child}"
+                rows.append(row)
+            else:
+                continue
+        except (OSError, FolderError, refmod.RefModError):
+            continue
+        if len(rows) + len(children) >= MAX_ASSETS:
+            truncated = True
+            break
+    return {"assets": sorted(rows, key=lambda row: row["mtime"], reverse=True),
+            "folders": children, "directory": name,
+            "parent": name.rpartition("/")[0] if name else None, "truncated": truncated}
+
+
+def metadata(filename, paths, kind):
+    """Validate bounded remembered checks against their actual registered files.
+
+    Rows may span directories/grants. A vanished or revoked file is simply not
+    selected on restore. Client data never becomes a synthetic asset row.
+    """
+    if kind not in KINDS:
+        raise FolderError("not a picker tab")
+    if not isinstance(paths, list) or len(paths) > MAX_CHECKS or any(
+            not isinstance(token, str) or not token or len(token) > MAX_RELATIVE for token in paths):
+        raise FolderError("send at most 256 registered file paths")
+    rows, missing, seen = [], [], set()
+    for token in paths:
+        if token in seen:
+            continue
+        seen.add(token)
+        try:
+            selected, name, path = resolve(filename, token)
+            row = _asset_row(path, name, kind)
+            if row is None:
+                raise FolderError("not a file for this picker tab")
+            row["path"] = f"{SCHEME}{selected['id']}/{name}"
+            rows.append(row)
+        except (FolderError, refmod.RefModError, OSError):
+            missing.append(token)
+    return {"assets": rows, "missing": missing}
 
 
 def _copy(source, root, name):

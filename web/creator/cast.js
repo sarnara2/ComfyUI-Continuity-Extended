@@ -53,14 +53,21 @@
 // lives, and there are two hosts.
 
 import { refmodFileUrl, viewUrl } from "./api.js";
-import { dismissable, el, icon, placeNear, closeOwnedPopovers } from "./dom.js";
+import { dismissable, el, icon, placeNear, closeOwnedPopovers, mountOverlay } from "./dom.js";
 import { createDisclosure } from "./disclosure.js";
+import { clearButton } from "./clear.js";
+import { mediaCountPills, resolvedReferenceFiles } from "./media-counts.js";
 import { isVisualReference, previewable, openReferencePreview } from "./reference-preview.js";
 import { t } from "./i18n.js";
+import { localizeDiagnostic } from "./server-messages.js";
 import { loraBase, openLoras } from "./loras.js";
-import { DEFAULT_SPACE, costMark, keepable, looks, modIn, remakeMods } from "./refmod.js";
+import { DEFAULT_SPACE, costMark, keepable, looks, modIn, modRow, remakeRows, remakeMods } from "./refmod.js";
 import * as S from "./state.js";
 import { WearsPanel } from "./wears.js";
+import { openReplacementAnnotation } from "./replacement-annotation.js";
+import { openCastPresets } from "./cast-presets.js";
+import { openReferenceFieldHelp } from "./reference-fields.js";
+import { BUILTIN_CAST_PRESETS, appendCastPreset, CAST_REFERENCE_FIELD_HELP } from "./cast-preset-data.js";
 
 /** The four things a file can lend a subject, and what tells them apart on
  *  sight. `from` takes several files; the other three take one each, which is
@@ -73,7 +80,7 @@ export const ROLES = [
   {
     key: "from", glyph: "face", label: "looks",
     lead: "Their looks come from this",
-    note: "Face, build and clothing are taken from it; its background, light and "
+    note: "Facial identity, hair and build are taken from it; its background, light and "
         + "pose are not. Several pictures of the same person are one subject.",
     fits: (asset) => asset.kind !== "audio" && asset.track !== "sound",
   },
@@ -100,9 +107,9 @@ export const ROLES = [
   {
     key: "replaces", glyph: "swap", label: "their place",
     lead: "They take somebody's place in this",
-    note: "The clip's framing, camera work and action are kept and its occupant "
-        + "is replaced by them — the whole of “swap this person for that one”.",
-    fits: (asset) => asset.kind === "video" && asset.track !== "sound",
+    note: "Identifies who or what is replaced. A marked image can point to the "
+        + "target; the original edit video still supplies the scene and action.",
+    fits: (asset) => ["image", "video"].includes(asset.kind) && asset.track !== "sound" && !S.isRefMod(asset),
   },
 ];
 
@@ -134,6 +141,8 @@ export function referenceRole(asset) {
  *  evicted the first. Their voice is genuinely singular. */
 const LIST_ROLES = new Set(["from", "motion", "replaces"]);
 
+export const REFERENCE_FIELD_HELP = CAST_REFERENCE_FIELD_HELP;
+
 /** What `subject` has in `role`, always as a list. */
 const inRole = (subject, role) =>
   role === "from" ? [...(subject.from ?? [])]
@@ -150,7 +159,7 @@ const BLANK_FACE = { person: "face", object: "weights", scene: "image", style: "
  *  same four an asset's own chip wears, so the two rows agree — and this is the
  *  line under them in the menu. */
 export const TAKES_NOTE = {
-  person: "Keeps the likeness — face, hair, build, clothing — and drops the "
+  person: "Keeps the likeness — facial identity, hair and build — and drops the "
         + "picture's background, palette, pose and action.",
   object: "Keeps the thing itself and drops the surroundings, lighting and "
         + "arrangement it was photographed in.",
@@ -186,18 +195,37 @@ export const MARKER_NOTE = {
  *  `lead`, where given, is called with the popover's own close and answers a
  *  node drawn under the title before the rows — the one place a menu about a
  *  file can hold the words the user attaches to it. */
-export function openMenu(anchor, { title, lead = null, sections, onClose = null }) {
-  const pop = el("div", { class: "mmc-pop mmc-pop-scroll mmc-cast-menu" },
-                 title ? [el("div", { class: "mmc-pop-title", text: title })] : []);
+export function openMenu(anchor, { title, lead = null, sections, sizes = [], onClose = null, preview = null }) {
+  const pop = el("div", { class: `mmc-pop mmc-cast-menu mmc-cast-fit-menu${preview ? " mmc-cast-preview-menu" : ""}` });
   let close = () => {};
-  if (lead) pop.appendChild(lead(() => close()));
+  pop.appendChild(el("div", { class: "mmc-cast-menu-top" }, [
+    ...(title ? [el("div", { class: "mmc-pop-title", text: title })] : []),
+    ...(sizes.length ? [el("div", { class: "mmc-cast-menu-sizes", role: "group", "aria-label": t("Encoded at") },
+      sizes.map((row) => el("button", {
+        class: "mmc-cast-size-pill", type: "button", text: row.label,
+        title: row.note, "aria-pressed": Boolean(row.checked),
+        onclick: () => { close(); row.onPick(); },
+      })))] : []),
+  ]));
+  const context = preview || lead ? el("div", { class: "mmc-cast-menu-context" }) : null;
+  if (preview) context.appendChild(preview(pop));
+  if (lead) context.appendChild(lead(() => close()));
+  const body = el("div", { class: "mmc-cast-menu-sections" });
+  pop.appendChild(el("div", { class: "mmc-cast-menu-layout" }, [context, body]));
+  const groups = [];
   for (const section of sections) {
     if (!section.rows.length) continue;
-    if (section.head) pop.appendChild(el("div", { class: "mmc-cast-menu-head", text: section.head }));
+    const rows = el("div", { class: "mmc-cast-menu-rows" });
+    const group = { items: [], page: 0, count: section.rows.length };
+    const box = el("div", { class: "mmc-cast-menu-section" }, [
+      ...(section.head ? [el("div", { class: "mmc-cast-menu-head", text: section.head })] : []), rows,
+    ]);
+    body.appendChild(box);
+    groups.push(group);
     for (const row of section.rows) {
       // A row that cannot be taken stays in the menu with the reason in its
       // note — a mode that vanished would leave "why can't I" unanswered.
-      pop.appendChild(el("button", {
+      const option = el("button", {
         class: "mmc-opt",
         "aria-checked": Boolean(row.checked),
         ...(row.disabled ? { disabled: "" } : {}),
@@ -207,17 +235,127 @@ export function openMenu(anchor, { title, lead = null, sections, onClose = null 
           ...(row.lead ? [row.lead] : []),
           el("span", { class: "mmc-cast-menu-text" }, [
             el("span", { text: row.label }),
-            ...(row.note ? [el("span", { class: "mmc-cast-menu-note", text: row.note })] : []),
+            ...(row.note ? [el("span", {
+              class: `mmc-cast-menu-note${row.path ? " mmc-cast-menu-path" : ""}`,
+              text: row.note, ...(row.path ? { title: row.note } : {}),
+            })] : []),
           ]),
         ]),
         el("span", { class: "mmc-radio" }),
-      ]));
+      ]);
+      const item = el("div", { class: "mmc-cast-menu-item" });
+      if (row.preview) {
+        pop.classList.add("mmc-cast-clip-menu");
+        const thumb = row.preview(pop, () => {
+          if (pop.isConnected && pop.dataset.previewing !== "1") option.click();
+        });
+        item.appendChild(el("div", { class: "mmc-cast-clip-option" }, [thumb, option]));
+      } else item.appendChild(option);
+      if (row.actions) {
+        item.appendChild(el("div", { class: "mmc-cast-menu-actions" }, row.actions(() => close())));
+      }
+      rows.appendChild(item);
+      group.items.push(item);
+    }
+    const previous = el("button", { class: "mmc-btn", type: "button", text: t("Previous"),
+      onclick: () => { group.page -= 1; showPage(group); } });
+    const next = el("button", { class: "mmc-btn", type: "button", text: t("Next"),
+      onclick: () => { group.page += 1; showPage(group); } });
+    group.range = el("span");
+    group.previous = previous;
+    group.next = next;
+    group.pager = el("div", { class: "mmc-cast-menu-pages", hidden: true }, [group.range, previous, next]);
+    box.appendChild(group.pager);
+  }
+  function showPage(group) {
+    const pages = Math.ceil(group.items.length / group.count);
+    group.page = Math.max(0, Math.min(group.page, pages - 1));
+    const start = group.page * group.count;
+    const end = Math.min(start + group.count, group.items.length);
+    group.items.forEach((item, index) => { item.hidden = index < start || index >= end; });
+    group.pager.hidden = pages === 1;
+    group.range.textContent = `${start + 1}–${end} / ${group.items.length}`;
+    group.previous.disabled = group.page === 0;
+    group.next.disabled = group.page === pages - 1;
+  }
+  let fitting = 0;
+  let fittedHeight = 0;
+  let firstFit = true;
+  function fit() {
+    const width = Math.min(1100, window.innerWidth - 16);
+    const height = window.innerHeight - 16;
+    const fits = () => {
+      fittedHeight = pop.getBoundingClientRect().height;
+      return fittedHeight <= height + 1;
+    };
+    const starts = new Map(groups.map((group) => [group, firstFit
+      ? Math.max(0, group.items.findIndex((item) => item.querySelector('[aria-checked="true"]')))
+      : group.page * group.count]));
+    firstFit = false;
+    pop.classList.remove("compact");
+    for (const group of groups) { group.count = group.items.length; showPage(group); }
+    for (const candidate of [420, 640, 900, width]) {
+      const available = Math.min(candidate, width);
+      pop.style.width = `${available}px`;
+      const wide = Boolean(context) && available >= 760;
+      pop.classList.toggle("wide", wide);
+      pop.style.setProperty("--mmc-cast-menu-cols", wide ? "1" : String(Math.min(3, Math.max(1, Math.floor(available / 300)))));
+      if (fits()) return;
+    }
+    pop.classList.add("compact");
+    if (fits()) return;
+    // Only an overfull viewport needs pages. Keep each option, its preview and
+    // its actions together, rather than hiding overflow or losing a file.
+    const resizePage = (group, count) => {
+      group.count = count;
+      group.page = Math.floor(starts.get(group) / count);
+      showPage(group);
+    };
+    while (!fits()) {
+      const largest = groups.reduce((held, group) => group.count > (held?.count ?? 1) ? group : held, null);
+      if (!largest) break;
+      let high = largest.count - 1;
+      resizePage(largest, Math.max(1, Math.floor(largest.count / 2)));
+      if (!fits()) continue;
+      let low = largest.count;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        resizePage(largest, middle);
+        if (fits()) low = middle;
+        else high = middle - 1;
+      }
+      resizePage(largest, low);
     }
   }
+  function scheduleFit() {
+    cancelAnimationFrame(fitting);
+    fitting = requestAnimationFrame(() => {
+      fitting = 0;
+      if (!pop.isConnected) return;
+      fit();
+      const box = pop.getBoundingClientRect();
+      pop.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - box.width - 8))}px`;
+      pop.style.top = `${Math.max(8, Math.min(box.top, window.innerHeight - box.height - 8))}px`;
+    });
+  }
   document.body.appendChild(pop);
+  fit();
   placeNear(pop, anchor);
-  close = dismissable(pop, onClose);
-  pop.querySelector('[aria-checked="true"]')?.scrollIntoView({ block: "center" });
+  const observer = new ResizeObserver(() => {
+    const height = pop.getBoundingClientRect().height;
+    if (height > window.innerHeight - 15 && Math.abs(height - fittedHeight) > 1) scheduleFit();
+  });
+  observer.observe(pop);
+  window.addEventListener("resize", scheduleFit);
+  close = dismissable(pop, () => {
+    cancelAnimationFrame(fitting);
+    observer.disconnect();
+    window.removeEventListener("resize", scheduleFit);
+    const closePreview = pop.closePreview;
+    pop.closePreview = null;
+    closePreview?.();
+    onClose?.();
+  }, { suspended: () => pop.dataset.previewing === "1" });
 }
 
 /** Hand a mod's file to the browser under its own name. An anchor rather than
@@ -246,19 +384,19 @@ function assetThumb(asset, className = "mmc-asset-thumb") {
             [icon(asset.kind === "video" ? "video" : "audio", 15)]);
 }
 
-/** The size mark on a tile, where the file is encoded at full detail. "max"
- *  is the setting that costs — reference tokens ride through every sampling
- *  step — so it is the one worth reading off a row at a glance, and the mark is
- *  set in the same monospace the marker wears: this is what the model is handed.
- *  Exported for the library sheet, whose tiles say the same thing. */
-export function sizeMark(asset, space = DEFAULT_SPACE) {
+function sizeMode(asset, space = DEFAULT_SPACE) {
   // A saved reference wears what it is rather than a size: it was encoded
   // when it was made, and the mark says the tile is a latent, not a picture.
   // A picture carrying its rendition for this family wears the same mark —
   // that is what the render reads it from.
-  if (asset && modIn(asset, space)) return [el("span", { class: "mmc-cast-size", text: "mod" })];
-  if (!asset || !S.sizeable(asset) || S.refSize(asset) !== "max") return [];
-  return [el("span", { class: "mmc-cast-size", text: "max" })];
+  if (asset && modIn(asset, space)) return "mod";
+  return asset && S.sizeable(asset) ? S.refSize(asset) : "";
+}
+
+/** The actual size/latent mode, shared by ordinary and replacement tiles. */
+export function sizeMark(asset, space = DEFAULT_SPACE) {
+  const mode = sizeMode(asset, space);
+  return mode ? [el("span", { class: "mmc-cast-size", text: mode })] : [];
 }
 
 /** The two sizes a reference can be encoded at, as menu rows. The words are
@@ -498,6 +636,8 @@ function weightField({ entry, touch, done }) {
  *                       `recast` — and only the host knows which prose there is.
  *                       Absent where there is nothing to rewrite, and the swap
  *                       is offered without it.
+ * `onNameChange`         refresh other name readouts without rebuilding this
+ *                       shelf or disturbing its active field.
  * `family`               the piece's video family, as a getter — what the LoRA
  *                       manager needs to say which checkpoint a LoRA on
  *                       somebody claims. Defaults to the pack's default family.
@@ -506,13 +646,15 @@ export class CastShelf {
   constructor({ getCast, setCast, getAssets, addAsset, whereCited, cite, touch, commit,
                 keep = null, library = null, mod = null, vae = null, families = null, rename = null,
                 dropAssets = null, canvas = null, family = null, disclosure = false,
-                initialOpen = true, onOpenChange }) {
+                initialOpen = true, onOpenChange, actionsBeforeHint = false,
+                addReplacementAsset = null, onNameChange = null }) {
     this.getCast = getCast;
     this.family = family ?? (() => S.DEFAULT_VIDEO_FAMILY);
     this.dropAssets = dropAssets;
     this.setCast = setCast;
     this.getAssets = getAssets;
     this.addAsset = addAsset;
+    this.addReplacementAsset = addReplacementAsset;
     this.whereCited = whereCited;
     this.cite = cite;
     this.touch = touch ?? commit;
@@ -530,9 +672,11 @@ export class CastShelf {
     this.encoding = null;
     this.modNote = null;
     this.rename = rename;
+    this.onNameChange = onNameChange;
     // Set while the library is open for a swap, so the card can say which of
     // its two buttons is waiting and a second press cannot start a second one.
     this.swapping = null;
+    this.referenceRequests = new WeakMap();
     // Which member is open, by reference rather than by name: a name is the one
     // field being typed into while the card is open, and a shelf that tracked it
     // by name would close them on the first keystroke.
@@ -545,6 +689,7 @@ export class CastShelf {
     // A Timeline-only visibility choice, never part of creator_data. The
     // node-face shelf keeps its existing layout and member-level disclosure.
     this.disclosureEnabled = disclosure;
+    this.actionsBeforeHint = actionsBeforeHint;
     this.initialOpen = initialOpen;
     this.onOpenChange = onOpenChange;
     this.section = null;
@@ -604,6 +749,16 @@ export class CastShelf {
   save() {
     this.commit?.();
     this.render();
+  }
+
+  referenceRequest(subject) {
+    const request = {};
+    this.referenceRequests.set(subject, request);
+    const value = () => JSON.stringify(ROLES.map(({ key }) => inRole(subject, key)).map((handles) =>
+      handles.map((handle) => [handle, this.getAssets().find((asset) => asset.handle === handle)?.filename])));
+    const before = value();
+    return () => this.getCast().includes(subject) && this.referenceRequests.get(subject) === request
+      && value() === before;
   }
 
   /**
@@ -667,11 +822,23 @@ export class CastShelf {
     // A member removed elsewhere must not keep the shelf open on nobody.
     if (this.opened && !cast.includes(this.opened)) this.opened = null;
     const title = t("Cast");
-    const hint = t("Who is in it. Name them once here, write @anna in the prompt, "
-                 + "and whatever is behind them rides in with them.");
+    const hint = "";
+    const files = resolvedReferenceFiles(cast.flatMap((subject) =>
+      [...S.subjectFiles(subject), ...S.replacesOf(subject)]), this.getAssets());
+    const counts = mediaCountPills(files, { supportingImages: true });
+    counts.prepend(el("span", { class: "mmc-media-count mmc-media-count-cast",
+      text: t("Cast {count}", { count: cast.length }) }));
     // Keep action targets mounted too: a refresh while a header has focus must
     // not lose the pending press or turn an Add into a section toggle.
     this.headerActions ??= [
+      el("button", {
+        type: "button", class: "mmc-ghost mmc-cast-new",
+        title: t("Cast somebody — a person, an object, a place or a look. Give them "
+               + "pictures to be built out of, or just describe them: a name with a "
+               + "description behind it is what keeps them the same person in shot 1 "
+               + "and in shot 9."),
+        onclick: () => this.addSubject(),
+      }, [el("span", { text: "+" }), el("span", { text: t("Add someone") })]),
       ...(this.library ? [el("button", {
         type: "button", class: "mmc-ghost mmc-cast-new",
         title: t("Take somebody out of the cast library — they arrive with their "
@@ -681,16 +848,15 @@ export class CastShelf {
           await this.library();
           if (this.getCast().some((subject) => !before.has(subject))) this.reveal();
         },
-      }, [icon("star", 13), el("span", { text: t("From the library") })])] : []),
-      el("button", {
-        type: "button", class: "mmc-ghost mmc-cast-new",
-        title: t("Cast somebody — a person, an object, a place or a look. Give them "
-               + "pictures to be built out of, or just describe them: a name with a "
-               + "description behind it is what keeps them the same person in shot 1 "
-               + "and in shot 9."),
-        onclick: () => this.addSubject(),
-      }, [el("span", { text: "+" }), el("span", { text: t("Add someone") })]),
+      }, [icon("star", 13), el("span", { text: t("Library") })])] : []),
+      this.clearCastButton(),
     ];
+    const clear = this.headerActions.at(-1);
+    clear.disabled = !cast.length;
+    clear.title = cast.length
+      ? t("Clear the cast and its appearance, motion and voice files. Written prompt tags remain and show missing connections.")
+      : t("Nothing written yet.");
+    if (!cast.length) clear.cancelClear?.();
     const content = cast.length
         ? el("div", { class: "mmc-cast-list" }, cast.map((s) => this.card(s)))
         : el("button", {
@@ -707,6 +873,7 @@ export class CastShelf {
     if (this.disclosureEnabled) {
       if (!this.section) {
         this.section = createDisclosure({ title, hint, content, actions: this.headerActions,
+          actionsBeforeHint: this.actionsBeforeHint,
           initialOpen: this.initialOpen, onOpenChange: this.onOpenChange,
           onBeforeCollapse: () => closeOwnedPopovers(this.section.body) });
         this.sectionWarning = el("div", { class: "mmc-tl-pool-bad mmc-cast-section-warning", role: "status" });
@@ -716,6 +883,7 @@ export class CastShelf {
         this.section.setText(title, hint);
         this.section.body.replaceChildren(content);
       }
+      this.section.setHintNodes(counts);
       // Folding should not hide why the piece cannot queue. Keep diagnostics
       // outside the folded list; all validation still comes from the same state.
       const problems = cast.map((subject) => {
@@ -728,7 +896,7 @@ export class CastShelf {
       this.root.replaceChildren(
         el("div", { class: "mmc-cast-head" }, [
           el("span", { class: "mmc-tl-field-name", text: title }),
-          el("span", { class: "mmc-cast-hint", text: hint }),
+          el("span", { class: "mmc-cast-hint" }, [counts]),
           ...this.headerActions,
         ]), content,
       );
@@ -766,6 +934,9 @@ export class CastShelf {
   /** Their line opens the member for editing. The representative face keeps
    *  its own preview gesture; the other details on the line are readouts. */
   shutRow(subject, problem, where) {
+    const files = resolvedReferenceFiles([...S.subjectFiles(subject), ...S.replacesOf(subject)], this.getAssets());
+    const worn = this.wearsMark(subject);
+    const cost = this.costMark(subject);
     return el("div", { class: "mmc-cast-row" }, [
       // A keyboard-accessible preview is a sibling of the edit button, not
       // an interactive element nested inside another button.
@@ -781,48 +952,59 @@ export class CastShelf {
             el("span", { class: "mmc-asset-handle", text: "@" }),
             el("span", { text: subject.handle || t("unnamed") }),
           ]),
+        ]),
+        el("span", { class: "mmc-cast-line-group mmc-cast-line-kind" }, [
           el("span", { class: "mmc-cast-line-takes", text: t(subject.takes ?? "person") }),
         ]),
-        this.miniRefs(subject),
-        ...this.wearsMark(subject),
-        ...this.costMark(subject),
+        el("span", { class: "mmc-cast-line-group mmc-cast-line-references" }, [
+          ...(files.length ? [mediaCountPills(files, { supportingImages: true })] : []),
+          this.miniRefs(subject),
+        ]),
+        ...(worn.length ? [el("span", { class: "mmc-cast-line-group" }, worn)] : []),
+        ...(cost.length ? [el("span", { class: "mmc-cast-line-group" }, cost)] : []),
         // What is wrong with them outranks where they walk on: a card that
         // cannot queue is the thing to deal with first, and it is the reason
         // this line is not the same colour as the others.
-        el("span", {
-          class: `mmc-cast-line-state${problem ? " bad" : ""}`,
-          // Titled as well as printed: a refusal is a sentence and the line has
-          // room for about half of one.
-          title: problem ? t(problem) : "",
-          // A host may answer "not cited" with a reason of its own — named
-          // only inside an alternative the seed passes over — and then the
-          // reason is the line, not the standing invitation to write them in.
-          text: problem ? t(problem) : where.cited || where.text ? where.text
-              : t("not in the prompt yet"),
-        }),
-        el("span", { class: "mmc-cast-chev" }, [icon("chevron", 14)]),
+        el("span", { class: "mmc-cast-line-group mmc-cast-line-status" }, [
+          el("span", {
+            class: `mmc-cast-line-state${problem ? " bad" : ""}`,
+            // Titled as well as printed: a refusal is a sentence and the line has
+            // room for about half of one.
+            title: problem ? localizeDiagnostic(problem) : "",
+            // A host may answer "not cited" with a reason of its own — named
+            // only inside an alternative the seed passes over — and then the
+            // reason is the line, not the standing invitation to write them in.
+            text: problem ? localizeDiagnostic(problem) : where.cited || where.text ? where.text
+                : t("not in the prompt yet"),
+          }),
+          el("span", { class: "mmc-cast-chev" }, [icon("chevron", 14)]),
+        ]),
       ]),
       el("button", {
         class: "mmc-asset-x", text: "✕",
         title: where.cited
-          ? t("Remove @{handle} — the prompt still writes their name, and will "
-            + "refuse to queue until it is edited out.", { handle: subject.handle })
+          ? t("Remove @{handle} — written tags stay and show a missing connection until this handle is reattached.", { handle: subject.handle })
           : t("Remove @{handle}", { handle: subject.handle }),
         onclick: () => this.remove(subject),
       }),
     ]);
   }
 
-  /** Their files at a glance, small enough to be a texture rather than a row of
-   *  controls: what a shut line has to say is "two pictures and a voice", and
-   *  the three that are not their looks wear their colour to say which. */
+  /** Additional files at a glance. The first appearance is already the face;
+   *  files lending another role remain visible even when it is the same file. */
   miniRefs(subject) {
     const assets = this.getAssets();
+    const primary = this.primaryReference(subject);
     const tiles = [];
     for (const role of ROLES) {
-      for (const handle of inRole(subject, role.key)) tiles.push([handle, role.key]);
+      for (const handle of inRole(subject, role.key)) {
+        if (role.key === "from" && handle === primary?.handle) continue;
+        tiles.push([handle, role.key]);
+      }
     }
     if (!tiles.length) {
+      // Their first appearance already has the larger face on this same line.
+      if (primary) return el("span", { class: "mmc-cast-minis" });
       return el("span", {
         class: "mmc-cast-line-words",
         text: String(subject.description ?? "").trim()
@@ -863,6 +1045,8 @@ export class CastShelf {
               text: t(subject.takes ?? "person"),
               onclick: (event) => this.pickTakes(event.currentTarget, subject),
             }),
+            this.primarySizeButton(subject),
+            this.markerButton(subject),
             // Only the unused first-line space is a second way out. Keeping
             // this a sibling button leaves inputs, pictures and menus alone.
             el("button", {
@@ -871,7 +1055,12 @@ export class CastShelf {
               onclick: close,
             }),
           ]),
-          this.descriptionField(subject),
+          this.refStrip(subject),
+          el("div", { class: "mmc-cast-field-group mmc-cast-reference-group" }, [
+            this.descriptionField(subject),
+            this.usageRulesField(subject),
+          ]),
+          ...this.placeRow(subject),
         ]),
         el("div", { class: "mmc-cast-side" }, [
           this.whereButton(subject, where),
@@ -884,22 +1073,19 @@ export class CastShelf {
           el("button", {
             class: "mmc-asset-x", text: "✕",
             title: where.cited
-              ? t("Remove @{handle} — the prompt still writes their name, and will "
-                + "refuse to queue until it is edited out.", { handle: subject.handle })
+              ? t("Remove @{handle} — written tags stay and show a missing connection until this handle is reattached.", { handle: subject.handle })
               : t("Remove @{handle}", { handle: subject.handle }),
             onclick: () => this.remove(subject),
           }),
         ]),
       ]),
-      this.refStrip(subject),
       // What each family gets when it renders them: the saved reference or
       // the pictures, and the LoRA they wear there. Under the tiles it is
       // about, before the words — it is still the "what they are made of"
       // half of the card, and the half of it that is one family's.
       ...[this.wears.render(subject)].filter(Boolean),
       this.featureBlock(subject),
-      ...this.placeRow(subject),
-      ...(problem ? [el("div", { class: "mmc-cast-bad", text: t(problem) })] : []),
+      ...(problem ? [el("div", { class: "mmc-cast-bad", text: localizeDiagnostic(problem) })] : []),
       ...(this.note?.subject === subject
         ? [el("div", { class: "mmc-cast-bad", text: this.note.text })] : []),
       ...this.footRow(subject),
@@ -968,17 +1154,46 @@ export class CastShelf {
    * one needing its own ✕ on the asset row to find and undo.
    *
    * Only what they alone claimed, and only what the host agrees is loose: a
-   * picture two members are built out of stays for the other one, and a file a
-   * prompt still writes by handle stays because the sentence would break
-   * without it. Both of those questions are answered outside this method — see
-   * `state.soleClaims` and the host's own `dropAssets`.
+   * picture two members are built out of stays for the other one. A written
+   * tag does not keep a departing member's sole file attached: the sentence
+   * keeps that tag, and the host reports the missing connection. Scope and
+   * ownership are answered outside this method — see `state.soleClaims` and
+   * the host's own `dropAssets`.
    */
   remove(subject) {
+    if (!this.getCast().includes(subject)) return;
+    closeOwnedPopovers(this.root);
+    this.referenceRequests.delete(subject);
     if (this.opened === subject) this.opened = null;
     const loose = S.soleClaims(subject, this.getCast());
     this.setCast(this.getCast().filter((s) => s !== subject));
     if (loose.length) this.dropAssets?.(loose);
     this.save();
+  }
+
+  clearCastButton() {
+    const button = clearButton({
+      compact: true,
+      written: this.getCast().length > 0,
+      what: t("Clear the cast and its appearance, motion and voice files. Written prompt tags remain and show missing connections."),
+      getOwner: () => this.getCast(),
+      getValue: () => ({ cast: this.getCast(), assets: this.getAssets() }),
+      run: () => {
+        const cast = this.getCast();
+        const sources = new Set(cast.flatMap(S.replacesOf));
+        const handles = [...new Set(cast.flatMap(S.subjectFiles))].filter((handle) => !sources.has(handle));
+        closeOwnedPopovers(this.root);
+        for (const subject of cast) this.referenceRequests.delete(subject);
+        this.setCast([]);
+        this.opened = null;
+        this.kept = null;
+        this.note = null;
+        if (handles.length) this.dropAssets?.(handles);
+        this.save();
+      },
+    });
+    button.classList.add("mmc-cast-clear");
+    return button;
   }
 
   /**
@@ -1013,7 +1228,8 @@ export class CastShelf {
    * the swap simply does not happen.
    */
   async recast(subject) {
-    if (!this.library || this.swapping) return;
+    if (!this.library || this.swapping || !this.getCast().includes(subject)) return;
+    const isCurrent = this.referenceRequest(subject);
     const before = new Set(this.getCast());
     this.swapping = subject;
     this.render();
@@ -1023,13 +1239,17 @@ export class CastShelf {
       this.swapping = null;
     }
     const arrived = this.getCast().filter((s) => !before.has(s));
-    if (arrived.length !== 1 || !this.getCast().includes(subject)) { this.render(); return; }
+    if (arrived.length !== 1 || !isCurrent()) { this.render(); return; }
     const [newcomer] = arrived;
 
     const place = S.replacesOf(subject);
-    if (place.length) newcomer.replaces = [...place];
-    if (subject.replaces_what && !newcomer.replaces_what) {
-      newcomer.replaces_what = subject.replaces_what;
+    if (place.length) {
+      newcomer.replaces = [...place];
+      if (subject.replacement_reference_only) newcomer.replacement_reference_only = true;
+      else delete newcomer.replacement_reference_only;
+    }
+    if (place.length || subject.replaces_what !== undefined) {
+      newcomer.replaces_what = subject.replaces_what ?? "";
     }
     // The clips they now stand in are narrowed to "edit" for them, over the
     // default only — a take somebody chose is theirs. The rest of their files
@@ -1062,7 +1282,7 @@ export class CastShelf {
   async keepSubject(subject) {
     const problem = this.problem(subject);
     if (problem) {
-      this.note = { subject, text: t(problem) };
+      this.note = { subject, text: localizeDiagnostic(problem) };
       this.render();
       return;
     }
@@ -1141,25 +1361,81 @@ export class CastShelf {
       .filter(isVisualReference);
   }
 
-  /** Keep the first appearance still as the face. An appearance clip can supply
-   *  a thumbnail too; a motion donor must not impersonate the subject's looks. */
-  face(subject) {
+  /** The first available appearance source is the representative, in the same
+   *  order as the definition. Motion/voice/target donors cannot become it. */
+  primaryReference(subject) {
     const assets = this.getAssets();
-    const appearance = (subject.from ?? [])
-      .map((handle) => assets.find((a) => a.handle === handle)).filter(isVisualReference);
-    const face = appearance.find((a) => a.kind === "image" || S.isRefMod(a)) ?? appearance[0];
+    return (subject.from ?? [])
+      .map((handle) => assets.find((asset) => asset.handle === handle)).find(isVisualReference);
+  }
+
+  /** The same live max/match control as the reference shelf, limited to this
+   *  representative. Encoded renditions keep their own mod semantics. */
+  primarySizeButton(subject) {
+    const primary = this.primaryReference(subject);
+    const space = this.ownFamily()?.space ?? DEFAULT_SPACE;
+    if (!primary || !S.sizeable(primary) || modIn(primary, space)) return null;
+    return el("button", {
+      type: "button", class: "mmc-cast-primary-size",
+      text: t(S.refSize(primary)), "aria-pressed": String(S.refSize(primary) === "max"),
+      title: primary.kind === "video"
+        ? t("match: scale to the generation's pixel area. max: core's 768 reference canvas — "
+          + "more detail, and much the slower of the two. A video's reference tokens are its "
+          + "whole grid once per latent frame, so at full length one clip is about as long as "
+          + "the target video itself, and all of it rides through every sampling step.")
+        : t("match: scale to the generation's pixel area. max: 2048 short edge — better identity, "
+          + "several times slower, because reference tokens ride through every sampling step."),
+      onclick: (event) => {
+        event.stopPropagation();
+        // A detached card must not change a former representative after a
+        // picker or another surface has already replaced the live asset.
+        const current = this.primaryReference(subject);
+        if (!this.getCast().includes(subject) || current !== primary
+          || !S.sizeable(current) || modIn(current, this.ownFamily()?.space ?? DEFAULT_SPACE)) return;
+        current.ref_size = S.refSize(current) === "max" ? "match" : "max";
+        event.currentTarget.textContent = t(S.refSize(current));
+        event.currentTarget.setAttribute("aria-pressed", String(S.refSize(current) === "max"));
+        this.save();
+      },
+    });
+  }
+
+  /** The first appearance reference, still or clip. Its single click retains
+   *  the settings/detach menu that used to live on the duplicate lower tile. */
+  face(subject) {
+    const face = this.primaryReference(subject);
     const sources = this.visualReferences(subject);
+    const off = face && S.muted(face);
+    const note = face ? S.subjectNotes(subject)[face.handle] ?? "" : "";
+    const wake = face ? S.subjectTriggers(subject)[face.handle] ?? "" : "";
     const thumb = face?.filename
-      ? el("img", {
-        class: "mmc-cast-face", alt: "",
-        src: viewUrl(face.filename, { preview: true, crop: S.thumbCrop(face) }),
-      })
+      ? el("span", { class: `mmc-cast-face${off ? " off" : ""}` }, [
+        el("img", {
+          class: "mmc-cast-face-image", alt: "",
+          src: viewUrl(face.filename, { preview: true, crop: S.thumbCrop(face) }),
+        }),
+        ...sizeMark(face, this.ownFamily()?.space ?? DEFAULT_SPACE),
+        ...(off ? [el("span", { class: "mmc-cast-badge mmc-cast-muted", title: t("muted") }, [icon("mute", 11)])] : []),
+        ...(note || wake ? [el("span", { class: `mmc-cast-noted${wake ? " wake" : ""}` })] : []),
+      ])
       : el("span", { class: "mmc-cast-face mmc-cast-face-blank" },
           [icon(BLANK_FACE[subject.takes ?? "person"] ?? "face", 22)]);
     if (sources.length) {
       previewable(thumb, {
-        title: t("{path} — double-click to view", { path: face?.filename ?? `@${subject.handle}` }),
+        title: face ? (off ? t("{name} — muted, and kept as it was set up.\n", { name: `@${face.handle}` }) : "")
+          + (note ? `@${face.handle} — ${note}\n` : "")
+          + (wake ? t("Wakes on {words}\n", { words: wake }) : "")
+          + t("@{handle} — {what}. Click to say what it shows of them, change what it "
+          + "lends them, or take it off.", { handle: face.handle, what: t(ROLE.from.lead).toLowerCase() })
+          + "\n" + t("{path} — double-click to view", { path: face.filename })
+          : t("{path} — double-click to view", { path: `@${subject.handle}` }),
         open: () => this.viewFace(subject, face, thumb),
+        click: face ? () => {
+          const current = this.primaryReference(subject);
+          if (current === face && thumb.isConnected && this.getCast().includes(subject)) {
+            this.pickRole(thumb, subject, current.handle, "from");
+          }
+        } : null,
       });
     }
     return thumb;
@@ -1191,11 +1467,16 @@ export class CastShelf {
       oninput: (event) => {
         subject.handle = event.target.value.trim();
         this.touch?.();
+        this.onNameChange?.(subject);
       },
       // Redrawn on blur rather than on every keystroke: the field holds the
       // caret, and rebuilding the card mid-word would take it away.
       onblur: () => {
-        if (!subject.handle && was) { subject.handle = was; this.touch?.(); }
+        if (!subject.handle && was) {
+          subject.handle = was;
+          this.touch?.();
+          this.onNameChange?.(subject);
+        }
         this.renderSoon();
       },
     });
@@ -1205,29 +1486,137 @@ export class CastShelf {
 
   descriptionField(subject) {
     const bare = !S.subjectFiles(subject).length && !S.replacesOf(subject).length;
-    const field = el("input", {
+    const field = el("textarea", {
       class: "mmc-cast-desc",
+      rows: "1",
       value: subject.description ?? "",
       // Two placeholders, because the field is doing two different jobs. With
       // pictures behind them it fills in what a picture cannot say; with nothing
       // behind them it *is* the definition, and the box has to ask for enough.
       placeholder: bare
         ? t("describe them — this is all the model will know")
-        : t("what a picture cannot say"),
+        : t("Who or what this reference represents"),
       title: bare
         ? t("Nothing else is behind them, so this is their whole definition. Written "
           + "into the prompt as what @{handle} is.", { handle: subject.handle })
-        : t("Folded into their definition after the files they are built out of — they "
-          + "are nervous, the cardigan is theirs. What the model cannot see for "
-          + "itself goes here."),
+        : t("Describe the identity, source or visible features shown by the reference. "
+          + "This defines the subject; put requests to keep or change features in Reference usage rules."),
       oninput: (event) => {
         subject.description = event.target.value;
+        this.fitReferenceField(event.target);
         this.touch?.();
       },
+      onfocus: (event) => this.fitReferenceField(event.target),
       onblur: () => this.renderSoon(),
     });
     field.addEventListener("pointerdown", (event) => event.stopPropagation());
-    return field;
+    field.value = subject.description ?? "";
+    requestAnimationFrame(() => { if (field.isConnected) this.fitReferenceField(field); });
+    return el("div", { class: "mmc-cast-description" }, [
+      this.referenceFieldLabel("description", field, subject),
+      field,
+      this.referenceFieldDestination("description"),
+    ]);
+  }
+
+  usageRulesField(subject) {
+    const field = el("textarea", {
+      class: "mmc-cast-desc mmc-cast-usage", rows: "1",
+      placeholder: t("What to keep, change or transfer from this reference"),
+      "aria-label": t("Reference usage rules"),
+      title: t("State what the generated result should keep, change or borrow. Written into retention_analysis."),
+      oninput: (event) => { subject.usage_rules = event.target.value; this.fitReferenceField(event.target); this.touch?.(); },
+      onfocus: (event) => this.fitReferenceField(event.target),
+      onblur: () => this.renderSoon(),
+      onpointerdown: (event) => event.stopPropagation(),
+    });
+    field.value = subject.usage_rules ?? "";
+    requestAnimationFrame(() => { if (field.isConnected) this.fitReferenceField(field); });
+    return el("div", { class: "mmc-cast-description mmc-cast-usage-row" }, [
+      this.referenceFieldLabel("usage_rules", field, subject), field,
+      this.referenceFieldDestination("usage_rules"),
+    ]);
+  }
+
+  fitReferenceField(field) {
+    field.style.height = "auto";
+    field.style.height = `${field.scrollHeight + 2}px`;
+  }
+
+  referenceFieldLabel(key, field, subject) {
+    const help = REFERENCE_FIELD_HELP[key];
+    field.setAttribute("aria-label", t(help.title));
+    return el("div", { class: "mmc-cast-description-label" }, [
+      el("button", {
+        class: "mmc-cast-preset-label", type: "button", text: t(help.title), "data-field": key,
+        "aria-label": t("{field} presets", { field: t(help.title) }),
+        onclick: (event) => {
+          event.stopPropagation();
+          this.openFieldPresets(subject, key, event.currentTarget);
+        },
+      }),
+      el("button", {
+        class: "mmc-cast-help", type: "button", text: "?", "data-field": key,
+        "aria-label": t("About {field}", { field: t(help.title) }),
+        onclick: (event) => {
+          event.stopPropagation();
+          this.openReferenceHelp(key, event.currentTarget);
+        },
+      }),
+      el("span", { class: "mmc-cast-field-colon", text: ":", "aria-hidden": true }),
+    ]);
+  }
+
+  referenceFieldDestination(key) {
+    const hints = {
+      description: "Who or what this is → subject_definitions",
+      usage_rules: "What to keep, change or borrow → retention_analysis",
+      replaces_what: "Who or what to replace in the source → retention_analysis",
+      replaces: "Locates the source target; the new identity comes from the supporting references.",
+    };
+    return el("span", { class: "mmc-cast-field-destination", text: t(hints[key]) });
+  }
+
+  openFieldPresets(subject, key, anchor) {
+    openCastPresets({
+      field: key, title: t(REFERENCE_FIELD_HELP[key].title), returnFocus: anchor,
+      restoreFocus: () => this.root.querySelector(`.mmc-cast-preset-label[data-field="${key}"]`)?.focus(),
+      getValue: () => key === "replaces" ? S.replacesOf(subject).map((handle) => `@${handle}`).join(", ") : subject[key] ?? "",
+      onApply: (preset, force = false) => this.applyFieldPreset(subject, key, preset, force),
+      onAction: (action) => this.referencePresetAction(subject, action),
+    });
+  }
+
+  applyFieldPreset(subject, key, preset, force) {
+    if (!this.getCast().includes(subject) || preset.field !== key || !preset.text || key === "replaces") {
+      return { ok: false, blocked: true, message: t("This cast member is no longer available.") };
+    }
+    if (preset.safety === "remove") {
+      return { ok: false, blocked: true, message: t("Removal belongs in the segment's editing instructions, not this cast replacement. Check automatic replacement and preservation rules before using it.") };
+    }
+    const value = subject[key] ?? "";
+    const folded = (text) => String(text).normalize("NFKC").toLowerCase().replace(/\s+/g, " ");
+    const current = folded(value);
+    if (current.includes(folded(preset.text).trim())) {
+      return { ok: false, blocked: true, message: t("This phrase is already in the field.") };
+    }
+    const previous = BUILTIN_CAST_PRESETS.filter((item) => item.field === key && item.text && current.includes(folded(item.text)));
+    const conflict = previous.some((item) => key === "replaces_what" ||
+      (preset.rule && item.rule?.group === preset.rule.group && item.rule.value !== preset.rule.value));
+    const fullPreservation = key === "usage_rules" && S.subjectMarker(subject) === "fully_preserved"
+      && ((preset.rule?.group === "wardrobe" && preset.rule.value !== "reference") || preset.rule?.group === "transfer");
+    if (!force && (conflict || fullPreservation)) {
+      return { ok: false, message: t("This may conflict with an existing target or preservation rule. Review the English text before appending; nothing will be removed automatically.") };
+    }
+    subject[key] = appendCastPreset(value, preset.text);
+    this.touch?.();
+    this.save();
+    return { ok: true };
+  }
+
+  openReferenceHelp(key, returnFocus) {
+    return openReferenceFieldHelp(REFERENCE_FIELD_HELP[key], returnFocus,
+      () => this.root.querySelector(`.mmc-cast-help[data-field="${key}"]`)?.focus());
   }
 
   // ---- feature by feature -----------------------------------------------------
@@ -1244,11 +1633,9 @@ export class CastShelf {
   // the clothing should be different — had no answer anywhere in the node. Here
   // it is a row with an arrow in it.
 
-  /** The features, one row each, and the marker they add up to. */
+  /** The features, one row each. Their marker is beside the type above. */
   featureBlock(subject) {
     const features = subject.features ?? [];
-    const marker = S.subjectMarker(subject);
-    const overridden = S.SUBJECT_MARKERS.includes(subject.relationship);
     const fromFiles = !!S.subjectFiles(subject).length;
     return el("div", { class: "mmc-cast-features" }, [
       el("div", { class: "mmc-cast-features-head" }, [
@@ -1266,24 +1653,30 @@ export class CastShelf {
         }),
       ]),
       ...features.map((feature, index) => this.featureRow(subject, feature, index)),
-      // The value itself, in the same monospace the compiled prompt sets its
-      // wire keys in: across both surfaces that face means "this is what the
-      // model is handed". Derived from the rows above unless somebody overrode
-      // it, and it is a button because the override is the only way to reach
-      // `weak_reference`, which no rule can infer.
-      el("button", {
-        class: `mmc-cast-marker${overridden ? " forced" : ""}`,
-        title: overridden
-          ? t("Set by hand. Click to go back to deciding it from the features above.")
-          : t("The reference guide's own relationship marker, worked out from the "
-            + "features above and written into the retention line. Click to set it "
-            + "by hand instead."),
-        onclick: (event) => this.pickMarker(event.currentTarget, subject),
-      }, [
-        el("span", { class: "mmc-cast-marker-value", text: marker }),
-        el("span", { class: "mmc-cast-marker-say", text: t(MARKER_LABEL[marker]) }),
-        ...(overridden ? [el("span", { class: "mmc-cast-marker-forced", text: t("set by hand") })] : []),
-      ]),
+    ]);
+  }
+
+  /** The existing preservation override, beside the identity's type. */
+  markerButton(subject) {
+    const marker = S.subjectMarker(subject);
+    const overridden = S.SUBJECT_MARKERS.includes(subject.relationship);
+    // The value itself, in the same monospace the compiled prompt sets its
+    // wire keys in: across both surfaces that face means "this is what the
+    // model is handed". Derived from the features unless somebody overrode
+    // it, and it is a button because the override is the only way to reach
+    // `weak_reference`, which no rule can infer.
+    return el("button", {
+      class: `mmc-cast-marker${overridden ? " forced" : ""}`,
+      title: overridden
+        ? t("Set by hand. Click to go back to deciding it from the features above.")
+        : t("The reference guide's own relationship marker, worked out from the "
+          + "features above and written into the retention line. Click to set it "
+          + "by hand instead."),
+      onclick: (event) => this.pickMarker(event.currentTarget, subject),
+    }, [
+      el("span", { class: "mmc-cast-marker-value", text: marker }),
+      el("span", { class: "mmc-cast-marker-say", text: t(MARKER_LABEL[marker]) }),
+      ...(overridden ? [el("span", { class: "mmc-cast-marker-forced", text: t("set by hand") })] : []),
     ]);
   }
 
@@ -1490,10 +1883,8 @@ export class CastShelf {
 
   placeRow(subject) {
     const held = S.replacesOf(subject);
-    const clips = this.getAssets().filter(
-      (asset) => asset.kind === "video" && asset.track !== "sound"
-                 && ["edit", "continue"].includes(asset.takes));
-    if (!held.length && !clips.length) return [];
+    const clips = this.getAssets().filter((asset) => ROLE.replaces.fits(asset));
+    if (!held.length && !clips.length && !this.addAsset) return [];
 
     const field = el("input", {
       class: "mmc-cast-desc mmc-cast-replaces",
@@ -1505,17 +1896,24 @@ export class CastShelf {
     });
     field.addEventListener("pointerdown", (event) => event.stopPropagation());
 
-    return [el("div", { class: `mmc-cast-line mmc-cast-place${held.length ? " on" : ""}` }, [
-      el("span", { class: "mmc-cast-of", text: t("takes the place of") }),
-      field,
-      el("span", { class: "mmc-cast-of", text: t("in") }),
-      el("button", {
-        class: "mmc-cast-place-clip",
-        title: t("Which clip they take somebody's place in. The clip's framing, "
-               + "camera work and action are kept; only its occupant moves."),
-        text: held.length ? held.map((handle) => `@${handle}`).join(", ") : t("pick a clip"),
-        onclick: (event) => this.pickPlace(event.currentTarget, subject, clips),
-      }),
+    const choose = el("button", {
+      class: "mmc-cast-place-clip",
+      title: t("Choose a video or image that identifies the replacement target."),
+      text: held.length ? held.map((handle) => `@${handle}`).join(", ") : t("Choose reference"),
+      onclick: (event) => this.pickPlace(event.currentTarget, subject, clips),
+    });
+    return [el("div", { class: `mmc-cast-field-group mmc-cast-replacement-group${held.length ? " on" : ""}` }, [
+      el("div", { class: "mmc-cast-description mmc-cast-place" }, [
+        this.referenceFieldLabel("replaces_what", field, subject),
+        field,
+        this.referenceFieldDestination("replaces_what"),
+      ]),
+      el("div", { class: "mmc-cast-place-controls" }, [
+        this.referenceFieldLabel("replaces", choose, subject), choose,
+        this.referenceFieldDestination("replaces"),
+      ]),
+      el("div", { class: "mmc-cast-replacement-thumbs" }, held.map((handle) =>
+        this.refTile(subject, handle, "replaces", this.getAssets()))),
     ])];
   }
 
@@ -1527,21 +1925,127 @@ export class CastShelf {
       title: t("Where @{handle} takes somebody's place", { handle: subject.handle }),
       sections: [{
         rows: clips.map((asset) => ({
-          lead: assetThumb(asset, "mmc-cast-menu-thumb"),
+          preview: (pop, pick) => previewable(assetThumb(asset, "mmc-cast-menu-thumb"), {
+            title: t("{path} — double-click to view", { path: asset.filename }),
+            click: pick,
+            open: (returnFocus) => this.viewRolePreview(asset, pop, returnFocus),
+          }),
           label: `@${asset.handle}`,
           note: asset.filename,
+          path: true,
           checked: held.has(asset.handle),
+          actions: this.addReplacementAsset ? (close) => [el("button", {
+            class: "mmc-btn mmc-cast-mark", text: t(asset.kind === "video" ? "Capture and mark frame" : "Mark target on image"),
+            onclick: () => { close(); this.markReplacement(subject, asset); },
+          })] : null,
           onPick: () => {
             if (held.has(asset.handle)) this.clearRole(subject, asset.handle, "replaces");
             else {
+              subject.replacement_reference_only = true;
               this.addRole(subject, asset.handle, "replaces");
-              S.inheritTake(subject, "replaces", asset);
             }
             this.save();
           },
         })),
-      }],
+      }, ...(this.addAsset ? [{ rows: [{
+        label: t("Attach replacement reference…"),
+        note: t("Use an image or video to identify the target; the original edit video stays unchanged."),
+        onPick: () => this.referenceActionGuard(subject, () => this.attachReplacement(subject)),
+      }] }] : [])],
     });
+  }
+
+  async referenceActionGuard(subject, run) {
+    try { await run(); }
+    catch (error) {
+      if (!this.getCast().includes(subject)) return;
+      this.note = { subject, text: String(error?.message || t("Could not open the reference action.")) };
+      this.renderSoon();
+    }
+  }
+
+  async attachReplacement(subject) {
+    return this.attachReference(subject, { replacement: true });
+  }
+
+  async attachReference(subject, { replacement = false } = {}) {
+    if (!this.addAsset) throw new Error(t("Reference import is unavailable in this view."));
+    const isCurrent = this.referenceRequest(subject);
+    if (!isCurrent()) return;
+    const picked = await this.addAsset(subject, { replacement, isCurrent });
+    if (!isCurrent()) return;
+    for (const asset of (Array.isArray(picked) ? picked : picked ? [picked] : [])) {
+      if (replacement && !ROLE.replaces.fits(asset)) continue;
+      if (replacement) subject.replacement_reference_only = true;
+      const key = replacement ? "replaces" : referenceRole(asset);
+      this.addRole(subject, asset.handle, key);
+      S.inheritTake(subject, key, asset);
+    }
+    this.save();
+  }
+
+  referencePresetAction(subject, action) {
+    return this.referenceActionGuard(subject, async () => {
+      if (!this.getCast().includes(subject)) return;
+      const anchor = this.root.querySelector(".mmc-cast-place-clip")
+        ?? this.root.querySelector('.mmc-cast-preset-label[data-field="replaces"]');
+      if (!anchor) return;
+      const assets = this.getAssets().filter(ROLE.replaces.fits);
+      const held = new Set(S.replacesOf(subject));
+      if (action === "choose") { this.pickPlace(anchor, subject, assets); return; }
+      if (action === "attach") { await this.attachReplacement(subject); return; }
+      if (action === "preview") {
+        const references = assets.filter(asset => held.has(asset.handle));
+        if (!references.length) throw new Error(t("Choose a replacement reference first."));
+        openReferencePreview(references, { returnFocus: anchor });
+        return;
+      }
+      if (!["mark-video", "mark-image", "remark"].includes(action)) return;
+      if (!this.addReplacementAsset) throw new Error(t("Reference marking is unavailable in this view."));
+      const candidates = assets.filter(asset => action === "remark" ? held.has(asset.handle)
+        : asset.kind === (action === "mark-video" ? "video" : "image"));
+      const sections = [{ rows: candidates.map(asset => ({
+        label: `@${asset.handle}`, note: asset.filename, path: true,
+        preview: (pop, pick) => previewable(assetThumb(asset, "mmc-cast-menu-thumb"), {
+          title: t("{path} — double-click to view", { path: asset.filename }), click: pick,
+          open: returnFocus => this.viewRolePreview(asset, pop, returnFocus),
+        }),
+        onPick: () => this.referenceActionGuard(subject, () => this.markReplacement(subject, asset)),
+      })) }];
+      if (action !== "remark" && this.addAsset) sections.push({ rows: [{
+        label: t("Import reference file"),
+        onPick: () => this.referenceActionGuard(subject, async () => {
+          const isCurrent = this.referenceRequest(subject);
+          if (!isCurrent()) return;
+          const picked = await this.addAsset(subject, { replacement: true, isCurrent });
+          if (!isCurrent()) return;
+          const kind = action === "mark-video" ? "video" : "image";
+          const candidate = (Array.isArray(picked) ? picked : picked ? [picked] : []).find(asset => asset.kind === kind && ROLE.replaces.fits(asset));
+          if (!candidate) return;
+          await this.markReplacement(subject, candidate);
+        }),
+      }] });
+      if (!candidates.length && (action === "remark" || !this.addAsset)) {
+        throw new Error(t("No matching replacement reference is available."));
+      }
+      openMenu(anchor, { title: t(action === "mark-video" ? "Capture and mark frame" : "Mark target on image"), sections });
+    });
+  }
+
+  async markReplacement(subject, asset) {
+    const isCurrent = this.referenceRequest(subject);
+    const file = asset.filename;
+    const sourceCurrent = () => isCurrent()
+      && this.getAssets().some((current) => current === asset && current.filename === file);
+    if (!sourceCurrent()) return;
+    closeOwnedPopovers(this.root);
+    const saved = await openReplacementAnnotation(asset);
+    if (!saved || !sourceCurrent()) return;
+    const added = await this.addReplacementAsset(saved, { isCurrent: sourceCurrent });
+    if (!added || !sourceCurrent()) return;
+    subject.replacement_reference_only = true;
+    this.addRole(subject, added.handle, "replaces");
+    this.save();
   }
 
   /** Where they walk on. A button rather than a readout when they walk on
@@ -1564,15 +2068,16 @@ export class CastShelf {
 
   // ---- the references --------------------------------------------------------
 
-  /** Every file behind them, one tile each, in the order the definition will cite
-   *  them: their looks, then their movement, then their voice, then the place they
-   *  take. A handle in two slots gets two tiles, which is honest — it is
-   *  lending them two different things. */
+  /** Supplementary looks, then motion and voice. The first appearance lives in
+   *  the representative above, with its full menu. A handle in another role is
+   *  still shown because it lends a different thing. Replacement has its own row. */
   refStrip(subject) {
     const assets = this.getAssets();
+    const primary = this.primaryReference(subject);
     const tiles = [];
-    for (const role of ROLES) {
+    for (const role of ROLES.filter((row) => row.key !== "replaces")) {
       for (const handle of inRole(subject, role.key)) {
+        if (role.key === "from" && handle === primary?.handle) continue;
         tiles.push(this.refTile(subject, handle, role.key, assets));
       }
     }
@@ -1585,7 +2090,7 @@ export class CastShelf {
                + "somebody's place in.", { handle: subject.handle }),
         onclick: (event) => this.pickReference(event.currentTarget, subject),
       }, [el("span", { text: "+" })]),
-      ...(tiles.length ? [] : [el("span", {
+      ...(tiles.length || primary ? [] : [el("span", {
         class: "mmc-cast-refs-none",
         text: t("no files — described in words alone"),
       })]),
@@ -1650,6 +2155,13 @@ export class CastShelf {
       label: t("Take it off @{handle}", { handle: subject.handle }),
       onPick: () => { this.clearRole(subject, handle, current); this.save(); },
     });
+    if (current === "replaces" && asset && ROLE.replaces.fits(asset) && this.addReplacementAsset) {
+      rows.unshift({
+        label: t(asset.kind === "video" ? "Capture and mark frame" : "Mark target on image"),
+        note: t("The original file is never changed; Save creates a separate image."),
+        onPick: () => this.markReplacement(subject, asset),
+      });
+    }
     // The size, on the tile's own menu rather than on the reference row: the
     // person is where you decide that picture 1 is the face at full detail
     // and picture 2 is the coat at match, and the library keeps it with them.
@@ -1662,6 +2174,7 @@ export class CastShelf {
     const file = asset && S.isRefMod(asset) ? [
       { label: t("Download .safetensors"),
         note: asset.filename.replace(/^refmod:/, "models/refmods/") + ".safetensors",
+        path: true,
         onPick: () => downloadMod(asset.filename) },
       ...(this.library ? [{ label: t("Show in library"),
                             note: t("The Cast tab's Saved references panel, on this file."),
@@ -1674,9 +2187,12 @@ export class CastShelf {
       : [];
     openMenu(anchor, {
       title: `@${handle}`,
+      sizes,
+      preview: asset?.filename && (isVisualReference(asset) || asset.kind === "audio"
+        || asset.kind === "video" && asset.track === "sound") ? (pop) => this.rolePreview(asset, pop) : null,
       lead: wordsLead({ subject, handle, touch: () => this.touch?.(),
                         done: () => this.save() }),
-      sections: [{ rows }, ...(sizes.length ? [{ head: t("Encoded at"), rows: sizes }] : []),
+      sections: [{ rows },
                  ...(modes.length ? [{ head: t("Encoded as"), rows: modes }] : []),
                  ...(file.length ? [{ head: t("The file"), rows: file }] : [])],
       // Words typed and then clicked away from are on the blob already; the
@@ -1685,16 +2201,55 @@ export class CastShelf {
     });
   }
 
+  /** A bounded, read-only picture above the file's role and words. Videos use
+   *  a still here; playback stays in the existing larger reference viewer. */
+  rolePreview(asset, pop) {
+    const title = t("{path} — double-click to view", { path: asset.filename });
+    const audio = asset.kind === "audio" || asset.track === "sound";
+    const status = el("span", { class: "mmc-cast-preview-error", role: "status", hidden: true });
+    const content = audio
+      ? el("span", { class: "mmc-cast-preview-audio" }, [
+          icon("audio", 32), el("span", { class: "mmc-cast-menu-path", text: asset.filename, title: asset.filename }),
+        ])
+      : el("img", {
+          src: viewUrl(asset.filename, { preview: asset.kind === "video" && !S.isRefMod(asset), crop: S.thumbCrop(asset) }),
+          alt: `@${asset.handle}`,
+          onerror: () => {
+            status.textContent = t("Preview unavailable. The file may be missing, or this browser may not support its format.");
+            status.hidden = false;
+          },
+        });
+    const thumb = el("div", { class: "mmc-cast-role-preview" }, [content, status]);
+    return previewable(thumb, {
+      title, open: (returnFocus) => this.viewRolePreview(asset, pop, returnFocus),
+    });
+  }
+
+  /** Temporarily give outside-click and Escape to the larger viewer, without
+   *  losing typed file notes, trigger words, the selected page or role settings. */
+  viewRolePreview(asset, pop, returnFocus) {
+    if (!pop.isConnected || pop.dataset.previewing === "1") return;
+    pop.dataset.previewing = "1";
+    pop.closePreview = openReferencePreview([asset], {
+      includeAudio: true, returnFocus,
+      onClose: () => {
+        delete pop.dataset.previewing;
+        pop.closePreview = null;
+      },
+    });
+  }
+
   /** Move a handle between slots. Their looks, their actions and the place
    *  they take are lists and a file joins them; their voice holds one, so
    *  taking it over displaces whatever was in it — which is the truthful
    *  outcome: they have one voice. */
   setRole(subject, handle, current, next) {
-    if (current === next) return;
+    if (current === next || !this.getCast().includes(subject)) return;
     // Into the new slot before out of the old: `clearRole` drops the words on a
     // file the moment it is on none of their slots, and a file changing slots
     // is never off them (issue #70 — the note vanished with every switch).
     this.addRole(subject, handle, next);
+    if (next === "replaces") subject.replacement_reference_only = true;
     this.clearRole(subject, handle, current);
     // The file is a different kind of reference now — a clip that was their looks
     // and is now their movement is a motion reference — so the narrowing follows
@@ -1705,6 +2260,8 @@ export class CastShelf {
 
   /** Put a handle in a slot, joining whatever is there where the slot is a list. */
   addRole(subject, handle, role) {
+    if (!this.getCast().includes(subject)) return;
+    this.referenceRequests.delete(subject);
     if (!LIST_ROLES.has(role)) { subject[role] = handle; return; }
     const held = inRole(subject, role);
     if (!held.includes(handle)) held.push(handle);
@@ -1715,6 +2272,8 @@ export class CastShelf {
    *  `state.releaseClaim` is the rule; the face's asset ✕ and the pool's use
    *  the same one, which is what keeps a removed file from dangling. */
   clearRole(subject, handle, role) {
+    if (!this.getCast().includes(subject)) return;
+    this.referenceRequests.delete(subject);
     S.releaseClaim(subject, handle, role);
   }
 
@@ -1730,6 +2289,7 @@ export class CastShelf {
         lead: assetThumb(asset, "mmc-cast-menu-thumb"),
         label: `@${asset.handle}`,
         note: asset.filename,
+        path: true,
         onPick: () => {
           const key = referenceRole(asset);
           this.addRole(subject, asset.handle, key);
@@ -1747,16 +2307,7 @@ export class CastShelf {
           lead: el("span", { class: "mmc-cast-menu-thumb mmc-cast-menu-plus", text: "+" }),
           label: t("Attach a file…"),
           note: t("Adds it to this shot and hangs it on them"),
-          onPick: async () => {
-            const picked = await this.addAsset(subject);
-            if (!this.getCast().includes(subject)) return;
-            for (const asset of (Array.isArray(picked) ? picked : picked ? [picked] : [])) {
-              const key = referenceRole(asset);
-              this.addRole(subject, asset.handle, key);
-              S.inheritTake(subject, key, asset);
-            }
-            this.save();
-          },
+          onPick: () => this.referenceActionGuard(subject, () => this.attachReference(subject)),
         }],
       });
     }

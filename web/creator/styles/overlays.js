@@ -1,6 +1,50 @@
 // Lightbox, LoRA detail sheet, segment editor.
 // No backticks or ${} anywhere in the CSS: each chunk is one template literal.
 export const css = `
+.mmc-storyboard-guidance {
+  display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--mmc-accent) 28%, var(--mmc-line));
+  border-radius: 14px; background: color-mix(in srgb, var(--mmc-accent) 5%, var(--mmc-surface));
+  font-size: calc(12px * var(--mmc-type)); line-height: 1.65; color: var(--mmc-text);
+  white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+}
+.mmc-storyboard-guidance p { margin: 0; }
+.mmc-storyboard-confirm {
+  display: flex; flex-direction: column; min-height: 0; width: min(1200px, 100%);
+  background: var(--mmc-float); color: var(--mmc-text); border: 1px solid var(--mmc-line);
+  border-radius: 18px; box-sizing: border-box; box-shadow: 0 30px 80px var(--mmc-shadow);
+}
+.mmc-storyboard-confirm-head {
+  flex: none; display: flex; align-items: center; gap: 16px; padding: 18px 20px;
+  border-bottom: 1px solid var(--mmc-line);
+}
+.mmc-storyboard-confirm-head strong { flex: 1; min-width: 0; font-size: calc(15px * var(--mmc-type)); overflow-wrap: anywhere; }
+.mmc-overlay.mmc-storyboard-confirm-overlay { padding: 16px; box-sizing: border-box; }
+.mmc-storyboard-confirm-body { padding: 16px 20px; user-select: text; }
+.mmc-storyboard-confirm-body .mmc-storyboard-guidance { gap: 8px; line-height: 1.5; }
+.mmc-storyboard-confirm-body .mmc-storyboard-guidance.mmc-storyboard-guidance-long {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 20px;
+}
+.mmc-storyboard-guidance-long p { min-width: 0; }
+.mmc-storyboard-confirm-actions {
+  flex: none; display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 0 20px 18px;
+}
+.mmc-storyboard-confirm-actions > .mmc-pill { white-space: normal; height: auto; min-height: var(--mmc-pill-h); padding: 8px 16px; }
+.mmc-storyboard-confirm-apply {
+  color: var(--mmc-accent); border-color: color-mix(in srgb, var(--mmc-accent) 50%, var(--mmc-line));
+  background: color-mix(in srgb, var(--mmc-accent) 9%, var(--mmc-surface));
+}
+.mmc-storyboard-confirm button:focus-visible, .mmc-storyboard-confirm-body:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 2px;
+}
+@media (max-width: 680px) {
+  .mmc-overlay.mmc-storyboard-confirm-overlay { padding: 8px; }
+  .mmc-storyboard-confirm-head { padding: 12px 14px; }
+  .mmc-storyboard-confirm-body { padding: 12px 14px; }
+  .mmc-storyboard-confirm-body .mmc-storyboard-guidance { padding: 10px 12px; gap: 4px; line-height: 1.4; }
+  .mmc-storyboard-confirm-body .mmc-storyboard-guidance.mmc-storyboard-guidance-long { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .mmc-storyboard-confirm-actions { padding: 0 14px 12px; }
+}
 /* --- lightbox ------------------------------------------------------------- */
 /* Double-click on any picker cell. Above the picker, like the segment editor. */
 .mmc-light {
@@ -39,6 +83,7 @@ export const css = `
   object-fit: contain; border-radius: 8px;
 }
 .mmc-reference-preview-stage > video:fullscreen { max-width: none; max-height: none; width: 100%; height: 100%; }
+.mmc-reference-preview-stage > audio { width: min(520px, 100%); max-width: 100%; }
 .mmc-reference-preview-foot { flex: none; display: flex; flex-direction: column; gap: 8px; max-height: 24vh; overflow: auto; }
 .mmc-reference-preview-name { font-size: calc(12px * var(--mmc-type)); overflow-wrap: anywhere; }
 .mmc-reference-preview-note, .mmc-reference-preview-error {
@@ -54,6 +99,34 @@ export const css = `
 .mmc-reference-preview button:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: 2px; }
 .mmc-reference-preview-count { font-variant-numeric: tabular-nums; font-size: calc(12px * var(--mmc-type)); }
 .mmc-reference-preview-guard { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
+.mmc-reference-preview-foot[hidden], .mmc-compiled-tag-meta-row[hidden] { display: none; }
+.mmc-reference-preview-empty { height: auto; max-height: 100%; }
+.mmc-reference-preview-empty .mmc-reference-preview-stage { min-height: 140px; border-radius: 10px; }
+.mmc-reference-preview-empty-message {
+  margin: 0; padding: 24px; color: var(--mmc-dim); text-align: center;
+  font-size: calc(13px * var(--mmc-type)); line-height: 1.6; overflow-wrap: anywhere;
+}
+.mmc-compiled-tag-details {
+  flex: none; display: flex; flex-direction: column; gap: 9px; padding: 12px 14px;
+  border: 1px solid var(--mmc-line); border-radius: 12px; background: var(--mmc-surface);
+  max-height: 25vh; overflow: auto; user-select: text;
+}
+.mmc-compiled-tag-meta-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 14px; }
+.mmc-compiled-tag-key {
+  flex: 0 0 calc(104px * var(--mmc-type)); color: var(--mmc-dim);
+  font-size: calc(11px * var(--mmc-type)); line-height: 1.6;
+}
+.mmc-compiled-tag-values { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.mmc-compiled-tag-label, .mmc-compiled-tag-handle {
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--tag) 38%, transparent);
+  background: color-mix(in srgb, var(--tag) 10%, transparent); color: var(--tag);
+  font: calc(12px * var(--mmc-type))/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+.mmc-compiled-tag-note {
+  margin: 2px 0 0; font-size: calc(11px * var(--mmc-type)); line-height: 1.5; color: var(--mmc-dim);
+}
 
 /* --- LoRA detail sheet ---------------------------------------------------- */
 /* Double-click on a manager card. Two shapes on purpose: with a sidecar the

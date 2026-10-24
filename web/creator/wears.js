@@ -26,6 +26,7 @@
 
 import { el, icon } from "./dom.js";
 import { t } from "./i18n.js";
+import { readViewPrefs, patchViewPrefs } from "./viewprefs.js";
 import { loraBase } from "./loras.js";
 import { cost, everyFamilyRows, familyModeRows, modIn, modRow, modeWord, remakeRows, shortTokens } from "./refmod.js";
 import * as S from "./state.js";
@@ -51,7 +52,7 @@ export class WearsPanel {
   constructor(host) {
     this.host = host;
     // Which family's tab is open, by id. Absent is the piece's own.
-    this.open = null;
+    this.open = readViewPrefs("wears:family").family ?? null;
   }
 
   family() {
@@ -140,7 +141,11 @@ export class WearsPanel {
     return el("button", {
       class: "mmc-wears-tab", role: "tab", "aria-selected": String(selected),
       title: t("What {family} is handed for @{handle}.", { family: t(family.label), handle: subject.handle }),
-      onclick: () => { this.open = family.id; this.host.redraw(); },
+      onclick: () => {
+        this.open = family.id;
+        patchViewPrefs("wears:family", { family: family.id });
+        this.host.redraw();
+      },
     }, [
       el("span", { class: `mmc-wears-dot ${dot}` }),
       ...(worn ? [el("span", { class: "mmc-wears-dot lora" })] : []),

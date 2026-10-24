@@ -18,6 +18,7 @@
 import { el, ICONS, svg, mountOverlay } from "./dom.js";
 import { loraDetail, loraShowcaseUrl } from "./api.js";
 import { t } from "./i18n.js";
+import { LoraThumbnails } from "./lora-thumbnails.js";
 
 /**
  * Open the sheet for one listing row. Resolves when it closes.
@@ -207,18 +208,22 @@ class LoraDetailSheet {
     this.pinned = siblings?.pinned ?? null;
     this.resolve = resolve;
     this.current = 0;   // which showcase item the stage shows
+    this.thumbnails = new LoraThumbnails();
+    this.loadSerial = 0;
+    this.closed = false;
   }
 
   /** Turn the sheet to another version of the same model, and tell the grid
    *  behind it — the two are one gesture, not a preview and a commit. */
   async switchTo(name) {
-    if (name === this.row.name) return;
+    if (this.closed || name === this.row.name) return;
     const next = this.siblings?.versions.find((version) => version.row.name === name);
     if (!next) return;
     this.siblings.onPick?.(name);
     this.row = next.row;
     this.current = 0;
     this.detail = null;
+    this.thumbnails.clear();
     this.sheet.replaceChildren(el("div", { class: "mmc-sheet-info" }, [
       this.closeButton(),
       el("div", { class: "mmc-empty", text: t("Loading…") }),
@@ -244,22 +249,32 @@ class LoraDetailSheet {
   }
 
   async load() {
+    const serial = ++this.loadSerial;
+    const name = this.row.name;
+    let detail;
     try {
-      this.detail = await loraDetail(this.row.name);
+      detail = await loraDetail(name);
     } catch (error) {
-      this.detail = { error: error.message };
+      detail = { error: error.message };
     }
-    if (!this.overlay.isConnected) return;
+    if (this.closed || serial !== this.loadSerial || name !== this.row.name || !this.overlay.isConnected) return;
+    this.detail = detail;
     this.render();
   }
 
   close() {
+    if (this.closed) return;
+    this.closed = true;
+    ++this.loadSerial;
+    this.thumbnails.close();
     this.unmount();
     this.resolve();
   }
 
   render() {
     const detail = this.detail;
+    if (this.closed || !detail) return;
+    this.thumbnails.clear();
     if (detail.error) {
       this.sheet.replaceChildren(el("div", { class: "mmc-sheet-info" }, [
         this.closeButton(),
@@ -273,6 +288,7 @@ class LoraDetailSheet {
       ...(showcase.length ? [this.stage(showcase)] : []),
       detail.meta ? this.metaInfo() : this.headerInfo(),
     );
+    this.thumbnails.sync();
   }
 
   closeButton() {
@@ -298,30 +314,19 @@ class LoraDetailSheet {
       "aria-selected": index === this.current,
       onclick: () => this.showItem(index),
     });
-    if (item.kind === "video" && !item.thumb) {
-      // A video showcase has no generated thumbnail; the media-fragment trick
-      // the manager's cards use paints its first usable frame instead.
-      const video = el("video", { muted: true, playsInline: true, preload: "metadata" });
-      video.src = `${loraShowcaseUrl(this.row.name, item.index)}#t=0.12`;
-      cell.appendChild(video);
-    } else {
-      cell.appendChild(el("img", {
-        src: loraShowcaseUrl(this.row.name, item.index, { thumb: true }),
-        loading: "lazy", alt: "",
-      }));
-    }
+    cell.appendChild(this.thumbnails.create(item.kind, loraShowcaseUrl(this.row.name, item.index)));
     return cell;
   }
 
   showItem(index) {
-    const item = (this.detail.showcase || [])[index];
-    if (!item) return;
+    const item = (this.detail?.showcase || [])[index];
+    if (this.closed || !item) return;
     this.current = index;
     this.stripCells.forEach((cell, at) => cell.setAttribute("aria-selected", String(at === index)));
     const source = loraShowcaseUrl(this.row.name, item.index);
-    this.stageMedia.replaceChildren(item.kind === "video"
-      ? el("video", { src: source, controls: true, loop: true, muted: true, autoplay: true, playsInline: true })
-      : el("img", { src: source, alt: "" }));
+    this.thumbnails.release(this.stageMedia);
+    this.stageMedia.replaceChildren(this.thumbnails.create(item.kind, source));
+    this.thumbnails.sync();
     this.renderRecipe(item.meta);
   }
 

@@ -16,6 +16,7 @@ whatever the directories do — they are what saved workflows name.
 from .creator import refine_routes  # noqa: F401  (registers /continuity/refine)
 from .creator import server_routes  # noqa: F401  (registers /continuity/assets)
 from .creator.creator_node import comfy_entrypoint  # noqa: F401
+from .creator.routes import answers  # noqa: F401  (registers /continuity/answers)
 from .creator.routes import blockout  # noqa: F401  (registers /continuity/blockout)
 from .creator.routes import chat  # noqa: F401  (registers /continuity/chat)
 from .creator.routes import control  # noqa: F401  (registers /continuity/control)
@@ -27,6 +28,7 @@ from .creator.routes import plate  # noqa: F401  (registers /continuity/plate)
 from .creator.routes import refmod  # noqa: F401  (registers /continuity/refmod)
 from .creator.routes import render  # noqa: F401  (registers /continuity/render)
 from .creator.routes import reveal  # noqa: F401  (registers /continuity/reveal)
+from .creator.routes import sheet  # noqa: F401  (registers /continuity/sheet)
 from .creator.routes import upscale  # noqa: F401  (registers /continuity/upscale)
 
 WEB_DIRECTORY = "./web"

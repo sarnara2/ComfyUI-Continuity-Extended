@@ -37,6 +37,8 @@ import { openTrim, formatTime } from "./trim.js";
 import * as S from "./state.js";
 import { rulesFor, secondsForFrames, matchSeconds } from "./canvas.js";
 import { MIN_SECONDS, atFrame, lane, band, pinned } from "./sound.js";
+import { createDisclosure } from "./disclosure.js";
+import { SoundView } from "./sound-view.js";
 
 // How near a snap target has to be before a drag lands on it, in pixels. Chosen
 // in pixels rather than frames on purpose: it is a statement about the pointer,
@@ -72,7 +74,7 @@ export class SoundLane {
    * @param {() => void} options.onCommit   called after any edit lands
    * @param {(message: string) => void} options.flash  how this surface complains
    */
-  constructor({ read, onCommit, flash, snaps = null }) {
+  constructor({ read, onCommit, flash, snaps = null, sectionOptions = {} }) {
     this.read = read;
     this.onCommit = onCommit;
     this.flash = flash ?? (() => {});
@@ -83,6 +85,29 @@ export class SoundLane {
     // about the piece, so it comes from the probe route and is remembered here.
     this.lengths = new Map();
     this.host = el("div", { class: "mmc-snd" });
+    // Header actions acknowledge a click without acquiring a toggle state.
+    this.host.addEventListener("click", (event) => {
+      const button = event.target.closest?.("button.mmc-tl-header-action");
+      if (!button || button.disabled || button.hasAttribute("aria-pressed")) return;
+      for (const animation of button.getAnimations()) {
+        if (animation.id === "mmc-snd-action-feedback") animation.cancel();
+      }
+      const animation = button.animate([
+        { color: "var(--mmc-blue)", borderColor: "var(--mmc-blue)",
+          backgroundColor: "color-mix(in srgb, var(--mmc-blue) 18%, var(--mmc-surface-2))" },
+        {},
+      ], { duration: matchMedia("(prefers-reduced-motion: reduce)").matches ? 100 : 320, easing: "ease-out" });
+      animation.id = "mmc-snd-action-feedback";
+    });
+    // Presentation only. This object never enters creator_data or sound.store.
+    this.viewState = { zoom: 1, center: .5, scroll: 0, tool: false };
+    this.contentEl = el("div", { class: "mmc-snd-content" });
+    this.disclosure = createDisclosure({ ...sectionOptions, title: t("Sound"),
+      content: this.contentEl, inlineActions: true, actionsBeforeHint: true,
+      onBeforeCollapse: () => this.cancelInteractions() });
+    this.host.appendChild(this.disclosure.root);
+    this.waveFrame = null;
+    this.destroyed = false;
     this.waves = new Map();
     // block index -> its element, for the duration of one render. A drag writes
     // through this rather than re-rendering; see `blocks()`.
@@ -422,7 +447,7 @@ export class SoundLane {
    * out of a container either way.
    */
   async add() {
-    const chosen = await openPicker({ kinds: ["audio", "video"], kind: "audio" });
+    const chosen = await openPicker({ selectionPurpose: "soundlane-files", kinds: ["audio", "video"], kind: "audio" });
     if (!chosen?.length) return;
     await this.lay(chosen);
   }
@@ -515,6 +540,8 @@ export class SoundLane {
         node.removeEventListener("pointermove", move);
         node.removeEventListener("pointerup", up);
         node.removeEventListener("pointercancel", up);
+        this.cancelDrag = null;
+        if (node.hasPointerCapture(event.pointerId)) node.releasePointerCapture(event.pointerId);
         this.showSnap(null);
         this.showRead(null);
         const blocks = this.working;
@@ -523,7 +550,7 @@ export class SoundLane {
         this.nodes.get(index)?.classList.remove("dragging");
         if (released.type === "pointercancel") {
           this.moved = true;
-          if (dirty) this.render();
+          if (dirty && !this.destroyed) this.render();
           return;
         }
         // A press that never moved is a click on its way to opening the block,
@@ -536,6 +563,7 @@ export class SoundLane {
       node.addEventListener("pointermove", move);
       node.addEventListener("pointerup", up);
       node.addEventListener("pointercancel", up);
+      this.cancelDrag = () => up({ type: "pointercancel", pointerId: event.pointerId });
     });
   }
 
@@ -596,11 +624,61 @@ export class SoundLane {
     this.readLenEl.textContent = t("{length} s", { length: (to - from).toFixed(1) });
   }
 
+  /** Names for an existing snap point, on the delivered piece's clock. This
+   *  describes snapPoints; it never adds or moves a target. Shared boundaries
+   *  keep both names, including cuts inside a merged generation. */
+  snapLabels(frame, exclude = this.dragging) {
+    const labels = [];
+    const passes = S.passes(this.piece);
+    for (const [index, window] of S.passWindows(this.piece).entries()) {
+      const pass = passes[index];
+      if (frame === window.at) labels.push(t("Segment {number} start", { number: pass.start + 1 }));
+      if (frame === window.at + window.frames) labels.push(t("Segment {number} end", { number: pass.end }));
+      for (const [cutIndex, cut] of S.cutTimes(pass.segments).at.entries()) {
+        if (!cutIndex) continue;
+        const cutFrame = window.sampledAt + atFrame(cut, this.rules());
+        if (cutFrame <= window.at || cutFrame >= window.at + window.frames || frame !== cutFrame) continue;
+        labels.push(t("Segment {number} end", { number: pass.start + cutIndex }));
+        labels.push(t("Segment {number} start", { number: pass.start + cutIndex + 1 }));
+      }
+    }
+    for (const block of this.blocks()) {
+      if (block.index === exclude) continue;
+      if (frame === block.at) labels.push(t("Sound clip {number} start", { number: block.index + 1 }));
+      if (frame === block.at + block.frames) labels.push(t("Sound clip {number} end", { number: block.index + 1 }));
+    }
+    if (!labels.length) {
+      if (frame === 0) labels.push(t("Piece start"));
+      else if (frame === this.total()) labels.push(t("Piece end"));
+    }
+    return [...new Set(labels)];
+  }
+
   /** The line that says a drag stopped somewhere on purpose. */
   showSnap(frame) {
     if (!this.snapEl) return;
     this.snapEl.classList.toggle("on", frame !== null);
     if (frame !== null) this.snapEl.style.left = this.pct(frame);
+    if (!this.snapHintEl) return;
+    this.snapHintEl.classList.toggle("on", frame !== null);
+    if (frame === null) {
+      this.snapLabelEl.textContent = "";
+      this.snapTimeEl.textContent = "";
+      this.snapHintEl.removeAttribute("title");
+      this.snapHintEl.removeAttribute("data-frame");
+      return;
+    }
+    const seconds = this.seconds(frame);
+    this.snapLabelEl.textContent = this.snapLabels(frame).join(" · ");
+    this.snapTimeEl.textContent = t("{time} · frame {frame}", { time: S.shotTime(seconds), frame });
+    this.snapHintEl.title = t("Boundary at frame {frame} ({seconds} s). An end marks the instant the last frame finishes.",
+      { frame, seconds: seconds.toFixed(6) });
+    this.snapHintEl.setAttribute("data-frame", String(frame));
+    // Clamp only the label's screen position. The snap hairline remains at the
+    // exact existing target, including both ends of the lane.
+    const half = Math.min(this.snapHintEl.getBoundingClientRect().width / 2 + 6,
+      (this.laneEl?.clientWidth ?? 0) / 2);
+    this.snapHintEl.style.left = `clamp(${half}px, ${this.pct(frame)}, calc(100% - ${half}px))`;
   }
 
   /** Arrow keys on a focused block: a frame, or a second with shift. The same
@@ -622,6 +700,12 @@ export class SoundLane {
   // ---- render --------------------------------------------------------------
 
   render() {
+    if (this.destroyed) return this.host;
+    // Owner rebuilds cancel captured gestures rather than committing a drag.
+    this.cancelDrag?.();
+    this.view?.destroy();
+    if (this.waveFrame !== null) cancelAnimationFrame(this.waveFrame);
+    this.waveFrame = null;
     this.syncSnaps();
     const piece = this.piece;
     const windows = S.passWindows(piece);
@@ -632,6 +716,11 @@ export class SoundLane {
     this.nodes.clear();
 
     this.snapEl = el("div", { class: "mmc-snd-snap" });
+    this.snapLabelEl = el("span", { class: "mmc-snd-snap-labels" });
+    this.snapTimeEl = el("span", { class: "mmc-snd-snap-time" });
+    this.snapHintEl = el("div", {
+      class: "mmc-snd-snap-hint", role: "status", "aria-atomic": "true",
+    }, [this.snapLabelEl, this.snapTimeEl]);
     this.gapsEl = el("div", { class: "mmc-snd-gaps" });
     // Where the pointer is asked to look while a shot in the reel is hovered.
     // One element moved rather than a wash per pass, because only ever one of
@@ -662,51 +751,53 @@ export class SoundLane {
         ? [el("div", { class: "mmc-snd-refs" }, refs.map((entry) => this.renderPinned(entry)))]
         : []),
       this.snapEl,
+      this.snapHintEl,
       this.renderRead(),
     ]);
 
-    this.host.replaceChildren(
-      el("div", { class: "mmc-snd-head" }, [
-        el("span", { class: "mmc-snd-name", text: t("Sound") }),
-        el("span", {
-          class: "mmc-snd-hint",
-          text: blocks.length
-            ? t("{n} on the lane · {length}", {
-                n: t("{count} tracks", { count: blocks.length }),
-                length: t("{s} s of {total} s covered", {
-                  s: this.seconds(blocks.reduce((n, b) => n + b.frames, 0)).toFixed(1),
-                  total: this.seconds(total).toFixed(1),
-                }),
-              })
-            // The empty state is an invitation and says what laying one down
-            // does, because what it does is the non-obvious part: the picture is
-            // generated against the sound, not laid over it afterwards.
-            : t("Every shot writes its own sound. Lay a track down and the picture is "
-              + "generated against it instead."),
-        }),
-        // What the lane can be done to, where the doing is: the affordances are
-        // drawn on the blocks, and this is the one line that names them. Only
-        // when there is something to drag — on an empty lane the invitation
-        // above is the whole message.
-        ...(blocks.length
-          ? [el("span", { class: "mmc-snd-how",
-                          text: t("Drag to move · an end to trim · ✕ to take off") })]
-          : []),
-        // No icon, matching the strip's own inline ghosts ("Split"): in this
-        // pack an icon means the rail, where a tool is a thing you reach for,
-        // and a button sitting in a header is a sentence you finish.
-        el("button", {
-          class: "mmc-ghost mmc-snd-add",
-          text: t("Add track"),
-          title: t("Add a track to the lane. It becomes the piece's own sound for as long "
-                 + "as it runs, and the shots under it are generated against it."),
-          onclick: () => this.add(),
-        }),
+    const toolTitle = t("Ctrl+wheel zooms at the cursor. With Zoom tool on, drag left or right to zoom without editing tracks. Escape turns the tool off.");
+    this.zoomTool = el("button", {
+      class: "mmc-ghost mmc-tl-header-action mmc-snd-zoom-tool", type: "button", text: t("Zoom tool"),
+      title: toolTitle, "aria-pressed": this.viewState.tool,
+      onclick: () => this.view?.tool(!this.viewState.tool),
+    });
+    this.zoomRead = el("span", { class: "mmc-snd-zoom-read", text: `${Math.round(this.viewState.zoom * 100)}%` });
+    this.disclosure.setActions(
+      el("button", { class: "mmc-ghost mmc-tl-header-action mmc-snd-add", type: "button", text: t("Add track"),
+        title: t("Add a track to the lane. It becomes the piece's own sound for as long "
+          + "as it runs, and the shots under it are generated against it."),
+        onclick: () => this.add() }),
+      this.zoomTool,
+      el("div", { class: "mmc-snd-zoom-controls" }, [
+        el("button", { class: "mmc-ghost mmc-tl-header-action", type: "button", text: "−", title: t("Zoom out"),
+          "aria-label": t("Zoom out"), onclick: () => this.view?.by(.8) }),
+        this.zoomRead,
+        el("button", { class: "mmc-ghost mmc-tl-header-action", type: "button", text: "+", title: t("Zoom in"),
+          "aria-label": t("Zoom in"), onclick: () => this.view?.by(1.25) }),
+        el("button", { class: "mmc-ghost mmc-tl-header-action", type: "button", text: t("Fit"),
+          onclick: () => this.view?.fit() }),
       ]),
-      this.renderReel(windows),
-      this.laneEl,
-      this.renderRuler(),
     );
+    this.rulerEl = this.renderRuler();
+    const axis = el("div", { class: "mmc-snd-axis" }, [this.renderReel(windows), this.laneEl, this.rulerEl]);
+    const viewport = el("div", {
+      class: `mmc-snd-viewport${this.viewState.tool ? " zoom-tool" : ""}`,
+      tabIndex: 0, role: "region", "aria-label": t("Sound timeline zoom"), "data-capture-wheel": "true",
+    }, [axis]);
+    this.contentEl.replaceChildren(viewport);
+    this.view = new SoundView({ viewport, axis, state: this.viewState, keyboardHost: this.host,
+      isBusy: () => Boolean(this.working), cancelEdit: () => this.cancelDrag?.(),
+      onModeChange: (on) => this.zoomTool?.setAttribute("aria-pressed", String(on)),
+      onChange: (zoom) => {
+        this.zoomRead.textContent = `${Math.round(zoom * 100)}%`;
+        const next = this.renderRuler(); this.rulerEl.replaceWith(next); this.rulerEl = next;
+        if (this.waveFrame !== null) return;
+        this.waveFrame = requestAnimationFrame(() => {
+          this.waveFrame = null;
+          if (!this.destroyed) this.paintWaves();
+        });
+      },
+    });
     this.paintGaps(blocks);
     this.paintWaves();
     return this.host;
@@ -768,7 +859,7 @@ export class SoundLane {
    */
   renderRuler() {
     const span = this.seconds(this.total());
-    const step = TICKS.find((size) => span / size <= 12) ?? 900;
+    const step = TICKS.find((size) => span / Math.max(1, this.viewState.zoom) / size <= 12) ?? 900;
     const marks = [];
     for (let at = 0; at < span - step / 2; at += step) marks.push(at);
     return el("div", { class: "mmc-snd-ruler" }, [
@@ -988,7 +1079,27 @@ export class SoundLane {
   }
 
   destroy() {
+    this.destroyed = true;
+    this.cancelInteractions();
+    this.view?.destroy();
+    if (this.waveFrame !== null) cancelAnimationFrame(this.waveFrame);
+    this.waveFrame = null;
     this.waves.clear();
     this.nodes.clear();
+  }
+
+  cancelInteractions() {
+    this.view?.cancel();
+    this.cancelDrag?.();
+  }
+
+  /** Overlay Escape runs in document capture before the Sound host listener. */
+  dismissZoomTool() {
+    if (!this.viewState.tool) return false;
+    this.view?.tool(false);
+    this.viewState.tool = false;
+    this.cancelInteractions();
+    this.zoomTool?.setAttribute("aria-pressed", "false");
+    return true;
   }
 }

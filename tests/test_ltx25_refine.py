@@ -144,8 +144,9 @@ check("the contract is the last thing read, after the example",
 check("a language other than English reaches the prose and the dialogue",
       "Write all descriptive prose, dialogue and lyrics in Japanese"
       in refine.system_prompt("T2V", "Japanese"), True)
-check("...and English says nothing at all",
-      "LANGUAGE" in refine.system_prompt("T2V", "English"), False)
+check("English is explicit for requests written in another language",
+      "Write all descriptive prose, dialogue and lyrics in English"
+      in refine.system_prompt("T2V", "English"), True)
 
 # The user's own added instructions land in the same place here as in H3's:
 # after the family's craft, before the reply contract.

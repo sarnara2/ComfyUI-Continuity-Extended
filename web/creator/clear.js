@@ -24,25 +24,40 @@ const ARM_MS = 5000;
  *   still as it was dropped disables the tool rather than offering to empty
  *   what is already empty.
  * @param {() => void} spec.run   empty the piece and commit.
+ * @param {boolean} [spec.compact=false] header pill, with an independent icon
+ *   class so rail/fullscreen tile sizing cannot leak into section controls.
  */
-export function clearButton({ written, run, what = null }) {
+export function clearButton({ written, run, what = null, getOwner = null, getValue = null, compact = false }) {
   let armed = null;   // the disarm callback while armed, null while idle
+  let snapshot = null;
+  const stamp = () => getValue ? JSON.stringify(getValue()) : null;
 
   const label = el("span", { text: t("Clear") });
   const button = el("button", {
-    class: "mmc-tool mmc-tool-danger",
+    class: compact ? "mmc-pill mmc-clear-compact" : "mmc-tool mmc-tool-danger",
+    type: "button",
     disabled: written ? undefined : true,
     title: written
       ? (what ?? t("Empty the prompts, the cast, the references and the shots — everything you wrote "
         + "for this scene. The weights, the LoRAs, the canvas and the sampler stay as they are."))
       : t("Nothing written yet."),
+    onkeydown: (event) => {
+      if (event.repeat && ["Enter", " "].includes(event.key)) event.preventDefault();
+    },
     onclick: () => {
-      if (armed) { armed(); run(); return; }
+      if (armed) {
+        const valid = (!snapshot.connected || button.isConnected)
+          && (!getOwner || snapshot.owner === getOwner()) && snapshot.value === stamp();
+        disarm();
+        if (valid) run();
+        return;
+      }
       arm();
     },
-  }, [el("span", { class: "mmc-tool-icon" }, [icon("eraser")]), label]);
+  }, [el("span", { class: compact ? "mmc-clear-icon" : "mmc-tool-icon" }, [icon("eraser")]), label]);
 
   function arm() {
+    snapshot = { owner: getOwner?.(), value: stamp(), connected: button.isConnected };
     label.textContent = t("Really clear?");
     button.classList.add("armed");
     // Also what takes the two listeners below off a button the rail has already
@@ -53,15 +68,21 @@ export function clearButton({ written, run, what = null }) {
     // exception — it is the second press, and it is what arming is waiting for.
     const elsewhere = (event) => { if (!button.contains(event.target)) disarm(); };
     const escape = (event) => { if (event.key === "Escape") disarm(); };
+    const focus = (event) => { if (!button.contains(event.relatedTarget)) disarm(); };
     document.addEventListener("pointerdown", elsewhere, true);
     document.addEventListener("keydown", escape, true);
+    button.addEventListener("focusout", focus);
     armed = () => {
       clearTimeout(timer);
       document.removeEventListener("pointerdown", elsewhere, true);
       document.removeEventListener("keydown", escape, true);
+      button.removeEventListener("focusout", focus);
       armed = null;
+      snapshot = null;
     };
   }
+
+  button.cancelClear = disarm;
 
   function disarm() {
     armed?.();

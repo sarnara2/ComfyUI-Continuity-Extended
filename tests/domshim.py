@@ -54,6 +54,7 @@ class Node {
     if (k.startsWith("data-")) this.dataset[k.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v;
   }
   getAttribute(k) { return this.attrs[k]; }
+  hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k); }
   removeAttribute(k) { delete this.attrs[k]; }
   addEventListener(t, fn) { (this.listeners[t] ??= []).push(fn); }
   removeEventListener() {}
@@ -69,6 +70,24 @@ class Node {
     this.children.push(c); c.parent = this; return c;
   }
   append(...c) { c.forEach((x) => this.appendChild(x)); }
+  prepend(...nodes) {
+    for (const node of [...nodes].reverse()) {
+      node.remove();
+      this.children.unshift(node);
+      node.parent = this;
+    }
+  }
+  after(...nodes) {
+    if (!this.parent) return;
+    const parent = this.parent;
+    let previous = this;
+    for (const node of nodes) {
+      node.remove();
+      parent.children.splice(parent.children.indexOf(previous) + 1, 0, node);
+      node.parent = parent;
+      previous = node;
+    }
+  }
   // The old children are detached, as a real one detaches them: `isConnected`
   // is read off the parent chain, and a node left pointing at its former parent
   // would answer that it is still in the document.
@@ -103,8 +122,9 @@ class Node {
   // A drag takes the pointer so it keeps arriving here once it has left the
   // element. Nothing to emulate — the tests deliver the moves themselves — but
   // the call is real and an element without it throws on pointerdown.
-  setPointerCapture() {}
-  releasePointerCapture() {}
+  setPointerCapture(id) { (this.pointerCaptures ??= new Set()).add(id); }
+  hasPointerCapture(id) { return this.pointerCaptures?.has(id) ?? false; }
+  releasePointerCapture(id) { this.pointerCaptures?.delete(id); }
   cloneNode() { return new Node(this.tagName); }
   remove() {
     if (!this.parent) return;
@@ -300,6 +320,31 @@ globalThis.ResizeObserver = class {
   constructor(fn) { this.fn = fn; globalThis.__observers.push(this); }
   observe() {} unobserve() {} disconnect() { this.dead = true; }
   fire() { if (!this.dead) this.fn([]); }
+};
+// Mutation observers are recorded separately: old resize/intersection tests
+// address __observers by index. This shim has no browser mutation delivery or
+// layout engine; a test queues records explicitly or fires a callback by hand.
+globalThis.__mutationObservers = [];
+globalThis.MutationObserver = class {
+  constructor(fn) {
+    this.fn = fn; this.targets = new Map(); this.records = []; this.dead = false;
+    globalThis.__mutationObservers.push(this);
+  }
+  observe(target, options = {}) {
+    if (!target || !(options.childList || options.attributes || options.characterData)) {
+      throw new TypeError("MutationObserver.observe needs a target and mutation kind");
+    }
+    this.dead = false;
+    this.targets.set(target, { ...options,
+      ...(options.attributeFilter ? { attributeFilter: [...options.attributeFilter] } : {}) });
+  }
+  disconnect() { this.dead = true; this.targets.clear(); this.records.length = 0; }
+  takeRecords() { return this.records.splice(0); }
+  fire(records = []) {
+    if (this.dead) return;
+    this.records.push(...records);
+    this.fn(this.takeRecords(), this);
+  }
 };
 // The LoRA grid hands a card's showcase clip a src only once it nears the
 // viewport: a folder of hundreds each opening a connection at once is the

@@ -2092,6 +2092,9 @@ def take(seconds=6.0, **fields):
 
 
 untouched = strip(shot("one"), shot("two"), shot("three"))
+# Perform the approved one-time Face-schema migration before testing the
+# existing hold-free renderer's identity contract on a current piece.
+untouched = compiler.as_piece(untouched)
 check("a strip with no holds is handed straight back",
       compiler.rendered_piece(untouched) is compiler.as_piece(untouched), True)
 
@@ -2164,6 +2167,7 @@ expect_error("a take that does not say how long it is",
 # One pass over the whole strip: a hold there holds the generation, because
 # there is only one and no half of it to hold.
 single = strip(shot("one"), shot("two"), render="single")
+single = compiler.as_piece(single)
 check("a one-pass strip with no holds is unchanged",
       compiler.rendered_piece(single) is compiler.as_piece(single), True)
 single_held = strip(shot("one", hold=True, take=take(seconds=12.0)),

@@ -313,6 +313,88 @@ export function rememberStillWeights(family, side) {
   patchSettings({ weights: { [family]: block } });
 }
 
+/** Read a long filename without making its button or settings row move.
+ *  Only presentation is owned here: the original buttons, labels and choice
+ *  callbacks stay mounted. Dispose before repainting and when the menu closes. */
+function mountWeightMarquees(container) {
+  const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const entries = [...container.querySelectorAll(".mmc-weight-file")].map((button) => {
+    const text = button.textContent;
+    const hint = button.title;
+    const label = el("span", { class: "mmc-weight-file-label", text });
+    button.replaceChildren(label);
+    // The complete filename remains readable without waiting for motion;
+    // retain the original model/route help after it rather than replacing it.
+    button.title = text + (hint ? `\n\n${hint}` : "");
+    const entry = { button, label, animation: null, distance: -1 };
+    const scroll = (event) => {
+      if (!media.matches || entry.distance <= 1) return;
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      if (event.key === "Home") button.scrollLeft = 0;
+      else if (event.key === "End") button.scrollLeft = button.scrollWidth;
+      else button.scrollLeft += event.key === "ArrowRight" ? 40 : -40;
+    };
+    button.addEventListener("keydown", scroll);
+    entry.scroll = scroll;
+    return entry;
+  });
+  let closed = false;
+  let pending = 0;
+  const measure = () => {
+    pending = 0;
+    if (closed) return;
+    for (const entry of entries) {
+      const { button, label } = entry;
+      const style = getComputedStyle(button);
+      const room = Math.max(0, button.clientWidth
+        - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0));
+      const distance = Math.max(0, label.getBoundingClientRect().width - room);
+      const animate = !media.matches && distance > 1;
+      if (Math.abs(distance - entry.distance) < .5 && !!entry.animation === animate) continue;
+      entry.animation?.cancel();
+      entry.animation = null;
+      entry.distance = distance;
+      button.classList.toggle("mmc-weight-marquee", distance > 1);
+      button.scrollLeft = 0;
+      if (!animate) continue;
+      // 28 px/s in both directions, with one second to read each end. The
+      // duration follows actual overflow distance, not filename length.
+      const hold = 1000;
+      const travel = distance / 28 * 1000;
+      const duration = travel * 2 + hold * 2;
+      entry.animation = label.animate([
+        { transform: "translateX(0px)", offset: 0 },
+        { transform: "translateX(0px)", offset: hold / duration },
+        { transform: `translateX(${-distance}px)`, offset: (hold + travel) / duration },
+        { transform: `translateX(${-distance}px)`, offset: (hold * 2 + travel) / duration },
+        { transform: "translateX(0px)", offset: 1 },
+      ], { duration, iterations: Infinity, easing: "linear" });
+    }
+  };
+  const schedule = () => {
+    if (!closed && !pending) pending = requestAnimationFrame(measure);
+  };
+  const observer = new ResizeObserver(schedule);
+  for (const { button, label } of entries) {
+    observer.observe(button);
+    observer.observe(label);
+  }
+  media.addEventListener("change", schedule);
+  measure();
+  return () => {
+    if (closed) return;
+    closed = true;
+    cancelAnimationFrame(pending);
+    observer.disconnect();
+    media.removeEventListener("change", schedule);
+    for (const { button, animation, scroll } of entries) {
+      animation?.cancel();
+      button.removeEventListener("keydown", scroll);
+    }
+  };
+}
+
 /**
  * A row per file, each opening the list for its folder.
  *
@@ -323,6 +405,7 @@ export function rememberStillWeights(family, side) {
 export function openWeightsPopover(anchor, { piece, models, checkpoints, onChange, turbo, face = false }) {
   const pop = el("div", { class: "mmc-pop mmc-weights-pop" });
   const body = el("div");
+  let disposeMarquees = () => {};
 
   // Every list, label and hint below is this family's. Read once, at the top:
   // the popover is rebuilt in place after each pick, and the family cannot
@@ -352,6 +435,7 @@ export function openWeightsPopover(anchor, { piece, models, checkpoints, onChang
     S.routedCheckpoints(models, checkpoints), face, family));
 
   const render = () => {
+    disposeMarquees();
     const files = catalogFiles();
     const devices = catalogDevices();
 
@@ -597,13 +681,14 @@ export function openWeightsPopover(anchor, { piece, models, checkpoints, onChang
 
     body.replaceChildren(...(routeRow ? [routeRow] : []),
                          ...(rayRow ? [rayRow] : []), ...rows);
+    disposeMarquees = mountWeightMarquees(body);
   };
 
   pop.append(el("div", { class: "mmc-pop-title", text: t("Weights") }), body);
   render();
   document.body.appendChild(pop);
   placeNear(pop, anchor);
-  dismissable(pop);
+  dismissable(pop, () => disposeMarquees());
 
   // The catalog may not have arrived yet on a freshly loaded page. Re-render
   // rather than block: the rows are meaningful without it — they say what is

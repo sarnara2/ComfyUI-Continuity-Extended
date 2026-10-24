@@ -1,39 +1,269 @@
 # Changelog
 
+## Extended integration — 2026-10-24
+
+Combine the accumulated local Extended improvements with the existing fork
+main and upstream remote-refiner timeout repair `3146741`. Retain scoped field
+and whole-segment refinement, owner locks and confirmation, optional Faithful
+Beta, sheet controls, per-card settings and the current picker/timeline UI.
+Segment modal reopen keeps in-flight progress and completed text; workflow return
+restores its own rendering progress and latest preview.
+
+Remote refine/chat replies use an immediate receipt and recover missed socket
+answers from a bounded RAM result store without repeating model work. Temporary
+same-page disconnection is covered; full reload/server restart recovery is not.
+Existing local GPU queue and direct-result compatibility remain intact.
+
+Retain Extended display/package identity, existing node IDs, serialized fields,
+licenses and credits. The older local-only entries below remain historical
+milestones and are included by this integration where their contracts still apply.
+Verification uses isolated source/DOM, fake-server/model/queue and browser mocks;
+no new real-provider or GPU-render proof is claimed.
+
+## Extended local Face/folder/facts usability — 2026-10-10 (not published)
+
+Face pass is owned by each generated card, with the original options in its
+stable outline pill. Outer global controls are removed. New/duplicated cards
+start OFF; old-format cards migrate OFF once, while saved new-format choices
+survive reopening. Merged generations must still agree on Face pass settings.
+Final render Face shape and neural/DLSS runtime are unchanged.
+
+The shared media picker browses added folders hierarchically with direct child
+folders and breadcrumb/up/root navigation, and offers large/small thumbnails or
+Details. View/location and purpose/tab-scoped pending file checks are remembered.
+Fresh file/kind/capacity checks precede restoration; explicit Add/Done remains
+required. No old edit recipe is restored and seeded sheet panels take priority.
+Legacy omitted-directory recursive API behavior and original import/security
+operations are preserved; the new read-only metadata route loads at the next
+normal ComfyUI restart. No server restart is performed by this update.
+
+The strip summary has separate Full video / New video / Cards pills, with subtle
+vertical dividers. Full video includes minutes/seconds, total seconds and whole
+Timeline FPS/frames; generated cards show their own reference/FPS-frame/duration
+facts with separate dividers. Clip filenames remain unchanged. Cast headers add
+a people-count pill before supporting-image counts. KO/JA/ZH include all 25 new
+strings; pre-existing translations and previously audited gaps remain unchanged.
+
+Sound now uses a remembered disclosure header without the old prose hint. Both
+cursor-anchored Ctrl+wheel and Zoom-tool scrubby drag are available, with a native
+horizontal scrollbar, Fit and keyboard +/- controls. This is visual zoom only:
+audio frame placement, trim/snap math and generation data are unchanged.
+
+Timeline opens edge-to-edge from both normal and existing fullscreen views.
+Global prompt gains a two-press Clear pill before Refine, guarded against stale
+values/owners and running refiners. Cast target-kind/clip controls sit below the
+left replacement label beside closer, aligned inputs. Generated footer order
+is Trim / Crop / Edit, with Edit rightmost; clips keep their existing actions.
+Storyboard text aligns right, and inline ready-video hover help is removed
+without changing accessible labels or playback/volume behavior.
+
+Verification uses isolated browser/temp-tree/fake-request tests and guarded
+local file hashes; this is not live ComfyUI/model/GPU-render proof or publication.
+
+## Extended local LoRA/card/preview usability — 2026-10-10 (not published)
+
+The Timeline LoRA manager now has three full-height tabs: LoRA (loaded), LoRA
+library and Stacks. Loaded cards get a matching native scrollbar; selected
+library files can be deselected with their blue check and loaded card kept in
+sync. Double-click details remain selection-neutral. Pins protect removal and
+show an unpin-first notice, Korean “핀을 먼저 해제해주세요”.
+
+Generated and supplied-clip footers keep right-aligned transport and editing
+rows, with a wider consistent editing pill. The clip soundtrack icon is centred
+and red when active. Card facts/controls do not move as portrait, landscape or
+ultrawide ready previews expand. Segment navigation matches the lock pills;
+One pass keeps a fixed gap below its neighbouring seam controls.
+
+Generated segment cards replace prompt excerpts with one exact character count,
+including whitespace and full Unicode code points; supplied-clip filenames stay
+as before. The remove X alone uses the brighter modified-take warning/red tone,
+without changing its original two-press delete confirmation.
+
+Only the five Timeline disclosure headers get a modest theme-relative surface
+lift to separate them from the background; body/card/button fills stay intact.
+
+Ready preview display now defaults on if no preference exists and remembers the
+last explicit on/off choice across window close or ComfyUI restart in the same
+browser. This display-only memory never enables sound or changes workflow data.
+
+Ready previews default to silent, even on hover. Their sound icon opens a
+vertical 0–100% slider, not a mute toggle. Only deliberate slider input enables
+preview sound; same-file inline/large viewers share session-only volume, while
+a fresh session or replacement/new take starts at 0%. Source/render audio and
+workflow data remain unchanged. No server restart, AI generation, media editing,
+continuous preview, export or repository publication is introduced. See
+EXT-53–61 in the [Extended change record](docs/extended-changes.md).
+
+## Extended local whole-Timeline scrollbar — 2026-10-10 (not published)
+
+The Timeline's existing full-body vertical scroller now shows its native
+right-edge scrollbar, matching the media picker's thin rounded grey rail.
+Space stays reserved as disclosures or ready previews grow. The title/settings
+header remains fixed and the card strip retains its independent horizontal
+scrolling. No new scroll synchronization, callbacks, workflow state, API or
+translation changes. See EXT-52 in the
+[Extended change record](docs/extended-changes.md).
+
+## Extended local header count-group divider — 2026-10-10 (not published)
+
+Timeline reference/cast headers distinguish their action-button group from the
+read-only file-count pills using the existing subtle divider tone. The rule is
+pointer-inert and hidden when compact layout gives counts their own row or no
+actions are present. No labels, file-count calculation, callbacks, disclosure
+state, refiner/API or workflow data change. See EXT-51 in the
+[Extended change record](docs/extended-changes.md).
+
+## Extended local field-only refining — 2026-10-10 (not published)
+
+Plain Refine now owns only its input: node/segment prompt, Timeline global
+prompt, soundscape or music. Compact field buttons replace collapsed prose
+previews; reference/cast counts remain. Refine all keeps the original whole-piece
+request/application/revert path and an explicit Refine all label. The shared
+red Confirm/two-press gate protects both paths. Stale replies do not overwrite
+an edited or closed field, and field requests never fall back to whole-piece
+refining. Existing family, model, language and custom-skill settings still apply.
+Save the workflow, restart ComfyUI and refresh the browser to load the new
+field-only API. No user workflow, generated file or GPU process is changed by
+installation. See EXT-50 in the [Extended change record](docs/extended-changes.md).
+
+## Extended local refine confirmation — 2026-10-10 (not published)
+
+All prompt-refine execution buttons now require two presses, including the node,
+segment editor and timeline Refine all/again controls. The first press shows a
+red Confirm label (확인 in Korean) without sending a rewrite request or changing
+content; the second press of that same control runs the original operation.
+Leaving the control, pressing Escape, changing focus, opening settings or
+removing/rebuilding its owner cancels the pending confirmation. Existing refiner
+settings, progress, rewrite application and revert behavior stay unchanged.
+See EXT-49 in the [Extended change record](docs/extended-changes.md).
+
+## Extended local audio/card/cast alignment — 2026-10-10 (not published)
+
+Soundscape and music bubbles no longer stretch one another when only one is
+expanded. Next-render time, duration and segment/queue facts move to the left
+of their existing row. Card take/motion/face badges align to the right; transport
+controls and edit/cut tools exchange sides, with editing labels matching the
+seed pill's Card font. Cast type and retention controls share top-row pill styling;
+description/replacement inputs stay visibly framed without hovering. Original
+input/operation behavior remains. N/A now requires a red first-press warning and
+second-press confirmation before applying the original field operation and Undo.
+Cast header actions are Add person then the shorter Library label.
+Reference/cast headers show separate file-type counts instead of long instructions.
+Fullscreen moves first with a vertical divider. Cards show an editable Segment/Clip
+name at the top and duration beside reference count; navigation uses the same name.
+Ready preview (준비된 미리보기) expands each playable card in place, with hover-only
+playback, preview-only mute, a seek bar and a larger double-click viewer. Saved
+completed/edited takes work after restart; no continuous-preview or export feature
+is added. Supporting-reference file-role settings are enlarged horizontally and
+vertically while staying within the viewport, without changing role/input actions.
+The cast relationship-marker menu is slightly wider and grows to show all options
+on roomy screens, using internal scrolling only when the viewport needs it.
+See EXT-37–48 in the [Extended change record](docs/extended-changes.md).
+
+## Extended local section header actions — 2026-10-10 (not published)
+
+Timeline sound N/A, reference Add and cast-library/add controls move directly
+after each section title and before its hint. They share compact pill styling
+and even spacing; existing callbacks, conditional availability and independent
+toggle/action behavior are preserved. Default disclosure and main-node/library
+headers are unchanged. See EXT-36 in the [Extended change record](docs/extended-changes.md).
+
+## Extended local cast details and menu readability — 2026-10-10 (not published)
+
+Cast descriptions gain a persistent left title; replacement fields and retention
+markers move directly beneath them. Supporting-reference role menus gain bounded
+read-only media previews and double-click access to the existing larger viewer.
+A matching faded divider separates segment cards from sound. The model/weights
+menu is widened for filenames while remaining within the viewport; long names
+move slowly within a single line instead of wrapping. Existing
+generation, model selection, role, notes and retention semantics are unchanged.
+See EXT-32–35 in the [Extended change record](docs/extended-changes.md).
+
+## Extended local timeline organization — 2026-10-10 (not published)
+
+Shared setting pills move beside the Timeline title with a subtle vertical
+separator. Whole-strip lock/unlock actions move beside Go to segment, retaining
+their original availability and callbacks. Queue facts/warnings remain by the
+cards. Take/motion/face controls use consistent spacing across conditional states.
+See EXT-30/31 in the [Extended change record](docs/extended-changes.md).
+
+## Extended local card/sound controls — 2026-10-10 (not published)
+
+After explicit authorization, the sound magnet moves left of the clip's remove
+button, with an inside-clip fallback for extremely short clips. Delete confirmation
+uses its full visible hit area and temporarily hides neighboring move/clone
+controls. Segment numbers stay yellow as display-only labels; the separate lock
+control is unchanged. See EXT-27 through EXT-29 in the
+[Extended change record](docs/extended-changes.md).
+
+## Extended local view convenience — 2026-10-10 (not published)
+
+The larger handle replacement picker adds read-only image/video/audio thumbnail
+previews. Segment navigation uses a rounded keyboard-accessible menu. Library
+view memory restores compatible tabs/folders/display sorting/filters, never files
+or generation settings. Generated-card take/motion/face status stays on one row;
+Edit is its explicit editor entry. See EXT-22 through EXT-26 in the
+[Extended change record](docs/extended-changes.md).
+
+## Extended local card layout — 2026-10-10 (not published)
+
+Generated segment cards group Edit, Trim and Crop in one rounded outer pill,
+keeping Crop immediately after Trim when a take is available. Motion-fix status
+uses the same pill language without changing its toggle. Clip cards and the
+existing ordering/clone/delete actions stay unchanged. See EXT-21 in the
+[Extended change record](docs/extended-changes.md).
+
+## Extended local LoRA manager — 2026-10-09 (not published)
+
+One timeline LoRAs tab now groups the added/editable configuration above an
+add-only library. Saved Stacks remain available. The inline timeline LoRA rail
+is hidden while its pill, counts and pin initialization remain. Existing LoRA
+settings and generation behavior are preserved. See EXT-16 in the
+[Extended change record](docs/extended-changes.md) for integration contracts and
+verification limits.
+
+## Extended local toolbar — 2026-10-09 (not published)
+
+The main strip node moves Fullscreen and Pre-stage to its existing top tool rail,
+and adds a Tools shortcut to the existing fullscreen dashboard. Only its bottom
+Edit timeline button is removed; prompt/strip access stays available. Other
+editor rails, capabilities and generation settings stay unchanged. See EXT-17
+in the [Extended change record](docs/extended-changes.md).
+
+## Extended local timeline layout — 2026-10-09 (not published)
+
+Foldable timeline sections now use one rounded outer container with subtle
+separators. Go to segment moves to its own row immediately above the cards.
+Segment continuation/frame and duration pills align horizontally, keeping the
+reference/match facts below. Folding, navigation and duration calculations stay
+unchanged. See EXT-18 through EXT-20 in the
+[Extended change record](docs/extended-changes.md).
+
+## Extended local UI update — 2026-10-09 (not published)
+
+Collapsed input summaries, numbered segment navigation, media display sorting
+and Shift selection, existing file info, clearer focus/scrolling, field-only N/A
+Undo and reference/match duration readouts. Existing sound snapping now labels
+segment start/end boundaries with precise time and frame; snapping math stays
+unchanged. No generation/audio/schema changes. See the
+[Extended change record](docs/extended-changes.md) for contracts, prior fork
+history and isolated-test limitations. Save and refresh the browser when safe;
+this frontend-only revision needs no backend restart.
+
 Back by request. Every entry opens with a line saying what changed; the
 paragraph under it says how and why, and from 3.0 down that paragraph is kept
 exactly as it was written, wall of text and all.
 
 ## Unreleased
 
-### Extended fork — 2026-10-08
-
-**Timeline and media-picker usability updates for this personal fork.** The five
-timeline sections remember their disclosure state in workflow properties. Queued
-renders share a batch-wide elapsed clock while each result keeps its own render
-span, with one stage for normal and fullscreen views. Media imports can choose
-supported roles and encoding sizes per file or in a batch. Piece-reference
-thumbnails preview on double-click and their handles open file replacement without
-rewriting prompt citations. Soundscape/music headings have `N/A` buttons, and individual
-sound clips have optional boundary snapping that accounts for delivered segments.
-
-The shared picker now has saved external folder shortcuts, horizontal scrolling,
-tab-specific media filtering and selected-folder refresh. Previously observed
-built-in folder pills stay visible while an external folder is selected. Only
-selected/touched external files are copied into managed media roots; removing a
-shortcut does not delete original files or already imported copies. The Windows
-folder chooser uses the larger Explorer-style dialog and raises its own visible
-window above other windows instead of relying only on an invisible owner.
-
-Existing prompt-handle replacement and Extended branding are retained. The
-cancelled workflow-tab preview cache is not added, and there is no new automatic
-source-audio copy feature. Regression checks cover source syntax, isolated browser
-interactions, real temporary-folder operations and API handlers. Actual native
-dialog foreground placement after restart remains a user desktop verification;
-this update does not claim a new GPU-render test.
-
-The [Extended change record](docs/extended-changes.md) maps feature IDs to source
-owners, saved-state contracts and regression checks for future upstream integration.
+**A remote refine or chat turn longer than a minute no longer comes back as
+"Fetch timeout" (issue #120).** The remote backend used to answer inside the
+request that asked, and frontend 1.55 aborts any request after 60 seconds, as a
+reverse proxy in front of ComfyUI would anyway: the browser hung up, the
+server finished regardless, and the rewrite went nowhere. The remote refine,
+chat turn and chat re-caption now reply with an id at once and send the result
+over the websocket when it is ready, the way a queued job's arrives, still
+without waiting behind a render on the local GPU.
 
 **Screens: a picture or clip put on a phone, tablet, laptop or TV in the shot,
 with its text as sharp as the file.** A shot can carry up to two screens, each

@@ -73,6 +73,7 @@ export const api = {
 CHECK = r"""
 const S = await import("./web/creator/state.js");
 const P = await import("./web/creator/presets.js");
+const { t } = await import("./web/creator/i18n.js");
 
 const out = { errors: [] };
 
@@ -697,8 +698,13 @@ try {
   // from it, and saying "no node" would be a lie about a workflow that has one.
   attempt("wrongKind", RENDER_META, { path: "x.png [output]", name: "x.png", kind: "image" });
   out.renderRefusals = reasons;
-  out.everyRenderRefusalExplained = Object.values(reasons)
-    .every((why) => typeof why === "string" && why.length > 24);
+  const expected = {
+    bare: t("That render carries no workflow — it was saved with metadata disabled, or written by something else."),
+    foreign: t("That render was not made by these nodes."),
+    wrongKind: t("That render's workflow holds no node that could have made a {kind}.", { kind: t("image") }),
+  };
+  out.everyRenderRefusalExplained = Object.entries(expected)
+    .every(([key, why]) => typeof why === "string" && why.trim() && reasons[key] === why);
 } catch (error) {
   out.errors.push(`renderRefusals: ${error.stack}`);
 }

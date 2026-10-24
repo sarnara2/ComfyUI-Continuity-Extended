@@ -40,7 +40,7 @@ export const css = `
 /* padding-bottom clears the floating Add/Cancel bar, which is positioned over
    the grid — without it the last row sits underneath and cannot be clicked. */
 .mmc-grid {
-  flex: 1; overflow-y: auto; padding: 4px 24px 96px;
+  flex: 1; min-height: 0; overflow-y: auto; padding: 4px 24px 96px;
   display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 14px;
   align-content: start;
   /* The grid is a flex child with a definite height, and implicit auto rows in
@@ -83,7 +83,42 @@ export const css = `
   background: var(--mmc-surface); border: 2px solid transparent; cursor: pointer;
 }
 .mmc-cell[aria-selected="true"] { border-color: var(--mmc-strong); }
-.mmc-cell:focus-visible { outline: none; border-color: var(--mmc-edge-2); }
+.mmc-cell:hover:not([aria-selected="true"]) { border-color: var(--mmc-edge); }
+.mmc-cell:focus-visible, .mmc-cell:has(:focus-visible) {
+  outline: 2px solid var(--mmc-accent); outline-offset: 2px;
+}
+/* Focus keeps a ring of its own: it must not erase the selection border/check.
+   Only the pack's scrollable grids and choice popovers override hidden bars. */
+.mmc-modal .mmc-grid, body > .mmc-pop, .mmc-pop .mmc-pop-scroll,
+.mmc-overlay .mmc-handle-list, .mmc-pop .mmc-handle-list, .mmc-modal .mmc-move-menu {
+  scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+}
+.mmc-modal .mmc-grid::-webkit-scrollbar, body > .mmc-pop::-webkit-scrollbar,
+.mmc-pop .mmc-pop-scroll::-webkit-scrollbar, .mmc-overlay .mmc-handle-list::-webkit-scrollbar,
+.mmc-pop .mmc-handle-list::-webkit-scrollbar, .mmc-modal .mmc-move-menu::-webkit-scrollbar { display: block; width: 6px; height: 6px; }
+.mmc-modal .mmc-grid::-webkit-scrollbar-thumb, body > .mmc-pop::-webkit-scrollbar-thumb,
+.mmc-pop .mmc-pop-scroll::-webkit-scrollbar-thumb, .mmc-overlay .mmc-handle-list::-webkit-scrollbar-thumb,
+.mmc-pop .mmc-handle-list::-webkit-scrollbar-thumb, .mmc-modal .mmc-move-menu::-webkit-scrollbar-thumb { background: var(--mmc-line-3); border-radius: 3px; }
+.mmc-modal .mmc-grid::-webkit-scrollbar-track, body > .mmc-pop::-webkit-scrollbar-track,
+.mmc-pop .mmc-pop-scroll::-webkit-scrollbar-track, .mmc-overlay .mmc-handle-list::-webkit-scrollbar-track,
+.mmc-pop .mmc-handle-list::-webkit-scrollbar-track, .mmc-modal .mmc-move-menu::-webkit-scrollbar-track { background: transparent; }
+/* File facts float beside the current tile, not in every thumbnail. Mouse and
+   keyboard read the same existing metadata, and the panel never catches clicks. */
+.mmc-file-info {
+  position: absolute; z-index: 8; pointer-events: none;
+  box-sizing: border-box; width: 320px; max-width: calc(100% - 16px);
+  max-height: calc(100% - 16px); overflow: hidden;
+  padding: 12px 14px; border: 1px solid var(--mmc-line-3); border-radius: 12px;
+  background: var(--mmc-surface); color: var(--mmc-text);
+  box-shadow: 0 12px 32px var(--mmc-shadow-soft);
+  font-size: calc(12px * var(--mmc-type)); line-height: 1.45;
+}
+.mmc-file-info[hidden] { display: none; }
+.mmc-file-info-name { color: var(--mmc-strong); font-weight: 500; overflow-wrap: anywhere; }
+.mmc-file-info dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 8px 0; }
+.mmc-file-info dt { color: var(--mmc-dim); }
+.mmc-file-info dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.mmc-file-info-hint { color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); }
 .mmc-cell img, .mmc-cell video, .mmc-cell-fallback {
   position: absolute; inset: 0; width: 100%; height: 100%; box-sizing: border-box;
 }
@@ -174,6 +209,15 @@ export const css = `
 
 /* The trail. It never scrolls away — leaving a folder is one click from any
    depth — so it takes only the width it needs and truncates the long names. */
+.mmc-picker-sort-control { flex: none; display: flex; align-items: center; max-width: 175px; }
+.mmc-picker-sort {
+  height: calc(30px * var(--mmc-type)); max-width: 100%; min-width: 0;
+  padding: 0 8px; border: 1px solid var(--mmc-line); border-radius: 10px;
+  background: var(--mmc-surface); color: var(--mmc-dim); font-family: inherit;
+  font-size: calc(12px * var(--mmc-type)); cursor: pointer;
+}
+.mmc-picker-sort:hover { color: var(--mmc-text); border-color: var(--mmc-line-3); }
+.mmc-picker-sort:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: 2px; }
 .mmc-crumbs { display: flex; align-items: center; gap: 1px; flex: 0 1 auto; min-width: 0; max-width: 45%; }
 .mmc-crumb {
   display: block; max-width: calc(130px * var(--mmc-type)); padding: 0 8px; height: calc(28px * var(--mmc-type)); flex: 0 1 auto;
@@ -252,6 +296,175 @@ export const css = `
   padding: 2px 8px; border-radius: 8px; background: var(--mmc-scrim-2);
   color: var(--mmc-text); font-size: calc(10px * var(--mmc-type)); pointer-events: none;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* One picker, three views: actions stay on the original cells in every mode. */
+.mmc-picker-view-modes {
+  display: flex; flex: none; align-items: center; gap: 2px; padding: 3px;
+  border: 1px solid var(--mmc-line); border-radius: 18px; background: var(--mmc-surface);
+}
+.mmc-picker-view-opt {
+  height: calc(28px * var(--mmc-type)); padding: 0 9px; border: 0; border-radius: 15px;
+  background: none; color: var(--mmc-dim); font-family: inherit;
+  font-size: calc(11px * var(--mmc-type)); white-space: nowrap; cursor: pointer;
+}
+.mmc-picker-view-opt:hover { color: var(--mmc-text); background: var(--mmc-surface-2); }
+.mmc-picker-view-opt[aria-pressed="true"] { color: var(--mmc-strong); background: var(--mmc-surface-3); }
+.mmc-picker-view-opt:focus-visible, .mmc-picker-folder:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 2px;
+}
+/* Long translated tools can wrap even when the viewport is wide but the
+   modal is only 1100px. Bottom actions and page controls never cover cells. */
+.mmc-picker .mmc-modal-bar { flex-wrap: wrap; }
+.mmc-picker .mmc-modal-foot {
+  position: static; flex: none; margin: 8px 24px 12px; min-width: 0; max-width: none;
+  flex-wrap: wrap; gap: 8px; box-sizing: border-box; max-height: 28vh; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+}
+.mmc-picker .mmc-pager {
+  position: static; flex: none; align-self: flex-start; margin: 6px 24px 0;
+  min-width: 0; max-width: calc(100% - 48px); overflow-x: auto;
+  scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+}
+.mmc-picker .mmc-pager > * { flex: none; }
+.mmc-picker.mmc-modal .mmc-grid { padding-bottom: 18px; }
+.mmc-picker-directory-bar {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  padding: 0 24px 12px; overflow-x: auto; flex: none;
+  scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+}
+.mmc-picker-directory-bar[hidden] { display: none; }
+.mmc-picker-directory-bar button {
+  flex: none; max-width: calc(220px * var(--mmc-type)); height: calc(30px * var(--mmc-type));
+  padding: 0 10px; border: 1px solid var(--mmc-line); border-radius: 15px;
+  background: var(--mmc-surface-2); color: var(--mmc-text); font-family: inherit;
+  font-size: calc(12px * var(--mmc-type)); cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mmc-picker-directory-bar button:disabled { opacity: .4; cursor: default; }
+.mmc-picker-directory-bar button[aria-current="location"] { border-color: var(--mmc-line-3); font-weight: 500; }
+.mmc-picker-folder {
+  display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px;
+  aspect-ratio: 1; min-width: 0; padding: 12px; border: 1px solid var(--mmc-line);
+  border-radius: 12px; background: var(--mmc-surface-2); color: var(--mmc-text);
+  font-family: inherit; font-size: calc(12px * var(--mmc-type)); cursor: pointer;
+}
+.mmc-picker-folder svg { flex: none; width: 32px; height: 32px; color: var(--mmc-accent); }
+.mmc-picker-folder span { max-width: 100%; overflow-wrap: anywhere; }
+.mmc-picker-folder:hover { background: var(--mmc-surface-3); border-color: var(--mmc-line-3); }
+.mmc-picker-view-small .mmc-grid { grid-template-columns: repeat(auto-fill, minmax(calc(112px * var(--mmc-type)), 1fr)); gap: 10px; }
+.mmc-picker-view-small .mmc-cell-reference { flex-wrap: nowrap; bottom: 24px; }
+.mmc-picker-view-small .mmc-cell-reference .mmc-reference-field { flex: 1; min-width: 0; }
+.mmc-picker-view-small .mmc-cell-reference .mmc-reference-field[name="ref_size"] { flex: 0 0 calc(44px * var(--mmc-type)); }
+.mmc-picker-view-details .mmc-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.mmc-picker-view-details .mmc-picker-folder {
+  aspect-ratio: auto; min-height: calc(48px * var(--mmc-type)); flex-direction: row;
+  justify-content: flex-start; padding: 8px 14px;
+}
+.mmc-picker-view-details .mmc-picker-folder svg { width: 24px; height: 24px; }
+.mmc-picker-view-details .mmc-cell {
+  height: auto; min-height: calc(94px * var(--mmc-type)); padding: 12px 42px 12px 112px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px; overflow: visible;
+}
+.mmc-picker-view-details .mmc-cell > img,
+.mmc-picker-view-details .mmc-cell > video,
+.mmc-picker-view-details .mmc-cell > .mmc-cell-fallback {
+  inset: 12px auto auto 40px; width: 56px; height: 56px; border-radius: 7px;
+}
+.mmc-picker-view-details .mmc-cell-fallback { padding: 4px; }
+.mmc-picker-view-details .mmc-cell-fallback > span { display: none; }
+.mmc-picker-view-details .mmc-check { display: none; }
+.mmc-picker-check {
+  position: absolute; left: 12px; top: 30px; width: 17px; height: 17px;
+  margin: 0; accent-color: var(--mmc-blue); cursor: pointer;
+}
+.mmc-picker-view-details .mmc-cell-name {
+  position: static; flex: 1 1 100%; padding: 0; min-width: 0; background: none;
+  font-size: calc(12px * var(--mmc-type)); font-weight: 500; order: 0;
+}
+.mmc-picker-detail-meta {
+  display: grid; grid-template-columns: repeat(3, auto minmax(0, 1fr)); gap: 3px 8px;
+  flex: 1 1 100%; min-width: 0; margin: 0; order: 1;
+  font-size: calc(10.5px * var(--mmc-type)); line-height: 1.45;
+}
+.mmc-picker-detail-label { color: var(--mmc-dim); }
+.mmc-picker-detail-value { margin: 0; min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.mmc-picker-view-details .mmc-cell-trim,
+.mmc-picker-view-details .mmc-cell-crop,
+.mmc-picker-view-details .mmc-cell-mod,
+.mmc-picker-view-details .mmc-cell-sheet {
+  position: static; display: inline-flex; max-width: 100%; order: 2; min-height: 24px;
+}
+.mmc-picker-view-details .mmc-cell-reference {
+  position: static; order: 3; flex: 1 1 100%; max-width: 100%; background: var(--mmc-surface-2);
+}
+.mmc-picker-view-details .mmc-cell:not([aria-selected="true"]) .mmc-cell-reference { display: none; }
+.mmc-picker-view-details .mmc-cell-reference .mmc-reference-field { flex: 0 1 132px; width: auto; padding: 0 7px; }
+.mmc-picker-view-details .mmc-cell-star,
+.mmc-picker-view-details .mmc-cell[aria-selected="true"] .mmc-cell-star { right: 8px; display: flex; }
+.mmc-picker-view-details .mmc-cell-home { display: none; }
+@media (max-width: 760px) {
+  .mmc-picker .mmc-modal-head { gap: 14px; }
+  .mmc-picker .mmc-modal-head .mmc-tab { flex: none; white-space: nowrap; }
+  .mmc-picker .mmc-modal-bar { flex-wrap: wrap; }
+  .mmc-picker .mmc-modal-bar .mmc-search { flex-basis: 100%; }
+  .mmc-picker-view-modes { max-width: 100%; flex-wrap: wrap; }
+  .mmc-picker-detail-meta { grid-template-columns: auto minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .mmc-picker .mmc-modal-head { overflow-x: auto; scrollbar-width: thin; }
+  .mmc-picker .mmc-modal-bar {
+    flex: none; max-height: 20vh; box-sizing: border-box; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+  }
+  .mmc-picker .mmc-modal-head .mmc-close {
+    flex: none; position: sticky; right: 0; margin-left: auto; z-index: 1;
+    box-shadow: 0 0 0 6px var(--mmc-float);
+  }
+  .mmc-picker .mmc-modal-foot {
+    left: 16px; right: 16px; bottom: 18px; max-width: none;
+    flex-wrap: wrap; gap: 8px; padding: 12px;
+    position: static; flex: none; margin: 8px 16px 12px; max-height: 28vh;
+    box-sizing: border-box; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+  }
+  .mmc-picker .mmc-modal-foot .mmc-slots { flex: 1 1 100%; }
+  .mmc-picker.mmc-modal .mmc-grid { padding-bottom: 18px; }
+  .mmc-picker .mmc-pager {
+    position: static; flex: none; margin: 6px 16px 0; min-width: 0;
+    overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+  }
+  .mmc-picker .mmc-pager > * { flex: none; }
+  .mmc-picker-view-details .mmc-cell { padding: 82px 10px 12px; gap: 8px; }
+  .mmc-picker-view-details .mmc-cell > img,
+  .mmc-picker-view-details .mmc-cell > video,
+  .mmc-picker-view-details .mmc-cell > .mmc-cell-fallback { left: 40px; }
+  .mmc-picker-view-details .mmc-cell-reference { flex-wrap: wrap; }
+  .mmc-picker-view-details .mmc-cell-reference .mmc-reference-field { flex: 1 1 70px; }
+  .mmc-picker-detail-meta { grid-template-columns: minmax(0, 40%) minmax(0, 1fr); }
+  .mmc-picker-detail-label { overflow-wrap: anywhere; }
+}
+/* At phone-width work areas, especially with enlarged type, floating controls
+   must not cover the file list. Keep actions in flow and long tools scrollable. */
+@media (max-width: 480px) {
+  .mmc-overlay:has(> .mmc-picker) { padding: 16px; }
+  .mmc-picker .mmc-modal-head { padding: 12px; }
+  .mmc-picker .mmc-modal-bar {
+    flex: none; max-height: 22vh; overflow-y: auto; padding: 12px;
+    scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+  }
+  .mmc-picker-view-modes { flex: 1 1 100%; flex-wrap: nowrap; overflow-x: auto; }
+  .mmc-picker-view-opt { flex: none; }
+  .mmc-picker .mmc-pager {
+    margin: 6px 12px 0;
+  }
+  .mmc-picker .mmc-modal-foot {
+    position: static; flex: none; margin: 8px 12px 12px; max-height: 28vh;
+    box-sizing: border-box; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+  }
+  .mmc-picker.mmc-modal .mmc-grid { padding: 4px 12px 18px; }
+  .mmc-picker .mmc-shelves, .mmc-picker .mmc-picker-directory-bar { padding-left: 12px; padding-right: 12px; }
 }
 
 /* --- organize mode --------------------------------------------------------- */

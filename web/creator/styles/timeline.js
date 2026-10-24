@@ -1,7 +1,21 @@
 // Timeline, timeline node body, sampler pills.
 // No backticks or ${} anywhere in the CSS: each chunk is one template literal.
 export const css = `
+/* Timeline uses the full app work area from every entry point, not a window. */
+.mmc-overlay.mmc-tl-overlay { padding: 0; align-items: stretch; justify-content: stretch; }
+.mmc-overlay.mmc-tl-overlay > .mmc-modal.mmc-tl-modal {
+  width: 100%; height: 100%; max-width: none; max-height: none;
+  border: 0; border-radius: 0; box-shadow: none; margin: 0;
+}
 /* --- timeline ------------------------------------------------------------- */
+
+/* The strip face's pre-stage toggle now wears a rail tile. Its active state
+   stays readable without changing any of the other bodies' tool styling. */
+.mmc-root > .mmc-rail .mmc-tool.mmc-prestage-toggle.on { color: var(--mmc-accent); }
+.mmc-root > .mmc-rail .mmc-tool.mmc-prestage-toggle.on .mmc-tool-icon {
+  border-color: var(--mmc-accent);
+  background: color-mix(in srgb, var(--mmc-accent) 10%, var(--mmc-surface-2));
+}
 
 /* The continuation switch, on a segment's pill row. Lit when on, because a
    segment that inherits its first frame is not the default and should not
@@ -20,10 +34,45 @@ export const css = `
    every pixel not given to it is a card you have to scroll for. The overlay's
    40px inset is what keeps it a window rather than a page. */
 .mmc-tl-modal { width: min(1800px, 100%); height: 100%; }
+/* Shared settings stay beside the title. The close control has its own column,
+   and only the settings can scroll if a compact window needs several rows. */
+.mmc-tl-modal .mmc-tl-header {
+  display: grid; grid-template-columns: max-content 1px minmax(0, 1fr) max-content;
+  align-items: center; column-gap: 16px; row-gap: 10px;
+  padding: 14px 24px; flex: none; min-width: 0;
+}
+.mmc-tl-header > .mmc-tl-heading { white-space: nowrap; cursor: default; }
+.mmc-tl-header-divider {
+  width: 1px; min-height: 24px; align-self: stretch; margin: 5px 0;
+  background: linear-gradient(180deg, transparent,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 15%,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 85%, transparent);
+  pointer-events: none;
+}
+.mmc-tl-header > .mmc-tl-bar {
+  min-width: 0; gap: 8px; padding: 3px; max-height: min(42vh, 320px);
+  overflow: auto; align-content: flex-start; scrollbar-width: thin;
+  scrollbar-color: var(--mmc-line-3) transparent;
+}
+.mmc-tl-header > .mmc-tl-bar > * { flex-shrink: 0; }
+.mmc-tl-header > .mmc-close {
+  margin-left: 0; color: var(--mmc-accent); font-size: calc(20px * var(--mmc-type)); font-weight: 600;
+}
 .mmc-tl-body {
   display: flex; flex-direction: column; gap: 16px;
   padding: 18px 24px 24px; overflow: auto; flex: 1; min-height: 0;
 }
+/* The full Timeline already scrolls here; reveal its native right-edge rail
+   instead of the pack-wide hidden scrollbar. Match the picker/popover rail,
+   reserve its space before disclosures or ready previews grow, and leave
+   nested editors and the cards' horizontal strip unchanged. */
+.mmc-tl-modal > .mmc-tl-body {
+  scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+  scrollbar-gutter: stable;
+}
+.mmc-tl-modal > .mmc-tl-body::-webkit-scrollbar { display: block; width: 6px; height: 6px; }
+.mmc-tl-modal > .mmc-tl-body::-webkit-scrollbar-thumb { background: var(--mmc-line-3); border-radius: 3px; }
+.mmc-tl-modal > .mmc-tl-body::-webkit-scrollbar-track { background: transparent; }
 .mmc-tl-prompt {
   width: 100%; box-sizing: border-box; min-height: calc(84px * var(--mmc-type)); max-height: 30vh; resize: vertical;
   background: var(--mmc-surface); border: 1px solid var(--mmc-line); border-radius: 14px;
@@ -52,6 +101,9 @@ export const css = `
 .mmc-tl-audio {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 12px;
 }
+/* Each audio bubble keeps its own height; opening its grid neighbour must not
+   stretch a closed outline. This changes presentation, not disclosure state. */
+.mmc-tl-modal .mmc-tl-audio { align-items: start; }
 /* Presentation-only folding; the editors stay mounted. Action buttons are
    siblings of the wide toggle so their click cannot collapse the section. */
 .mmc-tl-section { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 0 0 auto; }
@@ -86,6 +138,183 @@ export const css = `
 .mmc-tl-section-body { min-width: 0; }
 .mmc-tl-section-body[hidden], .mmc-tl-pool[hidden] { display: none; }
 .mmc-tl-section-warning .mmc-tl-section-hint { color: var(--mmc-warn); }
+/* Summary-only headers do not grow into paragraphs or compete with N/A.
+   The real inputs, reference instructions and their font sizes stay as before. */
+.mmc-tl-section-summary .mmc-tl-section-copy { flex: 1; flex-wrap: nowrap; overflow: hidden; }
+.mmc-tl-section-summary .mmc-tl-section-title { flex: 0 1 auto; min-width: 0; }
+.mmc-tl-section-summary .mmc-tl-section-hint {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mmc-tl-section-summary[data-open="true"] .mmc-tl-section-hint { display: none; }
+.mmc-tl-section-summary .mmc-tl-section-head-inline .mmc-tl-section-toggle { flex: 1 1 0; min-width: 0; }
+
+/* The Timeline's foldable areas are one bubble, not a bordered header above
+   another bordered input. Scope to this modal so node-face/editor controls keep
+   their existing shape. Visible overflow keeps existing reference/@ menus free. */
+.mmc-tl-modal .mmc-tl-section {
+  position: relative; gap: 0; border: 1px solid var(--mmc-line); border-radius: 20px;
+  background: var(--mmc-surface); overflow: visible;
+}
+.mmc-tl-modal .mmc-tl-section:focus-within { border-color: var(--mmc-line-2); }
+.mmc-tl-modal .mmc-tl-section-head {
+  /* One small surface step separates only disclosure headers from the body. */
+  align-items: center; border: 0; border-radius: 20px; background: var(--mmc-surface-2);
+}
+.mmc-tl-modal .mmc-tl-section[data-open="true"] > .mmc-tl-section-head {
+  border-radius: 20px 20px 0 0;
+}
+.mmc-tl-modal .mmc-tl-section-toggle {
+  border: 0; border-radius: 20px; background: transparent; padding: 8px 12px;
+}
+.mmc-tl-modal .mmc-tl-section-toggle:hover,
+.mmc-tl-modal .mmc-tl-section-head-inline:hover { background: var(--mmc-surface-2); }
+.mmc-tl-modal .mmc-tl-section-toggle:focus-visible { outline-offset: -3px; }
+.mmc-tl-modal .mmc-tl-section-actions { padding: 5px 10px 5px 0; margin-right: 0; }
+.mmc-tl-modal .mmc-tl-section-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mmc-tl-modal .mmc-tl-section-summary .mmc-tl-section-title { flex-shrink: 0; max-width: 100%; }
+.mmc-tl-modal .mmc-tl-section-body { padding: 4px 12px 12px; overflow: visible; }
+.mmc-tl-modal .mmc-tl-section-body > .mmc-tl-prompt,
+.mmc-tl-modal .mmc-tl-section-body > .mmc-tl-prompt-frame {
+  border: 0; border-radius: 0; background: transparent; padding: 8px 4px 0;
+}
+.mmc-tl-modal .mmc-tl-section > .mmc-cast-section-warning:not([hidden]) { margin: 0 12px 12px; }
+/* Soft separators use the space already between prompt, audio, references and
+   cast. They never steal a pointer or introduce another framed input. */
+.mmc-tl-modal .mmc-tl-body > .mmc-tl-section,
+.mmc-tl-modal .mmc-tl-body > .mmc-tl-audio,
+.mmc-tl-modal .mmc-tl-body > .mmc-tl-pool,
+.mmc-tl-modal .mmc-tl-body > .mmc-tl-cast { position: relative; }
+.mmc-tl-modal .mmc-tl-body > .mmc-tl-section::after,
+.mmc-tl-modal .mmc-tl-body > .mmc-tl-audio::after,
+.mmc-tl-modal .mmc-tl-body > .mmc-tl-pool::after,
+.mmc-tl-modal .mmc-tl-body > .mmc-tl-cast::after {
+  content: ""; position: absolute; height: 1px; left: 20px; right: 20px; bottom: -9px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--mmc-line) 60%, transparent) 12%,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 88%, transparent);
+  pointer-events: none;
+}
+.mmc-tl-audio-undo {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px;
+  padding: 8px 12px; border-radius: 9px; background: var(--mmc-surface-2);
+  color: var(--mmc-text); font-size: calc(12px * var(--mmc-type));
+}
+.mmc-tl-audio-undo[hidden] { display: none; }
+.mmc-tl-audio-undo > span { min-width: 0; overflow-wrap: anywhere; }
+.mmc-pill.mmc-tl-na-undo { height: 26px; min-height: 0; padding: 0 10px; }
+.mmc-tl-na-dismiss { margin-left: auto; }
+@media (max-width: 640px) {
+  .mmc-tl-modal .mmc-tl-section-toggle { align-items: flex-start; }
+  .mmc-tl-modal .mmc-tl-section-arrow { line-height: calc(18px * var(--mmc-type)); }
+  .mmc-tl-section-summary .mmc-tl-section-copy { flex-direction: column; align-items: stretch; gap: 2px; }
+  .mmc-tl-section-summary .mmc-tl-section-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mmc-tl-section-summary .mmc-tl-section-head-inline { flex-wrap: wrap; }
+  .mmc-tl-section-summary .mmc-tl-section-head-inline .mmc-tl-section-toggle { flex-basis: 100%; }
+  .mmc-tl-section-summary .mmc-tl-section-head-inline .mmc-tl-section-actions { margin-left: 30px; margin-bottom: 6px; }
+}
+/* Only opted-in Timeline sections place their independent actions between the
+   title and hint. Node-face/library headers retain their existing arrangement. */
+.mmc-tl-modal .mmc-tl-section-head-leading {
+  flex-wrap: wrap; align-items: center; gap: 6px; padding-right: 12px;
+}
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-toggle {
+  flex: 0 1 auto; max-width: 100%; padding-right: 0; align-items: center;
+}
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions {
+  position: relative; flex: 0 1 auto; max-width: 100%; padding: 5px 0; margin: 0; gap: 6px;
+}
+/* The leading title and its first control need the same quiet separation as
+   the control/count boundary. The rule is visual only, never a click target. */
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions:not(:empty) {
+  margin-left: 4px; padding-left: 12px;
+}
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions:not(:empty)::before {
+  content: ""; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 1px; height: 20px; pointer-events: none;
+  background: linear-gradient(180deg, transparent,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 15%,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 85%, transparent);
+}
+/* Field-local Refine shares the header's compact pill scale, not the main
+   timeline-bar height. The joined settings corner remains independently usable. */
+.mmc-tl-modal .mmc-tl-section-actions > .mmc-refine-split.pill { max-width: 100%; }
+.mmc-tl-modal .mmc-tl-section-actions > .mmc-refine-split.pill > .mmc-tl-field-refine {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  height: 26px; min-height: 26px; max-height: 26px; padding: 0 9px;
+  font-family: inherit; font-size: calc(11px * var(--mmc-type)); line-height: 1.2;
+  box-sizing: border-box; border-radius: 999px 0 0 999px; border-right: 0;
+}
+.mmc-tl-modal .mmc-tl-section-actions > .mmc-refine-split.pill > .mmc-tl-field-refine > .mmc-tool-icon {
+  width: auto; height: auto; background: none; border: 0; border-radius: 0;
+}
+.mmc-tl-modal .mmc-tl-section-actions > .mmc-refine-split.pill > .mmc-tl-field-refine > .mmc-tool-icon svg {
+  width: 13px; height: 13px;
+}
+.mmc-tl-modal .mmc-tl-section-actions > .mmc-refine-split.pill .mmc-refine-more {
+  height: 26px; min-height: 26px; max-height: 26px; width: 20px; flex: 0 0 20px;
+  border-radius: 0 999px 999px 0;
+}
+.mmc-tl-field-refine-status {
+  padding: 0 14px 10px; white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: calc(11px * var(--mmc-type)); color: var(--mmc-bad);
+}
+.mmc-tl-field-refine-status[hidden] { display: none; }
+.mmc-tl-modal .mmc-tl-section-head-leading > .mmc-tl-section-hint {
+  flex: 1 1 160px; min-width: 0; padding: 5px 0;
+}
+/* Separate interactive actions from the read-only file-count group. The rule
+   cannot become a flex item or steal a click from the existing header. */
+.mmc-tl-modal .mmc-tl-section-head-leading:has(> .mmc-tl-section-actions:not(:empty))
+  > .mmc-tl-section-hint:has(> .mmc-media-counts) {
+  position: relative; padding-left: 14px; margin-left: 4px;
+}
+.mmc-tl-modal .mmc-tl-section-head-leading:has(> .mmc-tl-section-actions:not(:empty))
+  > .mmc-tl-section-hint:has(> .mmc-media-counts)::before {
+  content: ""; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 1px; height: 20px; pointer-events: none;
+  background: linear-gradient(180deg, transparent,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 15%,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 85%, transparent);
+}
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions > button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  height: 26px; min-height: 0; max-width: 100%; padding: 0 9px;
+  border-radius: 999px;
+  font-family: inherit; font-size: calc(11px * var(--mmc-type)); line-height: 1.2;
+}
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions > button.mmc-ghost {
+  border: 1px solid var(--mmc-line); background: var(--mmc-surface-2); color: var(--mmc-text);
+}
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions > button.mmc-ghost:hover:not(:disabled) {
+  border-color: var(--mmc-line-2); background: var(--mmc-surface-3);
+}
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions > button.mmc-ghost:disabled {
+  color: var(--mmc-off); cursor: not-allowed;
+}
+.mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions > button:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 2px;
+}
+/* The full warning is the second-press target, not a tiny central hot spot.
+   It wraps naturally on narrow headers without clipping or nesting controls. */
+.mmc-tl-modal .mmc-tl-section-actions > button.mmc-tl-na.armed,
+.mmc-tl-modal .mmc-tl-section-actions > button.mmc-tl-prompt-clear.armed {
+  box-sizing: border-box; min-width: 0; max-width: 100%; height: auto; min-height: 26px;
+  padding: 4px 9px; white-space: normal; overflow-wrap: anywhere; text-align: left;
+  color: var(--mmc-bad); border-color: color-mix(in srgb, var(--mmc-bad) 60%, transparent);
+  background: color-mix(in srgb, var(--mmc-bad) 10%, var(--mmc-surface-2));
+}
+.mmc-tl-modal .mmc-tl-section-actions > button.mmc-tl-na.armed:hover:not(:disabled),
+.mmc-tl-modal .mmc-tl-section-actions > button.mmc-tl-prompt-clear.armed:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--mmc-bad) 14%, var(--mmc-surface-2));
+}
+@media (max-width: 640px) {
+  .mmc-tl-modal .mmc-tl-section-head-leading > .mmc-tl-section-hint { flex-basis: 100%; padding-left: 32px; }
+  .mmc-tl-modal .mmc-tl-section-head-leading .mmc-tl-section-actions { margin-left: 12px; }
+  /* Counts occupy their own row here; no orphaned vertical rule is needed. */
+  .mmc-tl-modal .mmc-tl-section-head-leading:has(> .mmc-tl-section-actions:not(:empty))
+    > .mmc-tl-section-hint:has(> .mmc-media-counts) { padding-left: 32px; margin-left: 0; }
+  .mmc-tl-modal .mmc-tl-section-head-leading:has(> .mmc-tl-section-actions:not(:empty))
+    > .mmc-tl-section-hint:has(> .mmc-media-counts)::before { display: none; }
+}
 .mmc-tl-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 /* Named for the field they become, not prettified: the value goes into the
    prompt under exactly this key, and someone comparing against MiniMax's guide
@@ -99,7 +328,91 @@ export const css = `
 /* The piece's reference pool: a shelf between the audio fields and the bar.
    Chips reuse the editor's asset row; what is ours here is only the head line
    and the "used in segments 2, 4" readout. */
-.mmc-tl-pool { display: flex; flex-direction: column; gap: 8px; }
+.mmc-tl-pool { display: flex; flex-direction: column; gap: 8px; container-type: inline-size; }
+/* Each file and its two note fields form one card. DOM order stays unchanged:
+   the shelf reads left-to-right, then down, without moving focused editors. */
+.mmc-tl-pool-references {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px;
+  min-width: 0; align-items: start;
+}
+.mmc-piece-reference-row {
+  display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 12px;
+  box-sizing: border-box; border: 1px solid var(--mmc-line-2); border-radius: 16px;
+  background: var(--mmc-surface-3);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--mmc-shadow-soft) 22%, transparent);
+}
+.mmc-piece-reference-head { min-width: 0; }
+.mmc-piece-reference-head > .mmc-asset {
+  width: 100%; min-width: 0; box-sizing: border-box; flex-wrap: wrap;
+}
+.mmc-piece-reference-head .mmc-tl-pool-group {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+  min-width: 0; max-width: 100%; box-sizing: border-box;
+  padding-inline-start: 8px; border-inline-start: 1px solid var(--mmc-line-2);
+}
+.mmc-piece-reference-head .mmc-tl-pool-identity { padding-inline-start: 0; border: 0; }
+.mmc-piece-reference-head .mmc-tl-pool-group:empty { display: none; }
+.mmc-piece-reference-head .mmc-asset button {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 0; max-width: 100%; min-height: 24px; height: auto; padding: 3px 8px;
+  box-sizing: border-box; border: 1px solid var(--mmc-line-2); border-radius: 999px;
+  background: var(--mmc-surface); line-height: 1.4; white-space: normal; overflow-wrap: anywhere;
+}
+.mmc-piece-reference-head .mmc-asset button:hover { background: var(--mmc-surface-3); }
+.mmc-piece-reference-head .mmc-asset button:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 2px;
+}
+.mmc-piece-reference-head .mmc-tl-pool-where {
+  min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere;
+}
+.mmc-piece-reference-head .mmc-asset-handle { max-width: 100%; overflow-wrap: anywhere; }
+.mmc-piece-reference-fields { width: 100%; margin-top: 0; }
+.mmc-piece-reference-fields .mmc-cast-preset-label { white-space: normal; overflow-wrap: anywhere; }
+.mmc-piece-reference-cast-note {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0;
+  padding: 9px 10px; border: 1px solid var(--mmc-line); border-radius: 14px;
+  background: var(--mmc-surface-2); color: var(--mmc-dim);
+  font-size: calc(11px * var(--mmc-type)); line-height: 1.5;
+}
+.mmc-piece-reference-cast-copy { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
+.mmc-piece-reference-cast-actions { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; max-width: 100%; }
+.mmc-piece-reference-cast-actions > button {
+  min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere;
+  height: auto; min-height: 28px; padding: 5px 9px; box-sizing: border-box;
+  font-size: inherit; line-height: 1.4;
+}
+.mmc-tl-modal .mmc-piece-reference-extra-linked { border-radius: 14px; }
+.mmc-tl-modal .mmc-piece-reference-extra-linked > .mmc-tl-section-head { border-radius: 14px; }
+.mmc-tl-modal .mmc-piece-reference-extra-linked[data-open="true"] > .mmc-tl-section-head {
+  border-radius: 14px 14px 0 0;
+}
+.mmc-tl-modal .mmc-piece-reference-extra-linked .mmc-tl-section-toggle { padding: 6px 9px; border-radius: 14px; }
+.mmc-tl-modal .mmc-piece-reference-extra-linked .mmc-tl-section-copy { flex: 1; gap: 4px 6px; }
+.mmc-tl-modal .mmc-piece-reference-extra-linked .mmc-tl-section-title {
+  font-size: calc(11px * var(--mmc-type)); font-weight: 500; white-space: normal;
+  overflow: visible; overflow-wrap: anywhere;
+}
+.mmc-tl-modal .mmc-piece-reference-extra-linked .mmc-tl-section-hint { white-space: normal; overflow-wrap: anywhere; }
+.mmc-tl-modal .mmc-piece-reference-extra-linked > .mmc-tl-section-body { padding: 9px; }
+.mmc-piece-reference-extra-linked .mmc-piece-reference-fields { border: 0; padding: 0; background: transparent; }
+.mmc-tl-modal .mmc-piece-reference-extra:not(.mmc-piece-reference-extra-linked) {
+  border: 0; border-radius: 0; background: transparent;
+}
+.mmc-tl-modal .mmc-piece-reference-extra:not(.mmc-piece-reference-extra-linked) > .mmc-tl-section-body { padding: 0; }
+.mmc-piece-reference-extra-count {
+  display: inline-flex; max-width: 100%; padding: 2px 6px;
+  border: 1px solid var(--mmc-line-2); border-radius: 999px;
+  color: var(--mmc-accent); font-size: calc(10px * var(--mmc-type)); line-height: 1.4;
+  white-space: normal; overflow-wrap: anywhere;
+}
+.mmc-piece-reference-cast-note[hidden], .mmc-piece-reference-extra[hidden],
+.mmc-piece-reference-extra-count[hidden], .mmc-piece-reference-extra > .mmc-tl-section-head[hidden] { display: none; }
+@container (max-width: 1030px) {
+  .mmc-tl-pool-references { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (max-width: 650px) {
+  .mmc-tl-pool-references { grid-template-columns: minmax(0, 1fr); }
+}
 .mmc-tl-pool-head { display: flex; gap: 10px; align-items: center; min-width: 0; }
 .mmc-tl-pool-hint {
   font-size: calc(11px * var(--mmc-type)); color: var(--mmc-off); flex: 1; min-width: 0;
@@ -122,6 +435,94 @@ export const css = `
 .mmc-tl-cast { min-width: 0; }
 
 .mmc-tl-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.mmc-tl-modal .mmc-tl-summary-row { display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap; min-width: 0; }
+/* Queue facts stay in their existing strip-adjacent row, now left aligned. */
+.mmc-tl-modal .mmc-tl-summary-row > .mmc-tl-total { margin-left: 0; }
+.mmc-tl-modal .mmc-tl-summary-row > .mmc-tl-problem,
+.mmc-tl-modal .mmc-tl-summary-row > .mmc-warn { max-width: 100%; overflow-wrap: anywhere; }
+.mmc-tl-modal .mmc-tl-navigation {
+  position: relative; display: flex; justify-content: flex-start; align-items: center;
+  flex: 0 0 auto; min-width: 0; padding-top: 12px; flex-wrap: wrap; gap: 8px;
+}
+.mmc-tl-modal .mmc-tl-navigation[hidden] { display: none; }
+.mmc-tl-navigation-divider {
+  flex: 0 0 1px; align-self: center; height: 16px; margin: 0 3px;
+  background: var(--mmc-line-3); pointer-events: none;
+}
+/* Match the input/navigation hairlines at the card strip's sound boundary. */
+.mmc-tl-modal .mmc-tl-body > .mmc-snd { position: relative; padding-top: 14px; }
+.mmc-tl-modal .mmc-tl-body > .mmc-snd::before {
+  content: ""; position: absolute; height: 1px; left: 20px; right: 20px; top: 0;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--mmc-line) 60%, transparent) 12%,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 88%, transparent);
+  pointer-events: none;
+}
+.mmc-tl-modal .mmc-tl-navigation::before {
+  content: ""; position: absolute; height: 1px; left: 20px; right: 20px; top: 0;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--mmc-line) 60%, transparent) 12%,
+    color-mix(in srgb, var(--mmc-line) 60%, transparent) 88%, transparent);
+  pointer-events: none;
+}
+.mmc-tl-modal .mmc-tl-navigation .mmc-tl-jump,
+.mmc-tl-modal .mmc-tl-navigation .mmc-tl-jump-select { max-width: 100%; }
+@media (max-width: 640px) {
+  .mmc-tl-modal .mmc-tl-header {
+    grid-template-columns: 1px minmax(0, 1fr) max-content; padding: 12px;
+    column-gap: 10px; row-gap: 8px;
+  }
+  .mmc-tl-header > .mmc-tl-heading { grid-column: 1 / 3; grid-row: 1; }
+  .mmc-tl-header > .mmc-close { grid-column: 3; grid-row: 1; }
+  .mmc-tl-header-divider { grid-column: 1; grid-row: 2; }
+  .mmc-tl-header > .mmc-tl-bar { grid-column: 2 / 4; grid-row: 2; }
+  .mmc-tl-header .mmc-pill, .mmc-tl-navigation > .mmc-pill {
+    min-width: 0; max-width: 100%; height: auto; min-height: var(--mmc-pill-h);
+    box-sizing: border-box; flex-wrap: wrap; white-space: normal; padding: 6px 12px;
+  }
+  .mmc-tl-header .mmc-pill > span { min-width: 0; overflow-wrap: anywhere; }
+  .mmc-tl-header .mmc-tl-render { max-width: 100%; box-sizing: border-box; flex-wrap: wrap; }
+  .mmc-tl-modal .mmc-tl-summary-row .mmc-tl-total { flex-wrap: wrap; margin-left: 0; }
+}
+.mmc-tl-jump { display: inline-flex; min-width: 0; position: relative; }
+.mmc-tl-jump-select {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  height: var(--mmc-pill-h); max-width: 100%; box-sizing: border-box;
+  padding: 0 14px; border: 1px solid var(--mmc-line); border-radius: 19px;
+  background: var(--mmc-surface-2); color: var(--mmc-text); font: inherit;
+  font-size: calc(13px * var(--mmc-type)); cursor: pointer;
+}
+@media (max-width: 640px) {
+  .mmc-tl-modal .mmc-tl-navigation .mmc-tl-jump-select {
+    height: auto; min-height: var(--mmc-pill-h); padding: 6px 12px;
+    flex-wrap: wrap; white-space: normal;
+  }
+  .mmc-tl-jump-select > span { min-width: 0; overflow-wrap: anywhere; }
+}
+.mmc-tl-jump-select:hover { border-color: var(--mmc-line-2); background: var(--mmc-surface-2); }
+.mmc-tl-jump-select:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: 2px; }
+/* The picker list is this pack's rounded popover, not the native select menu.
+   Only this list scrolls, so long pieces keep every card reachable. */
+.mmc-pop.mmc-tl-jump-menu {
+  min-width: min(220px, calc(100vw - 24px)); max-width: calc(100vw - 24px);
+  max-height: min(320px, calc(100vh - 32px)); box-sizing: border-box;
+  border-radius: 20px; padding: 6px; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--mmc-line-3) transparent;
+}
+.mmc-tl-jump-menu > .mmc-tl-jump-option {
+  display: block; width: 100%; box-sizing: border-box; padding: 8px 12px;
+  border: 0; border-radius: 12px; background: none; color: var(--mmc-text);
+  font-family: inherit; font-size: calc(13px * var(--mmc-type)); text-align: left;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer;
+}
+.mmc-tl-jump-menu > .mmc-tl-jump-option:hover,
+.mmc-tl-jump-menu > .mmc-tl-jump-option:focus-visible {
+  background: var(--mmc-wash-2);
+}
+.mmc-tl-jump-menu > .mmc-tl-jump-option:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: -2px; }
+.mmc-tl-jump-status {
+  position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+.mmc-tl-card.mmc-tl-jump-target { outline: 2px solid var(--mmc-accent); outline-offset: -2px; }
 /* The global stack, under the pill that counts it. Empty when there is none —
    and then it must take no room at all, or the bar and the strip sit a gap
    apart for a feature nobody used. */
@@ -185,6 +586,20 @@ export const css = `
 .mmc-turbo-opt[aria-pressed="true"] .mmc-pill-sub { color: color-mix(in srgb, var(--mmc-role-motion) 75%, transparent); }
 .mmc-tl-total { display: flex; gap: 8px; align-items: baseline; margin-left: auto; font-size: calc(13px * var(--mmc-type)); }
 .mmc-tl-total span { color: var(--mmc-dim); }
+.mmc-tl-total { flex-wrap: wrap; align-items: stretch; gap: 10px 20px; min-width: 0; }
+.mmc-tl-summary-pill {
+  position: relative; display: flex; align-items: center; flex-wrap: wrap;
+  gap: 4px 6px; min-width: 0; max-width: 100%; box-sizing: border-box;
+  padding: 5px 10px; border: 1px solid var(--mmc-line-2); border-radius: 999px;
+  background: var(--mmc-surface-2); color: var(--mmc-text); cursor: default;
+}
+.mmc-tl-summary-pill > * { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.mmc-tl-summary-pill:not(.row-start)::before {
+  content: ""; position: absolute; left: -11px; top: 50%; transform: translateY(-50%);
+  width: 1px; height: 16px; background: var(--mmc-line-3); pointer-events: none;
+}
+.mmc-tl-summary-pill b { color: var(--mmc-text); }
+.mmc-tl-summary-new b { color: var(--mmc-accent); }
 
 /* Chained / one pass. A segmented control rather than two pills, because they
    are one choice with two answers and every other pill on this bar is a value
@@ -256,37 +671,128 @@ export const css = `
 }
 .mmc-tl-card:hover { border-color: var(--mmc-line-2); }
 .mmc-tl-card-head { display: flex; align-items: center; gap: 8px; }
+.mmc-tl-card-head > .mmc-pill.mmc-tl-card-compiled {
+  display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
+  flex: 0 0 24px; width: 24px; height: 24px; min-width: 24px; min-height: 24px;
+  padding: 0; gap: 0; border-radius: 50%; border-color: var(--mmc-line);
+  background: transparent; color: var(--mmc-dim);
+}
+.mmc-tl-card-head > .mmc-pill.mmc-tl-card-compiled:hover:not(:disabled) {
+  background: var(--mmc-surface-2); border-color: var(--mmc-line-2); color: var(--mmc-text);
+}
+.mmc-tl-card-head > .mmc-pill.mmc-tl-card-compiled > svg { width: 13px; height: 13px; }
+/* The view label uses the old seconds lane. Only its text may ellipsize;
+   the ordinal, model route and explicit lock keep their own hitboxes. */
+.mmc-tl-card-name { flex: 1 1 0; min-width: 0; display: flex; }
+.mmc-tl-card-name-button,
+.mmc-tl-card-name-input {
+  box-sizing: border-box; width: 100%; min-width: 0;
+  font: inherit; font-weight: 500; color: var(--mmc-text); text-align: left;
+}
+.mmc-tl-card-name-button {
+  border: 0; background: none; padding: 0; cursor: text;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mmc-tl-card-name-button:hover { color: var(--mmc-accent); }
+.mmc-tl-card-name-button:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 3px; border-radius: 4px;
+}
+.mmc-tl-card-name-input {
+  border: 1px solid var(--mmc-accent); border-radius: 6px;
+  background: var(--mmc-surface); padding: 2px 4px; outline: none;
+}
 .mmc-tl-index {
-  width: calc(20px * var(--mmc-type)); height: calc(20px * var(--mmc-type)); border-radius: 50%; background: var(--mmc-surface-3);
+  width: calc(20px * var(--mmc-type)); height: calc(20px * var(--mmc-type)); border-radius: 50%;
+  background: var(--mmc-accent); color: var(--mmc-on-accent); cursor: default;
   display: flex; align-items: center; justify-content: center; font-size: calc(11px * var(--mmc-type)); flex: 0 0 auto;
 }
 .mmc-tl-dur { color: var(--mmc-text); font-weight: 500; }
 .mmc-tl-mode { color: var(--mmc-accent); font-size: calc(11px * var(--mmc-type)); margin-left: auto; }
 .mmc-tl-card-prompt {
-  flex: 1; color: var(--mmc-text); line-height: 1.45; overflow: hidden;
+  /* Do not absorb the shared strip's spare height. Preview aspect ratios may
+     change card height, but the facts and controls above them stay in place. */
+  flex: 0 0 auto; color: var(--mmc-text); line-height: 1.45; overflow: hidden;
   display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
 }
 .mmc-tl-card-prompt.empty { color: var(--mmc-off); font-style: italic; }
 /* The card keeps showing the typed sentence because that is what the shot is
    recognised by — dimmed, because it is not what the shot queues. */
 .mmc-tl-card-prompt.superseded { opacity: .42; }
+/* Segment cards show one exact input count, never a prompt excerpt. Clip
+   filenames retain their separate existing prompt/name presentation. */
+.mmc-tl-card-count {
+  flex: 0 0 auto; min-width: 0; color: var(--mmc-dim);
+  font-size: calc(11px * var(--mmc-type)); line-height: 1.45; white-space: nowrap;
+  text-align: right;
+}
 /* Reference counts must not compete with non-shrinking take/repair badges.
    On a narrow card that gave CJK labels only one character of room. */
 .mmc-tl-card-refs {
   color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type));
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px;
   text-align: right; white-space: nowrap;
+}
+.mmc-tl-card .mmc-tl-card-refs > .mmc-tl-dur {
+  flex: none; font-size: calc(12px * var(--mmc-type));
+}
+/* Generated cards keep the three facts in one bounded row. Long CJK frame
+   labels wrap inside their own fact; the two opaque separators stay inert. */
+.mmc-tl-card:not(.clip) .mmc-tl-card-refs { gap: 0; min-width: 0; }
+.mmc-tl-card-frame-fact {
+  flex: 0 1 auto; min-width: 0; white-space: normal; overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+.mmc-tl-card-frame-fact, .mmc-tl-card-frame-fact + .mmc-tl-dur {
+  position: relative; padding-left: 8px; margin-left: 8px;
+}
+.mmc-tl-card-frame-fact::before, .mmc-tl-card-frame-fact + .mmc-tl-dur::before {
+  content: ""; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 1px; height: 12px; background: var(--mmc-line-3); pointer-events: none;
 }
 .mmc-tl-card-meta {
   color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type));
   display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
 }
 .mmc-tl-card-meta > span { min-width: 0; overflow-wrap: anywhere; }
+/* Generated-card caption facts, including Storyboard, read from the same
+   right edge as the facts, repair pills and seed. Its presence changes only
+   vertical flow; the full-width status row keeps its existing geometry. */
+.mmc-tl-card:not(.clip) > .mmc-tl-card-meta {
+  justify-content: flex-end; text-align: right;
+}
+/* Keep take/repair states together on one stable, evenly spaced row, even
+   when a switch changes label or a conditional badge is absent. No badge
+   absorbs leftover width: they form one right-aligned group. Short cards
+   carrying a take plus repair switches retain enough room for whole labels. */
+.mmc-tl-card-status {
+  display: flex; align-items: center; justify-content: flex-end;
+  flex-wrap: nowrap; gap: 6px; width: 100%;
+  min-width: 0;
+}
+.mmc-tl-card-status > * {
+  flex: none; margin: 0; min-height: calc(20px * var(--mmc-type)); box-sizing: border-box;
+}
+.mmc-tl-card-status > .mmc-tl-card-state { margin-left: 0; margin-right: 0; }
+.mmc-tl-card-status > .mmc-tl-card-motion,
+.mmc-tl-card-status > .mmc-tl-card-face { margin-left: 0; }
+.mmc-tl-card:has(.mmc-tl-card-status > .mmc-tl-card-state):has(.mmc-tl-card-status > .mmc-tl-card-motion) {
+  min-width: calc(62px + 202px * var(--mmc-type));
+}
+.mmc-tl-card:has(.mmc-tl-card-status > .mmc-tl-card-state):has(.mmc-tl-card-status > .mmc-tl-card-face) {
+  min-width: calc(62px + 252px * var(--mmc-type));
+}
 /* The existing seed control, sized for the strip rather than a modal's full
    sampler row. Short shots and larger text still need space for its buttons;
    long seed values scroll inside the editable input, never over the footer. */
 /* Insets do not scale with text. Keep them outside the multiplier so a short
    card still fits translated mode labels at the smallest supported type. */
 .mmc-tl-card:has(> .mmc-tl-card-seed) { min-width: calc(26px + 170px * var(--mmc-type)); }
+/* Short generated shots still need one readable refs/FPS/seconds line at
+   enlarged CJK type. This text-only minimum does not depend on preview aspect
+   or source media; longer/unbounded labels retain their bounded wrap fallback. */
+.mmc-tl-card:not(.clip):has(> .mmc-tl-card-refs > .mmc-tl-card-frame-fact):has(> .mmc-tl-card-seed) {
+  min-width: calc(58px + 300px * var(--mmc-type));
+}
 .mmc-tl-card-seed { display: flex; justify-content: flex-end; min-width: 0; }
 .mmc-tl-card-seed .mmc-pill {
   box-sizing: border-box; max-width: 100%; min-width: 0;
@@ -311,18 +817,35 @@ export const css = `
 }
 .mmc-tl-card-face.on, .mmc-tl-card-motion.on { background: color-mix(in srgb, var(--mmc-blue) 18%, transparent); color: var(--mmc-blue); }
 .mmc-tl-card-face:hover, .mmc-tl-card-motion:hover { filter: brightness(1.25); }
-.mmc-tl-card-foot { display: flex; align-items: center; gap: 4px; }
-/* A clip's foot carries three words and four icons, wider than a clip card is
-   at any length a clip is. Unwrapped, the row ran out past the card's edge and
-   under the seam beside it, which took the clicks meant for the ✕ — a clip
-   could not be removed. Wrapped, the overflow drops to a second line inside
-   the card. A kept shot's foot carries Trim and Crop too, and wraps the same. */
-.mmc-tl-clip .mmc-tl-card-foot, .mmc-tl-kept .mmc-tl-card-foot { flex-wrap: wrap; row-gap: 6px; }
+/* Both repair controls use identical outline-pill geometry in either state. */
+.mmc-tl-card-motion, .mmc-tl-card-face {
+  min-height: calc(20px * var(--mmc-type)); box-sizing: border-box;
+  border: 1px solid var(--mmc-line-2); border-radius: 999px; padding: 2px 8px;
+}
+.mmc-tl-card-motion.on, .mmc-tl-card-face.on { border-color: var(--mmc-blue); }
+/* Both card kinds reserve the same two right-aligned rows. Changing a hold
+   or the available editing actions never moves Edit onto the icon row. */
+.mmc-tl-card-foot {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 0;
+}
 /* The ✕ after one press: the question, in the warning colour, where the ✕
    was. Kept to the ✕'s own height so the foot does not jump. */
 .mmc-tl-card-foot .mmc-asset-x.armed {
   color: var(--mmc-warn); font-size: calc(11px * var(--mmc-type)); white-space: nowrap;
+  flex: none; box-sizing: border-box; max-width: 100%;
+  min-height: calc(26px * var(--mmc-type)); padding: 0 calc(6px * var(--mmc-type));
+  position: relative; isolation: isolate; border: 1px solid transparent; border-radius: 0; background: none;
+  display: inline-flex; align-items: center; justify-content: center; touch-action: manipulation;
 }
+/* Paint the rounded pill separately; its transparent corner pixels still
+   belong to the rectangular button target rather than the card underneath. */
+.mmc-tl-card-foot .mmc-asset-x.armed::before {
+  content: ""; position: absolute; inset: -1px; z-index: -1; pointer-events: none;
+  border: 1px solid color-mix(in srgb, var(--mmc-warn) 40%, transparent); border-radius: 999px;
+  background: color-mix(in srgb, var(--mmc-warn) 10%, var(--mmc-surface-3));
+}
+/* Free only the annotated move/clone group. Edit/Trim/Crop stay usable. */
+.mmc-tl-card-transport:has(> .mmc-asset-x.armed) > .mmc-ghost { display: none; }
 .mmc-tl-edit {
   height: calc(26px * var(--mmc-type)); padding: 0 12px; border-radius: 8px; background: var(--mmc-surface-3);
   border: 0; color: var(--mmc-text); font-size: calc(12px * var(--mmc-type)); font-family: inherit; cursor: pointer;
@@ -335,7 +858,47 @@ export const css = `
 .mmc-tl-edit + .mmc-tl-edit { margin-left: 6px; }
 .mmc-tl-edit:has(+ .mmc-tl-edit) { margin-right: 0; }
 .mmc-tl-edit.on { box-shadow: inset 0 0 0 1px var(--mmc-blue); }
+/* Generated and supplied-clip editing actions share one roomy pill. Labels
+   may wrap inside their own segment at large type rather than being clipped. */
+.mmc-tl-card-edit-tools {
+  display: inline-flex; align-items: stretch; flex: none; max-width: 100%; box-sizing: border-box;
+  margin-left: auto; border: 1px solid var(--mmc-line-2); border-radius: 999px;
+  overflow: hidden; background: var(--mmc-surface-3);
+}
+.mmc-tl-card-edit-tools > .mmc-tl-edit {
+  flex: 0 1 auto; min-width: 0; margin: 0; padding: 0 calc(9px * var(--mmc-type));
+  height: auto; min-height: calc(26px * var(--mmc-type)); line-height: 1.3;
+  border-radius: 0; background: none; white-space: normal; overflow-wrap: anywhere;
+}
+/* Reuse the Card label's existing typography for either card kind. */
+.mmc-tl-card-edit-tools > .mmc-tl-edit,
+.mmc-tl-card-seed .mmc-seed-mode {
+  font-family: inherit; font-size: calc(11px * var(--mmc-type));
+}
+.mmc-tl-card-edit-tools > .mmc-tl-edit.mmc-tl-card-edit-action {
+  color: var(--mmc-accent); font-weight: 600;
+}
+.mmc-tl-card-edit-tools > .mmc-tl-edit + .mmc-tl-edit {
+  margin-left: 0; border-left: 1px solid var(--mmc-line-2);
+}
+.mmc-tl-card-edit-tools > .mmc-tl-edit:hover { background: var(--mmc-wash); }
+.mmc-tl-card-edit-tools > .mmc-tl-edit:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: -2px;
+}
+.mmc-tl-card-transport {
+  display: inline-flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 4px;
+  min-height: calc(26px * var(--mmc-type)); max-width: 100%; margin-left: auto;
+}
 .mmc-tl-card-foot .mmc-ghost { padding: 0 4px; font-size: calc(12px * var(--mmc-type)); }
+.mmc-tl-card-transport > .mmc-ghost,
+.mmc-tl-card-transport > .mmc-asset-x:not(.armed) {
+  display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+  width: calc(26px * var(--mmc-type)); height: calc(26px * var(--mmc-type));
+  padding: 0; box-sizing: border-box; line-height: 1;
+}
+.mmc-tl-clip-sound.on { color: var(--mmc-bad); }
+/* Only the unarmed remove glyph changes colour; its confirmation stays intact. */
+.mmc-tl-card-transport > .mmc-asset-x:not(.armed) { color: var(--mmc-warn); }
 .mmc-tl-card-foot button:disabled { opacity: .3; cursor: not-allowed; }
 
 /* The seam between two cards. It is a control, so it is wide enough to hit. */
@@ -353,13 +916,11 @@ export const css = `
 /* Picture above, sound below — the two switches on one seam. Stacked rather
    than side by side so the seam stays as narrow as it was.
  *
- * The padding is the card's own — the enclosure's inset plus the card's padding
- * and head — so the switches open level with the first line of the prompt beside
- * them and the merge button sits on the row of Edit buttons. A seam carrying two
- * chips and a seam carrying four then open and close on the same two lines,
- * instead of each centring itself on a different height. */
+ * The cards start 6px into their enclosure; 14px puts these controls 8px below
+ * their top edge. Keep the same total vertical padding so the shared strip's
+ * height and scrollbar stay put when the controls move up. */
 .mmc-tl-seam {
-  width: 78px; box-sizing: border-box; padding: 47px 3px 19px;
+  width: 78px; box-sizing: border-box; padding: 14px 3px 52px;
   display: flex; flex-direction: column; align-items: stretch; gap: 8px;
 }
 /* A source/blend pair is one shared-options group; storyboard is independent.
@@ -479,23 +1040,6 @@ export const css = `
 @media (hover: none) { .mmc-tl-take-x { opacity: .55; } }
 @media (prefers-reduced-motion: reduce) { .mmc-tl-take-x { transition: none; } }
 
-/* The card's number, doubling as the way to shoot that number and nothing
-   else. There is no room in a card's head for a control of its own — a
-   five-second card runs out about 26 px after the lock — and the number is
-   already what the card is called, so "shoot only 4" is said by clicking the 4.
-
-   It looks exactly like the badge it replaces until it is pointed at, which is
-   the whole of the restraint here: the resting strip is a row of numbered
-   cards, and the verb surfaces where somebody is already looking. */
-.mmc-tl-solo {
-  border: 0; font: inherit; color: inherit; cursor: pointer;
-  padding: 0; transition: background-color .12s ease, color .12s ease;
-}
-.mmc-tl-solo:hover, .mmc-tl-solo:focus-visible {
-  background: var(--mmc-accent); color: var(--mmc-on-accent);
-}
-@media (prefers-reduced-motion: reduce) { .mmc-tl-solo { transition: none; } }
-
 /* Lock all and Unlock all sit with Refine all and Revert all, and are the same
    shape of thing: one press for a gesture that is otherwise one press per card,
    offered only while it has something to do. */
@@ -602,11 +1146,10 @@ export const css = `
 /* The refusals compile.py would raise, under the pass they are about. */
 .mmc-tl-pass .mmc-tl-problem { padding: 0 4px; }
 
-/* The third answer on a seam: no seam at all. Held at the foot of the seam,
-   level with the cards' own buttons, and set apart from the switches above it —
-   they say how this join behaves, this says whether it is a join. */
+/* Keep the one-pass action in the same flow as the other seam controls. Card
+   previews may grow the strip, but must not push this action down on its own. */
 .mmc-tl-join-merge {
-  margin-top: auto; padding-top: 6px; border-top: 1px solid var(--mmc-line);
+  margin-top: 0; padding-top: 6px; border-top: 1px solid var(--mmc-line);
   border-radius: 0 0 8px 8px;
 }
 .mmc-tl-join-merge span:first-child { font-size: calc(12px * var(--mmc-type)); }
@@ -673,7 +1216,108 @@ export const css = `
    three rows and a section, and is let run to the screen's own limit on
    .mmc-pop instead of hiding its sentence under a scroll. */
 .mmc-board-hold-sect { min-width: 300px; box-sizing: border-box; }
+.mmc-pop-scroll:has(.mmc-storyboard-guidance) {
+  box-sizing: border-box; max-width: calc(100vw - 16px);
+}
 .mmc-pop-scroll:has(.mmc-board-hold-sect) { max-height: calc(100vh - 16px); }
+.mmc-pop.mmc-board-local-pop {
+  width: min(1200px, calc(100vw - 16px)); min-width: 0; max-height: none; overflow: visible;
+  box-sizing: border-box; padding: 16px;
+}
+.mmc-board-local-titlebar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.mmc-board-local-titlebar > span { flex: 1; min-width: 0; font-size: calc(13px * var(--mmc-type)); font-weight: 600; overflow-wrap: anywhere; }
+.mmc-board-local-titlebar .mmc-close { flex: none; }
+.mmc-board-local-header {
+  display: flex; align-items: center; gap: 14px; padding: 14px 0; margin-bottom: 14px;
+  border-bottom: 1px solid var(--mmc-line);
+}
+.mmc-board-local-toggle { flex: none; gap: 10px; }
+.mmc-board-local-toggle::after, .mmc-board-exclude-toggle::after {
+  content: ""; display: inline-block; width: 26px; height: 14px; flex: none;
+  border-radius: 999px; border: 1px solid var(--mmc-line-2);
+  background: radial-gradient(circle at 7px 50%, var(--mmc-dim) 4px, transparent 5px) var(--mmc-ground);
+}
+.mmc-board-local-toggle[aria-checked="true"]::after, .mmc-board-exclude-toggle[aria-checked="true"]::after {
+  border-color: color-mix(in srgb, var(--mmc-accent) 55%, var(--mmc-line));
+  background: radial-gradient(circle at 19px 50%, var(--mmc-accent) 4px, transparent 5px)
+    color-mix(in srgb, var(--mmc-accent) 12%, var(--mmc-ground));
+}
+.mmc-board-local-toggle[aria-checked="true"], .mmc-board-exclude-toggle[aria-checked="true"] {
+  color: var(--mmc-accent); border-color: color-mix(in srgb, var(--mmc-accent) 50%, var(--mmc-line));
+  background: color-mix(in srgb, var(--mmc-accent) 8%, var(--mmc-surface));
+}
+.mmc-board-local-status {
+  margin: 0; min-width: 0; color: var(--mmc-dim); font-size: calc(12px * var(--mmc-type));
+  line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+}
+.mmc-board-local-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.mmc-board-local-sources, .mmc-board-local-detail { min-width: 0; }
+.mmc-board-local-sources > .mmc-opt-label, .mmc-board-local-custom > .mmc-opt-label {
+  color: var(--mmc-dim); font-size: calc(12px * var(--mmc-type)); line-height: 1.5; margin-bottom: 8px;
+}
+.mmc-board-local-presets { display: flex; flex-direction: column; gap: 6px; }
+.mmc-board-local-presets .mmc-opt {
+  box-sizing: border-box; align-items: center; gap: 12px; padding: 10px 12px;
+  border: 1px solid var(--mmc-line); border-radius: 999px; font-size: calc(13px * var(--mmc-type));
+}
+.mmc-board-local-presets .mmc-opt > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.mmc-board-local-presets .mmc-opt-col { display: flex; }
+.mmc-board-local-presets .mmc-opt[aria-checked="true"] {
+  border-color: color-mix(in srgb, var(--mmc-accent) 45%, var(--mmc-line));
+  background: color-mix(in srgb, var(--mmc-accent) 8%, var(--mmc-surface));
+}
+.mmc-board-local-custom { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--mmc-line); }
+.mmc-board-local-custom .mmc-board-picks { gap: 6px; padding: 0; }
+.mmc-board-local-custom .mmc-board-pick { border-radius: 999px; padding: 5px 10px; }
+.mmc-board-local-custom .mmc-board-pick:disabled { cursor: default; opacity: .5; }
+.mmc-board-local-custom > .mmc-opt-sub, .mmc-board-local-advanced > .mmc-opt-sub {
+  margin: 8px 0 0; line-height: 1.45; overflow-wrap: anywhere;
+}
+.mmc-board-local-pages {
+  display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px;
+  margin-top: 10px; color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type));
+}
+.mmc-board-local-pages .mmc-pill {
+  height: auto; min-height: calc(30px * var(--mmc-type)); padding: 5px 12px;
+  font-size: inherit; white-space: normal;
+}
+.mmc-board-local-detail { padding-left: 16px; border-left: 1px solid var(--mmc-line); }
+.mmc-board-local-detail .mmc-board { margin: 0 0 12px; width: 156px; max-width: 100%; }
+.mmc-board-local-detail .mmc-storyboard-guidance { padding: 10px 12px; gap: 7px; line-height: 1.5; }
+.mmc-board-local-advanced { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--mmc-line); }
+.mmc-board-local-advanced > summary {
+  width: fit-content; color: var(--mmc-dim); cursor: pointer; font-size: calc(12px * var(--mmc-type));
+  line-height: 1.5; user-select: none;
+}
+.mmc-board-local-advanced[open] > summary { margin-bottom: 10px; }
+.mmc-board-exclude-toggle { gap: 10px; white-space: normal; height: auto; min-height: var(--mmc-pill-h); }
+.mmc-board-local-pop button:focus-visible, .mmc-board-local-advanced > summary:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 2px;
+}
+@media (min-width: 681px) and (max-height: 800px) {
+  .mmc-pop.mmc-board-local-pop { padding: 12px; }
+  .mmc-board-local-header { padding: 10px 0; margin-bottom: 10px; }
+  .mmc-board-local-layout { gap: 12px; }
+  .mmc-board-local-presets { gap: 4px; }
+  .mmc-board-local-custom { margin-top: 10px; padding-top: 8px; }
+  .mmc-board-local-detail .mmc-storyboard-guidance { gap: 6px; }
+  .mmc-board-local-advanced { margin-top: 10px; padding-top: 8px; }
+  .mmc-board-local-advanced[open] > summary { margin-bottom: 8px; }
+}
+@media (max-width: 680px) {
+  .mmc-pop.mmc-board-local-pop { padding: 12px; }
+  .mmc-board-local-header { flex-wrap: wrap; gap: 8px; padding: 8px 0; margin-bottom: 8px; }
+  .mmc-board-local-status { flex: 1 1 250px; }
+  .mmc-board-local-layout { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .mmc-board-local-custom .mmc-board-pick { padding: 3px 8px; }
+  .mmc-board-local-pages { margin-top: 8px; }
+  .mmc-board-local-pages .mmc-pill { min-height: 32px; padding: 4px 12px; }
+  .mmc-board-local-detail { border-left: 0; border-top: 1px solid var(--mmc-line); padding: 10px 0 0; }
+  .mmc-board-local-detail .mmc-board { width: 132px; margin-bottom: 8px; }
+  .mmc-board-local-detail .mmc-storyboard-guidance { padding: 8px 10px; gap: 6px; }
+  .mmc-board-local-advanced { margin-top: 8px; padding-top: 8px; }
+  .mmc-board-local-advanced[open] > summary { margin-bottom: 8px; }
+}
 .mmc-board-hold-head { padding: 4px 10px 0; }
 .mmc-board-hold-note { line-height: 1.4; }
 /* The three holds are the shot toggles above in the same row shape, split
@@ -723,10 +1367,10 @@ export const css = `
   width: 108px; box-sizing: border-box; margin: 6px 0 6px 12px;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
   background: none; border: 1px dashed var(--mmc-line); border-radius: 14px;
-  color: var(--mmc-dim); font-family: inherit; font-size: calc(12px * var(--mmc-type)); cursor: pointer;
+  color: var(--mmc-accent); font-family: inherit; font-size: calc(13px * var(--mmc-type)); cursor: pointer;
 }
 .mmc-tl-add span:first-child { font-size: calc(20px * var(--mmc-type)); }
-.mmc-tl-add:hover:not(:disabled) { color: var(--mmc-text); border-color: var(--mmc-line-2); }
+.mmc-tl-add:hover:not(:disabled) { color: var(--mmc-accent); border-color: var(--mmc-line-2); }
 .mmc-tl-add:disabled { cursor: not-allowed; opacity: .4; }
 
 /* Two ways to fill the next stretch of the piece: write one, or bring one.
@@ -736,7 +1380,7 @@ export const css = `
 .mmc-tl-add-pair .mmc-tl-add { margin: 0 0 0 12px; flex: 1; min-height: 0; }
 .mmc-tl-add-pair .mmc-tl-add:first-child { margin-top: 6px; }
 .mmc-tl-add-pair .mmc-tl-add:last-child { margin-bottom: 6px; }
-.mmc-tl-add-pair .mmc-tl-add span:first-child { font-size: calc(15px * var(--mmc-type)); }
+.mmc-tl-add-pair .mmc-tl-add span:first-child { font-size: calc(16px * var(--mmc-type)); }
 .mmc-tl-add-clip { border-style: solid; }
 
 /* The piece-view toggle: which face this node is wearing while it holds one
@@ -777,7 +1421,12 @@ export const css = `
 
 /* A clip card. Solid where a shot's card is not, because the difference worth
    seeing at a glance is that this stretch of the piece already exists. */
-.mmc-tl-clip { background: var(--mmc-surface-3); }
+.mmc-tl-clip {
+  background: var(--mmc-surface-3);
+  /* Four square transport controls, three gaps and the fixed card insets.
+     This is a text/hit-target minimum, independent of preview media ratio. */
+  min-width: calc(38px + 104px * var(--mmc-type));
+}
 .mmc-tl-clip-tag { color: var(--mmc-dim); }
 .mmc-tl-clip-name {
   font-style: normal; color: var(--mmc-text);
@@ -792,7 +1441,7 @@ export const css = `
 
 .mmc-tl-summary { gap: 14px; flex: 1; min-height: 0; }
 /* The room grows; the text does not. On a tall node the room soaks up the
-   panel's free height so the reel and the pills dock at the bottom, next to
+   panel's free height so the stats and the pills dock at the bottom, next to
    the sampler rows — the shot face's silhouette. On a node sized by content
    the room is only as tall as the clamped text, so nothing balloons. */
 .mmc-tl-summary-room {
@@ -812,124 +1461,7 @@ export const css = `
   mask-image: linear-gradient(to bottom, #000 calc(100% - 26px), transparent);
 }
 .mmc-tl-summary-prompt.empty { color: var(--mmc-off); }
-/* Segments at their real relative lengths — the node's one honest picture of
-   the timeline without room for the strip itself. */
-.mmc-tl-reel {
-  display: flex; flex-direction: column; gap: 3px; height: 40px; cursor: pointer; flex: 0 0 auto;
-}
-.mmc-tl-lane { display: flex; gap: 4px; flex: 1 1 auto; min-height: 0; overflow: hidden; }
-/* A pass in the lane: its shots close ranks and share one outline, which is the
-   casing's reading at a tenth the size. A pass of one is just its own tick. */
-.mmc-tl-run { display: flex; gap: 4px; min-width: 0; }
-.mmc-tl-run.on {
-  gap: 0; border: 1px solid color-mix(in srgb, var(--mmc-accent) 32%, transparent); border-radius: 8px; padding: 1px;
-  background: color-mix(in srgb, var(--mmc-accent) 8%, transparent);
-}
-.mmc-tl-run.on .mmc-tl-tick {
-  background: none; border: 0; border-left: 1px dashed color-mix(in srgb, var(--mmc-accent) 40%, transparent); border-radius: 0;
-}
-.mmc-tl-run.on .mmc-tl-tick:first-child { border-left: 0; }
-.mmc-tl-tick {
-  display: flex; align-items: center; justify-content: center; gap: 5px;
-  background: var(--mmc-surface-2); border: 1px solid var(--mmc-line);
-  border-radius: 8px; min-width: 18px; overflow: hidden; padding: 0 4px;
-}
-.mmc-tl-tick svg { width: 13px; height: 13px; stroke: currentColor; fill: none;
-  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
-.mmc-tl-tick-n { color: var(--mmc-text); font-size: calc(12px * var(--mmc-type)); font-weight: 500; }
-.mmc-tl-tick-s { color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); }
-.mmc-tl-lane:hover .mmc-tl-tick { border-color: var(--mmc-line-2); }
-/* Where the shoot has got to, at a tenth the size of the strip's own picture of
-   it: a block filled in because that stretch of film exists, hollowed out
-   because it has not been shot. Same two readings the cards wear, minus the
-   perforations, which at eighteen pixels would be a smudge. */
-.mmc-tl-tick.kept { background: var(--mmc-surface-3); }
-.mmc-tl-tick.unshot { background: none; border-style: dashed; }
-.mmc-tl-tick.unshot .mmc-tl-tick-n, .mmc-tl-tick.unshot .mmc-tl-tick-s { color: var(--mmc-off); }
-.mmc-tl-tick.on {
-  background: color-mix(in srgb, var(--mmc-accent) 13%, transparent); border-color: color-mix(in srgb, var(--mmc-accent) 32%, transparent); color: var(--mmc-accent);
-}
-.mmc-tl-tick.on .mmc-tl-tick-n { color: var(--mmc-accent); }
-
-/* --- the crowded reel ------------------------------------------------------
-
-   Past about forty shots a block is twenty pixels wide, and a tile with a
-   number, a length and a rounded border is a smear. So the lane closes: no
-   gaps, no radius, one continuous band divided by frame lines, and the labels
-   move off the picture and onto the edge. What is drawn inside the band is only
-   what is not true of the whole strip — a merged pass, a hard cut — because a
-   mark every shot carries is a mark that says nothing.
-
-   Set from fitLane(), which measures rather than counts: the same forty shots
-   are roomy on a wide node and crowded on a narrow one. */
-
-.mmc-tl-lane.dense {
-  gap: 0; border: 1px solid var(--mmc-line); border-radius: 4px;
-  /* Lit from the top, so the row of cells reads as one physical strip rather
-     than as a grid of empty boxes. */
-  background: linear-gradient(180deg, var(--mmc-wash), transparent 60%),
-              var(--mmc-surface-2);
-}
-.mmc-tl-lane.dense .mmc-tl-run { gap: 0; flex-basis: 0; }
-.mmc-tl-lane.dense .mmc-tl-tick {
-  border: 0; border-left: 1px solid var(--mmc-line); border-radius: 0;
-  background: none; min-width: 0; padding: 0;
-  /* Length alone decides the width here. With the default auto basis a block
-     starts at the width of its own label and grows from there, so a two-digit
-     number quietly buys its shot a few pixels the shot has not earned — which
-     at this scale is most of a block. */
-  flex-basis: 0;
-}
-.mmc-tl-lane.dense .mmc-tl-run:first-child .mmc-tl-tick:first-child { border-left: 0; }
-.mmc-tl-lane.dense .mmc-tl-tick-n { font-size: calc(11px * var(--mmc-type)); color: var(--mmc-dim); }
-.mmc-tl-lane.dense .mmc-tl-tick.on .mmc-tl-tick-n { color: var(--mmc-dim); }
-/* What a block gives up as it narrows, in order. The length goes first — a band
-   drawn to scale is already a picture of the lengths — and the seam glyph goes
-   with it, since the join itself says that. Then the number. Set per block by
-   fitLane(), so a short shot beside a long one gives up its own labels without
-   taking the long one's with it. */
-.mmc-tl-tick.narrow .mmc-tl-tick-s,
-.mmc-tl-tick.narrow svg { display: none; }
-.mmc-tl-tick.bare .mmc-tl-tick-n { display: none; }
-/* And nothing at all once no block on the lane can hold a number: the band goes
-   bare and the edge row below does the counting. */
-.mmc-tl-lane.crowded .mmc-tl-tick-n,
-.mmc-tl-lane.crowded .mmc-tl-tick-s,
-.mmc-tl-lane.crowded .mmc-tl-tick svg { display: none; }
-/* Continuing is the ordinary case in a long strip, so it is drawn as the
-   ordinary case: an unbroken band. */
-.mmc-tl-lane.dense .mmc-tl-tick.on { background: none; border-color: var(--mmc-line); }
-/* A hard cut is the exception, so it is the thing that shows: a real break in
-   the film with a bright edge on the far side of it — a splice. */
-.mmc-tl-lane.dense .mmc-tl-tick.cut {
-  margin-left: 3px; border-left-color: transparent;
-  box-shadow: inset 2px 0 0 var(--mmc-line-3);
-}
-/* A pass keeps its accent — four of them among forty single shots is exactly
-   the reading worth spending colour on. Drawn as an inset ring rather than a
-   border and padding, which at this width would steal four pixels from the run
-   and quietly bend the proportions the lane exists to show. */
-.mmc-tl-lane.dense .mmc-tl-run.on {
-  border: 0; border-radius: 0; padding: 0;
-  background: color-mix(in srgb, var(--mmc-accent) 16%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mmc-accent) 42%, transparent);
-}
-.mmc-tl-lane.dense .mmc-tl-run.on .mmc-tl-tick { border-left: 1px dashed color-mix(in srgb, var(--mmc-accent) 50%, transparent); }
-.mmc-tl-lane.dense .mmc-tl-tick:hover { background: var(--mmc-wash-2); }
-/* The band is one click target, so the band as a whole answers the pointer —
-   the frame lines inside it are structure, not forty separate buttons. */
-.mmc-tl-lane.dense:hover { border-color: var(--mmc-line-2); }
-
-/* Edge code: the numerals down the side of the film, not across the frame.
-   Placed in pixels by fitLane() against the blocks it measured, so a number
-   sits on the shot it names however the durations divide the lane. */
-.mmc-tl-edge { position: relative; flex: 0 0 10px; }
-.mmc-tl-edge:empty { display: none; }
-.mmc-tl-edge-n {
-  position: absolute; top: 0; padding-left: 3px;
-  border-left: 1px solid var(--mmc-line-2);
-  font-size: calc(9px * var(--mmc-type)); line-height: 10px; color: var(--mmc-dim);
-  font-variant-numeric: tabular-nums; letter-spacing: .04em;
-}
+.mmc-tl-node-stats { margin-left: 0; flex: 0 0 auto; }
 
 /* Where the Creator puts its mode badge: the right end of the pill row. */
 .mmc-tl-open {
@@ -1091,6 +1623,44 @@ export const css = `
    Everything inside the tracks is positioned as a percentage of the whole, so
    the lane survives the modal being resized without measuring anything. */
 .mmc-snd { display: flex; flex-direction: column; gap: 6px; }
+/* Sound shares the Cast disclosure's title/action grammar. Its zoom is one
+   independent native viewport, never the card strip or the workflow clock. */
+.mmc-snd .mmc-tl-section { min-width: 0; }
+.mmc-snd .mmc-tl-section-head { background: var(--mmc-surface-2); }
+.mmc-snd-content { min-width: 0; }
+.mmc-snd-viewport {
+  max-width: 100%; min-width: 0; overflow-x: auto; overflow-y: hidden;
+  padding-bottom: 5px; scrollbar-width: thin;
+  scrollbar-color: var(--mmc-line-3) transparent;
+}
+.mmc-snd-viewport::-webkit-scrollbar { height: 6px; }
+.mmc-snd-viewport::-webkit-scrollbar-thumb { background: var(--mmc-line-3); border-radius: 3px; }
+.mmc-snd-viewport::-webkit-scrollbar-track { background: transparent; }
+.mmc-snd-viewport:focus-visible { outline: 1px solid var(--mmc-accent); outline-offset: 2px; }
+.mmc-snd-axis { display: flex; flex-direction: column; gap: 6px; width: 100%; min-width: 100%; }
+.mmc-snd-axis > .mmc-snd-lane { box-sizing: border-box; width: 100%; flex: none; }
+.mmc-snd-viewport.zoom-tool, .mmc-snd-viewport.zoom-tool * { cursor: ew-resize; }
+.mmc-snd-viewport.zooming { user-select: none; }
+.mmc-snd-zoom-controls { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.mmc-snd .mmc-tl-header-action {
+  display: inline-flex; align-items: center; justify-content: center;
+  box-sizing: border-box; min-width: 26px; max-width: 100%; height: 26px; min-height: 0;
+  padding: 0 9px; border: 1px solid var(--mmc-line); border-radius: 999px;
+  background: var(--mmc-surface-2); color: var(--mmc-text);
+  font-family: inherit; font-size: calc(11px * var(--mmc-type)); line-height: 1.2;
+}
+.mmc-snd .mmc-tl-header-action:hover:not(:disabled) { border-color: var(--mmc-line-2); background: var(--mmc-surface-3); }
+.mmc-snd-zoom-read {
+  color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type));
+  min-width: 4ch; text-align: center; font-variant-numeric: tabular-nums;
+}
+/* BEGIN Sound header button feedback */
+.mmc-tl-modal .mmc-snd button.mmc-ghost.mmc-tl-header-action[aria-pressed="true"]:not(:disabled),
+.mmc-tl-modal .mmc-snd button.mmc-ghost.mmc-tl-header-action:active:not(:disabled) {
+  color: var(--mmc-blue); border-color: var(--mmc-blue);
+  background: color-mix(in srgb, var(--mmc-blue) 18%, var(--mmc-surface-2));
+}
+/* END Sound header button feedback */
 /* An author rule that sets display beats the user agent's hidden-attribute rule
    whatever the specificity, so the lane this hides (timeline.js, for a family
    that supplies no audio) stayed on screen with the attribute set. The spinner
@@ -1269,7 +1839,7 @@ export const css = `
    there is something here — and what arrives on hover is a chip solid enough to
    read over a waveform's loudest stretch, which is what this corner is. */
 .mmc-snd-drop {
-  position: absolute; right: 11px; bottom: 3px; z-index: 2;
+  position: absolute; right: 11px; bottom: 2px; z-index: 2;
   display: grid; place-items: center; width: 18px; height: 18px;
   border: 1px solid transparent; border-radius: 5px; padding: 0;
   background: none; cursor: pointer; color: var(--mmc-text); opacity: .5;
@@ -1297,9 +1867,10 @@ export const css = `
    target the gesture can end on by accident. */
 .mmc-snd-block.dragging .mmc-snd-drop { opacity: 0; pointer-events: none; }
 
-/* The matching corner is a per-track snap switch, outside the trim grips. */
+/* Beside delete, outside the trim grips. The existing clip's visual width and
+   drag geometry do not change; exceptionally tiny clips keep a vertical pair. */
 .mmc-snd-magnet {
-  position: absolute; left: 11px; bottom: 3px; z-index: 2;
+  position: absolute; right: 35px; bottom: 2px; z-index: 2;
   display: grid; place-items: center; width: 18px; height: 18px;
   border: 1px solid transparent; border-radius: 5px; padding: 0;
   background: none; cursor: pointer; color: var(--mmc-text); opacity: .5;
@@ -1318,10 +1889,12 @@ export const css = `
 .mmc-snd-magnet:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: 1px; }
 .mmc-snd-block.dragging .mmc-snd-magnet { opacity: 0; pointer-events: none; }
 @container (max-width: 58px) {
-  .mmc-snd-magnet { left: 1px; width: 14px; }
+  .mmc-snd-drop { right: 2px; width: 14px; }
+  .mmc-snd-magnet { right: 21px; width: 14px; }
 }
-@container (max-width: 43px) {
-  .mmc-snd-magnet { width: 18px; bottom: 23px; }
+@container (max-width: 36px) {
+  .mmc-snd-drop { height: 14px; }
+  .mmc-snd-magnet { right: 2px; bottom: 19px; height: 14px; }
   .mmc-snd-label { visibility: hidden; }
 }
 
@@ -1387,9 +1960,218 @@ export const css = `
   z-index: 5; background: var(--mmc-accent); opacity: 0; pointer-events: none;
 }
 .mmc-snd-snap.on { opacity: .9; }
+/* Read-only feedback for the existing magnet. Its line stays on the exact
+   boundary; the caption is clamped inside the lane and never takes pointer input. */
+.mmc-snd-snap-hint {
+  position: absolute; top: 3px; z-index: 7; display: flex; flex-direction: column;
+  gap: 1px; width: max-content; max-width: calc(100% - 12px); box-sizing: border-box;
+  padding: 3px 7px; border: 1px solid var(--mmc-accent); border-radius: 6px;
+  background: var(--mmc-scrim-3); color: var(--mmc-text);
+  font-size: calc(11px * var(--mmc-type)); line-height: 1.2;
+  pointer-events: none; transform: translateX(-50%); opacity: 0;
+}
+.mmc-snd-snap-hint.on { opacity: 1; }
+.mmc-snd-snap-labels { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.mmc-snd-snap-time { color: var(--mmc-dim); white-space: nowrap; }
+
+/* --- compact cards without ready previews --- */
+/* With media hidden, size each card from its readable controls rather than
+   its duration or the tallest neighbouring seam. Names still occupy one
+   ellipsized line, but must not dictate the card's intrinsic width. */
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-pass-cards {
+  align-items: flex-start;
+}
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-pass-cards > .mmc-tl-card {
+  width: max-content !important; min-width: 0 !important; align-self: flex-start;
+}
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-card-name,
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-clip-name {
+  contain: inline-size;
+}
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-clip-name {
+  display: block;
+}
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-clip > .mmc-tl-card-meta {
+  contain: inline-size; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-card-frame-fact {
+  flex: none; white-space: nowrap; overflow-wrap: normal;
+}
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-card-edit-tools > .mmc-tl-edit {
+  white-space: nowrap; overflow-wrap: normal;
+}
+/* Caption facts occupy their own right-aligned row, without contributing a
+   long label to the intrinsic width of the controls below them. */
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-card:not(.mmc-tl-clip) > .mmc-tl-card-meta {
+  flex-direction: column; align-items: stretch;
+}
+.mmc-tl-strip:not(.individual-preview) .mmc-tl-card:not(.mmc-tl-clip) > .mmc-tl-card-meta > span {
+  flex: none; contain: inline-size; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; overflow-wrap: normal;
+}
+/* --- end compact cards without ready previews --- */
+
+/* BEGIN looping card titles */
+.mmc-tl-title-loop {
+  display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.mmc-tl-title-track {
+  display: inline-block; position: relative; vertical-align: bottom; white-space: nowrap;
+}
+.mmc-tl-title-loop.scrolling { text-overflow: clip; }
+.mmc-tl-title-loop.scrolling > .mmc-tl-title-track {
+  animation: mmc-title-loop var(--mmc-title-duration) linear infinite;
+  animation-delay: 1s;
+}
+.mmc-tl-title-loop.scrolling > .mmc-tl-title-track::after {
+  content: attr(data-mmc-loop-title); position: absolute; left: calc(100% + 48px); top: 0;
+}
+.mmc-tl-title-loop:focus-visible > .mmc-tl-title-track { animation-play-state: paused; }
+@keyframes mmc-title-loop {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(calc(-1 * var(--mmc-title-distance))); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mmc-tl-title-loop.scrolling { text-overflow: ellipsis; }
+  .mmc-tl-title-loop.scrolling > .mmc-tl-title-track { animation: none; }
+  .mmc-tl-title-loop.scrolling > .mmc-tl-title-track::after { content: none; }
+}
+/* END looping card titles */
+
+/* A delivered-file preview grows the existing card, not a second bordered
+   card. The optional large viewer reuses the same read-only controls. */
+.mmc-tl-individual-preview { margin-right: 8px; }
+.mmc-tl-strip.individual-preview .mmc-tl-pass-cards { align-items: flex-start; }
+.mmc-card-preview {
+  width: 100%; min-width: 0; box-sizing: border-box; margin-top: 10px;
+  padding-top: 10px; border-top: 1px solid var(--mmc-line);
+}
+.mmc-card-preview-stage {
+  position: relative; width: 100%; min-width: 0; overflow: hidden;
+  border-radius: 8px; background: #111; cursor: pointer;
+}
+.mmc-card-preview-stage:focus-visible { outline: 2px solid var(--mmc-accent); outline-offset: 2px; }
+.mmc-card-preview-media { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.mmc-card-preview-frame { display: block; width: 100%; height: 100%; object-fit: contain; }
+.mmc-card-preview-controls {
+  display: grid; grid-template-columns: 24px minmax(0, 1fr) 24px;
+  align-items: center; gap: 2px 5px; margin-top: 5px; min-width: 0;
+}
+.mmc-card-preview-controls button {
+  flex: 0 0 auto; border: 0; border-radius: 50%; background: transparent;
+  color: var(--mmc-text); min-width: 24px; min-height: 24px; padding: 2px;
+  font: inherit; cursor: pointer;
+}
+.mmc-card-preview-controls button:hover { background: var(--mmc-surface-3); }
+.mmc-card-preview-controls button:disabled { opacity: .45; cursor: default; }
+.mmc-card-preview-scrub { grid-column: 2; grid-row: 1; width: 100%; min-width: 0; accent-color: var(--mmc-accent); margin: 0; }
+.mmc-card-preview-mute { grid-column: 3; grid-row: 1; }
+/* Preview volume is a body-portal choice, clear of the cards' clipping strip.
+   A native vertical range puts 100% at the top and 0% at the bottom. */
+.mmc-pop.mmc-card-preview-volume-pop {
+  min-width: 0; width: min(calc(72px * var(--mmc-type)), calc(100vw - 16px));
+  max-height: calc(100vh - 16px); box-sizing: border-box;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 12px 10px; border-radius: 18px; overflow: hidden;
+}
+.mmc-card-preview-volume-slider {
+  writing-mode: vertical-lr; direction: rtl; margin: 0;
+  width: calc(22px * var(--mmc-type));
+  height: min(calc(150px * var(--mmc-type)), calc(100vh - 96px));
+  min-height: 48px; accent-color: var(--mmc-accent); cursor: pointer;
+}
+.mmc-card-preview-volume-slider:focus-visible {
+  outline: 2px solid var(--mmc-accent); outline-offset: 3px; border-radius: 999px;
+}
+.mmc-card-preview-volume-read {
+  font-family: inherit; font-size: calc(11px * var(--mmc-type));
+  color: var(--mmc-text); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.mmc-card-preview-clock {
+  grid-column: 1 / -1; grid-row: 2; text-align: center; color: var(--mmc-dim);
+  font-size: calc(9px * var(--mmc-type)); white-space: nowrap;
+}
+.mmc-card-preview-shared, .mmc-card-preview-status, .mmc-card-preview-unavailable {
+  color: var(--mmc-dim); font-size: calc(11px * var(--mmc-type)); line-height: 1.4;
+  white-space: normal; overflow-wrap: anywhere;
+}
+.mmc-card-preview-shared { margin-bottom: 5px; }
+.mmc-card-preview-status { margin-top: 5px; }
+.mmc-card-preview-unavailable { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--mmc-line); }
+.mmc-reference-preview-stage > .mmc-card-preview {
+  margin-top: 0; padding-top: 0; border-top: 0; max-width: 100%;
+  height: 100%; min-height: 0; display: flex; flex-direction: column; gap: 8px;
+}
+.mmc-reference-preview-stage > .mmc-card-preview .mmc-card-preview-stage {
+  flex: 1 1 0; height: 0; min-height: 0; max-height: none; width: 100%; margin: 0;
+}
+.mmc-reference-preview-stage > .mmc-card-preview .mmc-card-preview-controls,
+.mmc-reference-preview-stage > .mmc-card-preview .mmc-card-preview-shared,
+.mmc-reference-preview-stage > .mmc-card-preview .mmc-card-preview-status { flex: none; margin: 0; }
 
 @media (prefers-reduced-motion: reduce) {
   .mmc-snd-block, .mmc-snd-grip, .mmc-snd-shot { transition: none; }
 }
+
+/* BEGIN ready portrait segment card width */
+/* Equal display-aspect classes share a width across clips and generated cards.
+   Source pixels, duration and canvas backing dimensions never size this UI. */
+.mmc-tl-strip.individual-preview .mmc-tl-pass-cards > .mmc-tl-card:has(> .mmc-card-preview) {
+  width: max(420px, calc(58px + 300px * var(--mmc-type))) !important;
+  min-width: max(420px, calc(58px + 300px * var(--mmc-type)));
+}
+.mmc-tl-strip.individual-preview .mmc-tl-pass-cards > .mmc-tl-card:has(> .mmc-card-preview.mmc-card-preview-portrait) {
+  width: max(338px, calc(38px + 300px * var(--mmc-type))) !important;
+  min-width: max(338px, calc(38px + 300px * var(--mmc-type)));
+}
+.mmc-tl-strip.individual-preview .mmc-tl-pass-cards > .mmc-tl-card:has(> .mmc-card-preview.mmc-card-preview-wide) {
+  width: max(520px, calc(58px + 300px * var(--mmc-type))) !important;
+  min-width: max(520px, calc(58px + 300px * var(--mmc-type)));
+}
+/* A custom ellipsized name or canvas intrinsic pixels must not size the card. */
+.mmc-tl-card:has(> .mmc-card-preview) > .mmc-tl-card-head > .mmc-tl-card-name,
+.mmc-tl-card > .mmc-card-preview {
+  contain: inline-size;
+}
+.mmc-tl-strip.individual-preview .mmc-tl-card:has(> .mmc-card-preview) > .mmc-tl-card-refs > .mmc-tl-card-frame-fact,
+.mmc-tl-strip.individual-preview .mmc-tl-card:has(> .mmc-card-preview) .mmc-tl-card-edit-tools > .mmc-tl-edit {
+  flex: none; white-space: nowrap;
+}
+/* END ready portrait segment card width */
+
+/* BEGIN forgiving Timeline scrollbars */
+/* Native dimensions/gutters stay unchanged; these siblings paint and accept
+   drags only in the existing gutter, strip padding and surrounding whitespace.
+   The vertical rail and its thumb sit 6px inside the body's outer wall. */
+.mmc-tl-modal.mmc-tl-scrollbars { position: relative; }
+.mmc-tl-modal > .mmc-tl-body.mmc-tl-scroll-managed,
+.mmc-tl-strip.mmc-tl-scroll-managed { scrollbar-color: transparent transparent; }
+.mmc-tl-modal > .mmc-tl-body.mmc-tl-scroll-managed::-webkit-scrollbar-thumb,
+.mmc-tl-strip.mmc-tl-scroll-managed::-webkit-scrollbar-thumb { background: transparent; }
+.mmc-tl-scroll-rail {
+  position: absolute; z-index: 2; touch-action: none; user-select: none;
+  cursor: default; outline: none;
+}
+.mmc-tl-scroll-rail[hidden] { display: none; }
+.mmc-tl-scroll-rail.vertical { width: 24px; }
+.mmc-tl-scroll-rail.horizontal { height: 24px; }
+.mmc-tl-scroll-thumb {
+  position: absolute; border-radius: 6px; pointer-events: none;
+  background: var(--mmc-line-3);
+  transition: width 180ms ease, height 180ms ease, background-color 180ms ease;
+}
+.mmc-tl-scroll-rail.vertical > .mmc-tl-scroll-thumb { right: 0; width: 6px; }
+.mmc-tl-scroll-rail.horizontal > .mmc-tl-scroll-thumb { top: 10px; height: 6px; }
+.mmc-tl-scroll-rail.near > .mmc-tl-scroll-thumb,
+.mmc-tl-scroll-rail.dragging > .mmc-tl-scroll-thumb,
+.mmc-tl-scroll-rail:focus-visible > .mmc-tl-scroll-thumb { background: color-mix(in srgb, var(--mmc-ink) 50%, transparent); }
+.mmc-tl-scroll-rail.vertical.near > .mmc-tl-scroll-thumb,
+.mmc-tl-scroll-rail.vertical.dragging > .mmc-tl-scroll-thumb,
+.mmc-tl-scroll-rail.vertical:focus-visible > .mmc-tl-scroll-thumb { width: 10px; }
+.mmc-tl-scroll-rail.horizontal.near > .mmc-tl-scroll-thumb,
+.mmc-tl-scroll-rail.horizontal.dragging > .mmc-tl-scroll-thumb,
+.mmc-tl-scroll-rail.horizontal:focus-visible > .mmc-tl-scroll-thumb { height: 10px; }
+@media (prefers-reduced-motion: reduce) { .mmc-tl-scroll-thumb { transition: none; } }
+/* END forgiving Timeline scrollbars */
 
 `;

@@ -320,8 +320,8 @@ def user_message(shot, seconds=None, images=0, mode=None, language=None):
                      f"what is actually in them.")
     if shot.get("continues"):
         lines.append(refine.CONTINUES_NOTE)
-    if language and language != "English":
-        lines.append(f"Write the prose and any dialogue in {language}.")
+    lines.append(f"Write descriptive prose in {language or 'English'}, translating the request where needed. "
+                 "Preserve exact quoted dialogue, on-screen text, handles and structural tags.")
 
     lines.append("")
     text = str(shot.get("text") or "").strip()

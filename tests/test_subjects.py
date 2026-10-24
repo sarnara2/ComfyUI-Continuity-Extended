@@ -188,7 +188,7 @@ check("...and the retention line says the movement is followed",
       "the movement in <Video 1> (the golf swing), its path, its timing and its "
       "weight, is followed by <Subject 1>" in _noted_ret, True)
 check("...while her own looks stay retained",
-      "their face, hair, build, and clothing are retained" in _noted_ret, True)
+      "their face, hair, and build are retained" in _noted_ret, True)
 check("a note on a file nobody claims is kept out of the prose",
       "gone" in subjects.definitions(_noted, _noted_labels), False)
 expect_error("notes must be a map",
@@ -218,7 +218,7 @@ _ret = subjects.retention(_swap, _swap_labels, "[Shot 1] <Subject 1> pours coffe
 check("and says who is going, in the retention line",
       "the man at the counter in <Video 1>" in _ret, True)
 check("and the baseline appearance is retained, not transferred onto him",
-      "their face, hair, build, and clothing are retained" in _ret, True)
+      "their face, hair, and build are retained" in _ret, True)
 check("and the subject is what appears in the vacancy",
       "they appear in place of the man at the counter in <Video 1>" in _ret, True)
 
@@ -342,9 +342,8 @@ check("...so the base form's field is not also claimed",
 check("the definitions stand in front of the description, as in the guide",
       _text_only.prompt.index("subject_definitions:")
       < _text_only.prompt.index("detailed_description:"), True)
-check("...and it is summarised, with no task type to claim",
-      "summary: The target video runs one shot and features <Subject 1>."
-      in _text_only.prompt, True)
+check("...and it is summarised without inventing a shot count",
+      "summary:\nThe target video features <Subject 1>." in _text_only.prompt, True)
 
 # ...and a text-only piece with nobody cast is byte-identical to what it always
 # compiled to. The sections exist only where a cast does.
@@ -697,11 +696,10 @@ check("an untouched card compiles the sentence it always did",
       subjects.retention(_seeded, _LAB, "[Shot 1] <Subject 1> waits."),
       "<Subject 1> (appears in [Shot 1]): fully_preserved - their face, hair, "
       "build, and clothing are retained.")
-check("...the same one a card with no rows at all still compiles",
-      subjects.retention(_seeded, _LAB, "[Shot 1] <Subject 1> waits."),
-      subjects.retention(
+check("a card with no rows does not automatically retain wardrobe",
+      "clothing" in subjects.retention(
           subjects.parse([{"handle": "vera", "from": ["img-1"], "takes": "person"}]),
-          _LAB, "[Shot 1] <Subject 1> waits."))
+          _LAB, "[Shot 1] <Subject 1> waits."), False)
 # The definition is what the label denotes, and "with face, hair, build, and
 # clothing" says nothing the noun did not. A seeded row earns its place in the
 # retention line, where the question is what is carried over.

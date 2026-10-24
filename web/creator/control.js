@@ -389,6 +389,7 @@ class Bench {
 
   async browse() {
     const chosen = await openPicker({
+      selectionPurpose: "control-source",
       kinds: ["image", "video", "renders"], kind: "video", single: true,
       capacity: () => ({ used: 0, max: 1, filesLeft: 1 }),
     });

@@ -13,11 +13,17 @@
 
 import { el, floatAbove, icon, keepScroll, mountOverlay } from "./dom.js";
 import { t } from "./i18n.js";
+import { localizeDiagnostic } from "./server-messages.js";
 import { castFactsLine, listPresets, loadBody } from "./presets.js";
 import { listAssets, viewUrl } from "./api.js";
 import { LANGUAGES, settings as refineSettings } from "./refine.js";
-import { citedSubjects, subjectFiles, tagIndex } from "./state.js";
+import { citedSubjects, missingPromptHandles, sortByHandle, subjectFiles, tagIndex } from "./state.js";
 import { layout as layoutVariations } from "./variations.js";
+import { isVisualReference, previewable, openReferencePreview } from "./reference-preview.js";
+import { compiledTagNodes } from "./compiled-tags.js";
+import { openCompiledTagPreview } from "./compiled-tag-preview.js";
+import { DELIVERY, parseDialogue, parseSpeech, sayLine } from "./dialogue.js";
+import { dialogueChip, dialogueNodes } from "./dialogue-view.js";
 
 /* Where a `{day|night}` is painted: the braces and bars of every live group in
    one colour, the alternatives the seed does not take in another — see
@@ -66,55 +72,27 @@ const COMMAND = /\/([\w-]*)$/;
    and the rest of the line disappears into it. */
 const QUOTED = /[\u0022\u201c]([^\u0022\u201c\u201d\n]{1,400})[\u0022\u201d]$/;
 const MAX_SUGGESTIONS = 40;
+let dialogueEditor = null;
+
+export function setDialogueEditor(handler) {
+  dialogueEditor = handler;
+}
 
 function handlePattern(handle) {
   const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`@${escaped}(?![A-Za-z0-9_-])`, "g");
+  return new RegExp(`(?:(?<![\\w@])|(?<=\\(S))@${escaped}(?![A-Za-z0-9_-])`, "g");
 }
 
 /** Replace an exact citation, retaining any :scope suffix. */
 export function replacePromptHandle(text, from, to, at, all = false) {
   const pattern = handlePattern(from);
   if (all) return text.replace(pattern, () => `@${to}`);
-  const match = pattern.exec(text.slice(at));
-  if (!match || match.index !== 0) return text;
+  pattern.lastIndex = at;
+  const match = pattern.exec(text);
+  if (!match || match.index !== at) return text;
   return `${text.slice(0, at)}@${to}${text.slice(at + from.length + 1)}`;
 }
 
-/* A finished spoken line, as `sayText` writes one and `build` reads one back.
-
-   Every piece of it is the guide's: `(S@anna)` is the speaker token
-   `subjects.substitute_speakers` resolves to `<Subject 1> (S1)`, the lead-in
-   between it and the tag is the identity, action and delivery §4.4 keeps
-   *outside* `<d>`, and the tail is the lips-closed sentence a voiceover is
-   required to be followed by. */
-const SPOKEN = new RegExp(
-  "\\(S(@[A-Za-z][A-Za-z0-9_]*(?:\\s*,\\s*@[A-Za-z][A-Za-z0-9_]*)*)\\)"
-  + "\\s([^<>\n]{0,60}?)"
-  + "<d>\\[([^\\]\n]{1,24})\\]\\s?([^<>\n]*?)</d>"
-  + "(\\s*while their lips remain completely closed\\.)?", "g");
-
-/* How a line is delivered: the verb outside the tag, in the guide's own forms.
-
-   `lead` ends in the punctuation §4.4's examples end in — a colon before a
-   statement, a comma before one that leans on the clause around it — and
-   `together` is what the same verb becomes when a compound `(S1,S2)` says it,
-   which is the example the guide gives for two speakers at once.
-
-   Voiceover is the one that is not just a verb. §4.4 fixes both halves of it:
-   the exact phrase, and a sentence immediately after the tag saying the lips
-   stay shut. Getting that pair right by hand is most of why this menu exists. */
-const DELIVERY = [
-  { id: "says", lead: "says:", together: "say together:", label: "says" },
-  { id: "asks", lead: "asks:", together: "ask together:", label: "asks" },
-  { id: "replies", lead: "replies,", together: "reply together,", label: "replies" },
-  { id: "whispers", lead: "whispers,", together: "whisper together,", label: "whispers" },
-  { id: "shouts", lead: "shouts,", together: "shout together,", label: "shouts" },
-  { id: "sings", lead: "sings,", together: "sing together,", label: "sings" },
-  { id: "voiceover", lead: "says in an off-screen voiceover:",
-    together: "say in an off-screen voiceover:", label: "voiceover",
-    tail: " while their lips remain completely closed." },
-];
 const SAYS = DELIVERY[0];
 
 /* The lead-in somebody has already written in front of their own quote.
@@ -186,35 +164,15 @@ function padded(nodes) {
     const chip = node.nodeType !== Node.TEXT_NODE;
     if (chip && (previous === null || previous.nodeType !== Node.TEXT_NODE)) {
       out.push(document.createTextNode(PAD));
+    } else if (chip && previous.nodeValue.endsWith("\n")) {
+      // A newline before an atomic node needs a text position on the new line.
+      previous.nodeValue += PAD;
     }
     out.push(node);
     previous = node;
   }
   if (previous && previous.nodeType !== Node.TEXT_NODE) out.push(document.createTextNode(PAD));
   return out;
-}
-
-/**
- * The line a choice and a set of words come to, in the form §4.4 spells it.
- *
- * Speaker token, then the delivery, then the tag holding only the language and
- * the words — and, for a voiceover, the sentence that has to follow it. The
- * quotes are dropped: inside `<d>` they would be two more characters for the
- * model to read out.
- *
- * A plain function rather than a method, because it is called on the way out:
- * the menu closes before the box is rewritten, and by then there is no choice
- * left on the instance to read.
- */
-function sayLine(say, words) {
-  const how = DELIVERY.find((d) => d.id === say.delivery) ?? SAYS;
-  // `lead` is prose somebody wrote themselves — the guide's own example of one
-  // is "exclaims with light annoyance," — carried through an edit untouched.
-  // Picking a delivery from the list is what clears it, because that is the
-  // gesture that means "use this instead".
-  const lead = say.lead || (say.who.length > 1 ? how.together : how.lead);
-  return `(S${say.who.map((handle) => "@" + handle).join(",")}) ${lead} `
-    + `<d>[${say.language}] ${String(words).trim()}</d>${how.tail ?? ""}`;
 }
 
 /** A voice description -> a handle for the member it becomes. `styleHandle`'s
@@ -244,7 +202,17 @@ const BODY_FIELDS = new Set(["integrated_multimodal_description", "detailed_desc
  * in, and this only decides how it is set.
  */
 export function compiledBlocks(text) {
-  return String(text || "").split(/\n\s*\n/)
+  const source = String(text || "");
+  const speech = parseDialogue(source).filter((span) => span.complete);
+  const blocks = [];
+  let at = 0;
+  for (const match of source.matchAll(/\n\s*\n/g)) {
+    if (speech.some((span) => match.index > span.start && match.index < span.end)) continue;
+    blocks.push(source.slice(at, match.index));
+    at = match.index + match[0].length;
+  }
+  blocks.push(source.slice(at));
+  return blocks
     .map((block) => block.trim())
     .filter(Boolean)
     .map((block) => {
@@ -281,7 +249,7 @@ const BLOCK = new Set(["DIV", "P", "LI", "TR", "BLOCKQUOTE", "PRE", "H1", "H2", 
  *
  * @returns {() => void} close it from outside
  */
-export function openEditorSheet({ title, subtitle = "", content, onClose }) {
+export function openEditorSheet({ title, subtitle = "", headerTools = [], content, onClose }) {
   const close = () => {
     unmount();
     onClose?.();
@@ -290,10 +258,11 @@ export function openEditorSheet({ title, subtitle = "", content, onClose }) {
     class: "mmc-overlay",
     onpointerdown: (event) => { if (event.target === overlay) close(); },
   }, [
-    el("div", { class: "mmc-modal mmc-editor-sheet" }, [
+    el("div", { class: `mmc-modal mmc-editor-sheet${headerTools.length ? " mmc-editor-sheet-structured" : ""}` }, [
       el("div", { class: "mmc-modal-head" }, [
         el("span", { class: "mmc-tab", "aria-selected": "true", text: title }),
         ...(subtitle ? [el("span", { class: "mmc-editor-sheet-sub", text: subtitle })] : []),
+        ...headerTools,
         el("button", { class: "mmc-close", text: "✕", title: t("Close"), onclick: close }),
       ]),
       el("div", { class: "mmc-editor-sheet-body" }, content),
@@ -433,6 +402,13 @@ export class PromptBox {
     // whole, wrappers and all, into a box whose every other route is plain
     // text. See `onPaste`, which this is the same handler as.
     this.root.addEventListener("drop", (event) => this.onPaste(event));
+    for (const name of ["copy", "cut"]) this.root.addEventListener(name, (event) => {
+      const spot = this.captureInsertion();
+      if (spot.end <= spot.start || !event.clipboardData) return;
+      event.preventDefault();
+      event.clipboardData.setData("text/plain", this.getValue().slice(spot.start, spot.end));
+      if (name === "cut") this.replaceRange(spot, "");
+    });
     // The grace period is for the click that is landing on a menu row: that
     // closes the menu itself, and a dismissal arriving after it would erase the
     // name it just wrote. `dismissMenu` no-ops once the menu is gone.
@@ -442,8 +418,9 @@ export class PromptBox {
     // so without this exception the field was torn down 120ms after it appeared
     // and there was no way to type a word into it.
     this.root.addEventListener("blur", () => setTimeout(() => {
+      if (this.replacing?.previewing) return;
       if (this.menu?.contains(document.activeElement)) return;
-      this.dismissMenu(false);
+      this.finishTyping();
     }, 120));
     // A subject's name, opened on. The chip is contenteditable="false", so a
     // click on it had nowhere to put a caret and did nothing — which makes the
@@ -459,7 +436,8 @@ export class PromptBox {
       // A spoken line first: it is a chip that holds a name, so the cast test
       // below would answer for the name inside it and open somebody instead of
       // the line they are saying.
-      const said = event.target?.closest?.("[data-say]");
+      if (this.caretPress) { this.caretPress = false; return; }
+      const said = event.target?.closest?.("[data-say]:not(.mmc-speaker-token)");
       if (said && this.root.contains(said)) {
         event.preventDefault();
         this.editSaid(said);
@@ -498,6 +476,15 @@ export class PromptBox {
     // Only the names, and only where they open somebody. A file's chip is not a
     // control, so selecting it is the ordinary thing to be doing with it.
     this.root.addEventListener("mousedown", (event) => {
+      if (event.button !== 0 || event.shiftKey) return;
+      const before = this.caretBeforeChip(event);
+      if (before !== null) {
+        event.preventDefault();
+        this.caretPress = true;
+        this.placeCaret(before);
+        return;
+      }
+      this.caretPress = false;
       if (this.replaceChip(event) || this.castChip(event) || this.refChip(event)
           || event.target?.closest?.("[data-say]")) event.preventDefault();
     });
@@ -596,6 +583,8 @@ export class PromptBox {
    * under it saying that a shape is coming.
    */
   setCompiledOpen(open) {
+    this.compiledRevision = (this.compiledRevision ?? 0) + 1;
+    this.compiledChildClose?.(); this.compiledChildClose = null;
     this.compiledOpen = !!open && !!this.hooks.compiled;
     this.compiled.classList.toggle("open", this.compiledOpen);
     this.compiledRail.setAttribute("aria-expanded", String(this.compiledOpen));
@@ -619,6 +608,8 @@ export class PromptBox {
    */
   async refreshCompiled() {
     if (!this.compiledOpen || !this.hooks.compiled) return;
+    this.compiledRevision = (this.compiledRevision ?? 0) + 1;
+    this.compiledChildClose?.(); this.compiledChildClose = null;
     if (this.compiledBusy) { this.compiledDirty = true; return; }
     this.compiledBusy = true;
     this.compiledDirty = false;
@@ -665,21 +656,29 @@ export class PromptBox {
    * here that is marked. That is the question the panel exists to answer — what
    * did the compiler add — and one accent answers it without a legend.
    */
-  drawCompiled({ problem = "", note = "", text = "", message = "" } = {}) {
+  drawCompiled({ problem = "", note = "", text = "", message = "", tags = [] } = {}) {
+    this.compiledChildClose?.(); this.compiledChildClose = null;
+    const current = this.compiledRevision;
+    const openTag = (binding, span) => {
+      if (!this.compiledOpen || this.compiledBusy || current !== this.compiledRevision || !span.isConnected) return;
+      this.compiledChildClose?.();
+      this.compiledChildClose = openCompiledTagPreview(binding, { returnFocus: span,
+        onClose: () => { this.compiledChildClose = null; } });
+    };
     this.compiled.classList.toggle("problem", !!problem);
 
     if (problem) {
       this.compiledStatus.textContent = t("could not compile");
-      this.compiledDoc.replaceChildren(el("p", { class: "mmc-compiled-problem", text: problem }));
+      this.compiledDoc.replaceChildren(el("p", { class: "mmc-compiled-problem", text: localizeDiagnostic(problem) }));
       return;
     }
 
-    this.compiledStatus.textContent = note;
+    this.compiledStatus.textContent = localizeDiagnostic(note);
     // The panel talking rather than a prompt to show: a clip that generates
     // nothing has no wire keys, and dressing our sentence in one would be
     // inventing a field the model is never handed.
     if (message) {
-      this.compiledDoc.replaceChildren(el("p", { class: "mmc-compiled-note", text: message }));
+      this.compiledDoc.replaceChildren(el("p", { class: "mmc-compiled-note", text: localizeDiagnostic(message) }));
       return;
     }
 
@@ -705,7 +704,8 @@ export class PromptBox {
           el("span", { text: key || t("frame alignment") }),
           ...(mine ? [el("span", { class: "mmc-compiled-mine", text: t("yours") })] : []),
         ]),
-        el("p", { class: "mmc-compiled-value", text: value }),
+        el("p", { class: "mmc-compiled-value" }, dialogueNodes(value,
+          (part) => compiledTagNodes(part, tags, openTag))),
       ])),
       // Said plainly, because "it looks the same as what I typed" is the right
       // reading of this case and not a bug: a shot with no cast and no
@@ -825,105 +825,76 @@ export class PromptBox {
     this.hooks.onOverflow?.(this.overflowing());
   }
 
-  /** Text -> [text nodes, chip spans]. Only handles with a live asset — the
-   *  state's own or the piece's pool — and names the piece's cast declares
-   *  become chips; the rest stay as plain text so the dangling-handle warning
-   *  sees them.
-   *
-   *  The file half of the pattern is tried first, so `@img-1` is one handle and
-   *  never the word "img". A name nobody cast matches the second half, finds no
-   *  subject and stays prose — which is the promise the cast is built on. */
+  /** Syntax identifies a tag; attachment state only decides its presentation.
+   *  An unconnected tag is still a tag, never an attachment to recreate. */
   build(text) {
-    const cast = new Set((this.hooks.getCast?.() ?? []).map((s) => s.handle));
     const out = [];
     let at = 0;
-    SPOKEN.lastIndex = 0;
-    let said;
-    while ((said = SPOKEN.exec(text)) !== null) {
-      const who = said[1].split(",").map((h) => h.trim().slice(1));
-      // A speaker nobody cast is left as the text it is, exactly as an
-      // uncited `@name` is: the compiler refuses it by name, and a chip drawn
-      // over it would hide the one thing that needs fixing.
-      if (!who.every((handle) => cast.has(handle))) continue;
-      if (said.index > at) out.push(...this.buildRefs(text.slice(at, said.index)));
-      out.push(this.sayChip(said, who));
-      at = said.index + said[0].length;
+    for (const span of parseDialogue(text)) {
+      if (span.start > at) out.push(...this.buildRefs(text.slice(at, span.start)));
+      const chip = dialogueChip(span);
+      if (span.complete) {
+        chip.setAttribute("role", "button");
+        chip.tabIndex = 0;
+        chip.title = t("Edit dialogue — {language}", { language: t(span.language || "Language not set") });
+      }
+      out.push(chip);
+      at = span.end;
     }
     if (at < text.length) out.push(...this.buildRefs(text.slice(at)));
     return padded(out);
   }
 
-  /**
-   * A spoken line, drawn as the one thing it is.
-   *
-   * Not a `.mmc-ref` pill. A reference chip is a *label* — it stands in for a
-   * file, and looking like a token is the whole of its job. A line of dialogue
-   * is not a label for anything: it is words that are heard, sitting inside a
-   * sentence about what is seen. So it keeps the speaker's tag colour and gives
-   * up the pill, and what marks it instead is a rule down its left edge — the
-   * same mark `.mmc-compiled-block.mine` already uses in this pack to say "this
-   * part of the text is yours". Here it says: this part is heard.
-   *
-   * Dashed for a voiceover, because that is the difference the mark is for. A
-   * voice in the room and a voice over the picture are the same words and a
-   * different sound, and a broken line is what that difference looks like.
-   *
-   * The delivery and the language show only when they are not the ordinary
-   * answer. A chip that prints "EN" on every line of an English film has said
-   * nothing, and the room it takes is room the words needed.
-   */
-  sayChip(match, who) {
-    const [source, , lead, language, words, tail] = match;
-    const said = lead.trim();
-    // Prose that is not one of the seven is prose somebody wrote by hand —
-    // "exclaims with light annoyance," is the guide's own example of it — so
-    // the chip shows what is actually there rather than rounding it to `says`.
-    const delivery = DELIVERY.find((d) => said === d.lead || said === d.together);
-    const how = delivery ? t(delivery.label) : said.replace(/[:,]\s*$/, "");
-    const over = !!tail || delivery?.id === "voiceover";
-    return el("span", {
-      class: `mmc-say${over ? " mmc-say-over" : ""} mmc-tag-${tagIndex(who[0])}`,
-      contenteditable: "false",
-      "data-say": source,
-      "data-speakers": who.join(","),
-      title: t("{who} {how} — {language}", {
-        who: who.map((h) => "@" + h).join(", "), how, language }),
-    }, [
-      el("span", { class: "mmc-say-who", text: who.map((h) => "@" + h).join(" ") }),
-      ...(delivery === SAYS ? [] : [el("span", { class: "mmc-say-how", text: how })]),
-      ...(language === "English" ? []
-        : [el("span", { class: "mmc-say-lang", text: language.slice(0, 2).toUpperCase() })]),
-      el("span", { class: "mmc-say-words", text: `“${words}”` }),
-    ]);
-  }
-
   /** The half of `build` that was all of it: text -> [text nodes, ref chips]. */
   buildRefs(text) {
-    const attached = [...this.hooks.getState().assets,
-                      ...(this.hooks.getPool?.() ?? [])];
-    const known = new Set([...attached.map((a) => a.handle),
-                           ...(this.hooks.getScreens?.() ?? []).map((s) => s.handle)]);
-    // Muted files, so the chip can say it. A name in the sentence whose picture
-    // is out of the run reads as a picture being used, and the row saying
-    // otherwise is two floors away from the word that is wrong.
-    const off = new Set(attached.filter((a) => a.enabled === false).map((a) => a.handle));
-    const cast = new Set((this.hooks.getCast?.() ?? []).map((s) => s.handle));
+    const pattern = /\(S(@[A-Za-z][A-Za-z0-9_]*(?:\s*,\s*@[A-Za-z][A-Za-z0-9_]*)*)\)/g;
+    const out = [];
+    let at = 0;
+    let match;
+    while ((match = pattern.exec(text))) {
+      if (match.index > at) out.push(...this.buildHandleRefs(text.slice(at, match.index)));
+      const who = match[1].split(",").map((handle) => handle.trim().slice(1));
+      const { cast, off, missing } = this.referenceStatus(text);
+      out.push(el("span", { class: "mmc-speaker-token", contenteditable: "false",
+        "data-say": match[0], "data-speakers": who.join(","),
+        title: t("Speaker numbers are assigned when the prompt is compiled.") },
+      who.flatMap((handle, index) => [
+        ...(index ? [document.createTextNode(", ")] : []),
+        this.chip(handle, cast.has(handle), off.has(handle), null, missing.has(handle)),
+      ])));
+      at = pattern.lastIndex;
+    }
+    if (at < text.length) out.push(...this.buildHandleRefs(text.slice(at)));
+    return out;
+  }
+
+  buildHandleRefs(text) {
+    const { cast, off, missing } = this.referenceStatus(text);
     const out = [];
     let at = 0;
     // A file's handle may wear what it is cited as (`@pic-2:start`); a name
     // never does, so the suffix is only read after a handle-shaped citation.
-    const pattern = /@([A-Za-z]+-\d+)(?::([a-z]+))?|@([A-Za-z][A-Za-z0-9_]*)/g;
+    const pattern = /(?:(?<![\w@])|(?<=\(S))@(?:([A-Za-z]+-\d+)(?::([a-z]+))?|([A-Za-z][A-Za-z0-9_]*))(?![A-Za-z0-9_-])/g;
     let match;
     while ((match = pattern.exec(text)) !== null) {
       const handle = match[1] ?? match[3];
       const scope = match[1] ? (match[2] ?? null) : null;
-      if (!known.has(handle) && !cast.has(handle)) continue;
       if (match.index > at) out.push(document.createTextNode(text.slice(at, match.index)));
-      out.push(this.chip(handle, cast.has(handle), off.has(handle), scope));
+      out.push(this.chip(handle, cast.has(handle), off.has(handle), scope, missing.has(handle)));
       at = match.index + match[0].length;
     }
     if (at < text.length) out.push(document.createTextNode(text.slice(at)));
     return out;
+  }
+
+  referenceStatus(text) {
+    const assets = [...(this.hooks.getState().assets ?? []), ...(this.hooks.getPool?.() ?? [])];
+    const cast = this.hooks.getCast?.() ?? [];
+    return {
+      cast: new Set(cast.map(subject => subject.handle)),
+      off: new Set(assets.filter(asset => asset.enabled === false).map(asset => asset.handle)),
+      missing: new Set(missingPromptHandles([text], assets, cast, this.hooks.getScreens?.() ?? [])),
+    };
   }
 
   /** The cast chip an event landed on, if it landed on one that opens somebody.
@@ -935,9 +906,10 @@ export class PromptBox {
     return chip && this.root.contains(chip) ? chip : null;
   }
 
-  chip(handle, subject = false, muted = false, scope = null) {
+  chip(handle, subject = false, muted = false, scope = null, missing = null) {
+    if (missing === null) missing = this.referenceStatus(`@${handle}`).missing.has(handle);
     return el("span", {
-      class: `mmc-ref${subject ? " mmc-ref-cast" : ""}${muted ? " mmc-ref-off" : ""} mmc-tag-${tagIndex(handle)}`,
+      class: `mmc-ref${subject ? " mmc-ref-cast" : ""}${muted ? " mmc-ref-off" : ""}${missing ? " mmc-ref-missing" : ""} mmc-tag-${tagIndex(handle)}`,
       contenteditable: "false",
       "data-handle": handle,
       // What the file is cited as — `@pic-2:start`, `@pic-2:style` — kept on
@@ -946,7 +918,8 @@ export class PromptBox {
       ...(scope ? { "data-scope": scope } : {}),
       // Said on the chip, because a gesture nobody can see is a gesture nobody
       // finds. The pointer is the other half of it — see .mmc-prompt-castable.
-      title: this.hooks.replaceHandles
+      title: missing ? t("Unconnected tag @{handle}. Attach a reference or cast member with the same handle.", { handle })
+        : this.hooks.replaceHandles
         ? t("Replace @{handle}", { handle })
         : subject && this.hooks.onCastChip
         ? t("Edit @{handle}", { handle })
@@ -968,7 +941,7 @@ export class PromptBox {
   /** The file chip an event landed on, where the host offers a menu on one. */
   refChip(event) {
     if (!this.hooks.onRefChip) return null;
-    const chip = event.target?.closest?.(".mmc-ref[data-handle]:not(.mmc-ref-cast)");
+    const chip = event.target?.closest?.(".mmc-ref[data-handle]:not(.mmc-ref-cast):not(.mmc-ref-missing)");
     return chip && this.root.contains(chip) ? chip : null;
   }
 
@@ -985,6 +958,10 @@ export class PromptBox {
       for (const node of parent.childNodes) {
         if (node === chip) return true;
         if (node.nodeType === Node.TEXT_NODE) text += bare(node.nodeValue);
+        else if (node.classList?.contains("mmc-speaker-token") && node.contains(chip)) {
+          text += node.dataset.say.slice(0, node.dataset.say.indexOf(`@${chip.dataset.handle}`));
+          return true;
+        }
         else if (node.dataset?.say !== undefined) text += node.dataset.say;
         else if (node.dataset?.handle) {
           text += `@${node.dataset.handle}${node.dataset.scope ? `:${node.dataset.scope}` : ""}`;
@@ -1140,6 +1117,53 @@ export class PromptBox {
     this.onEdit();
   }
 
+  /** Resolve at the gesture, not at row creation: a file can be replaced while
+   *  this read-only picker is open. Cast files already live in the current pool. */
+  replacementPreviewFiles(option) {
+    const state = this.hooks.getState();
+    const assets = [...(state.assets ?? []), ...(this.hooks.getPool?.() ?? [])];
+    const available = (asset) => isVisualReference(asset)
+      || Boolean(asset?.filename) && (asset.kind === "audio" || asset.kind === "video" && asset.track === "sound");
+    if (option.kind === "cast") {
+      const subject = (this.hooks.getCast?.() ?? []).find((row) => row.handle === option.handle);
+      return subject ? subjectFiles(subject)
+        .map((handle) => assets.find((asset) => asset.handle === handle)).filter(available) : [];
+    }
+    if (option.kind === "screen") {
+      const screen = (this.hooks.getScreens?.() ?? []).find((row) => row.handle === option.handle);
+      if (!screen?.file) return [];
+      const content = state.screens?.find((row) => row.handle === option.handle)?.content;
+      const known = assets.find((asset) => asset.filename === screen.file);
+      const kind = content?.filename === screen.file ? content.kind : known?.kind
+        ?? (/\.(png|jpe?g|webp|gif|bmp|avif)(?:\s+\[(?:input|output|temp)\])?$/i.test(screen.file) ? "image"
+          : /\.(mp4|webm|mov|mkv)(?:\s+\[(?:input|output|temp)\])?$/i.test(screen.file) ? "video" : null);
+      return kind ? [{ filename: screen.file, kind, handle: screen.handle }] : [];
+    }
+    const source = option.kind === "attached" ? state.assets : this.hooks.getPool?.();
+    const asset = (source ?? []).find((row) => row.handle === option.handle);
+    return available(asset) ? [asset] : [];
+  }
+
+  previewReplacement(option, change) {
+    if (this.replacing !== change || !this.menu?.isConnected || change.previewing) return;
+    const files = this.replacementPreviewFiles(option);
+    if (!files.length) return;
+    const menu = this.menu;
+    change.previewing = true;
+    // Keep the input, scope and selection mounted, but below the isolated viewer.
+    menu.style.display = "none";
+    change.closePreview = openReferencePreview(files, {
+      includeAudio: true, returnFocus: change.field,
+      onClose: () => {
+        if (this.replacing !== change || this.menu !== menu) return;
+        change.previewing = false;
+        change.closePreview = null;
+        menu.style.display = "";
+        this.place();
+      },
+    });
+  }
+
   /**
    * Dim the box while a rewrite stands in for it — and fold it away.
    *
@@ -1184,10 +1208,21 @@ export class PromptBox {
     this.excerpt.classList.toggle("empty", !text);
   }
 
-  /** Re-run the text through build(): an asset was added or removed, so some
-   *  chips may need to become plain text or vice versa. Skipped while focused
-   *  so it never yanks the caret mid-sentence. */
+  /** Update connection status in place, even while editing. Only an unfocused
+   *  box is rebuilt, so half-typed names and the live selection stay untouched. */
   refresh() {
+    const status = this.referenceStatus(this.getValue());
+    for (const chip of this.root.querySelectorAll("[data-handle]")) {
+      const handle = chip.dataset.handle;
+      const next = this.chip(handle, status.cast.has(handle), status.off.has(handle),
+        chip.dataset.scope ?? null, status.missing.has(handle));
+      const speaker = chip.classList.contains("mmc-say-speaker");
+      chip.className = speaker ? `mmc-say-speaker${status.missing.has(handle) ? " mmc-ref-missing" : ""}`
+        : next.className;
+      const title = speaker && !status.missing.has(handle) ? null : next.title;
+      if (title) chip.title = title; else chip.removeAttribute("title");
+    }
+    this.censusChips();
     if (document.activeElement === this.root) return;
     const text = this.hooks.getState().prompt ?? "";
     const built = this.build(text);
@@ -1205,9 +1240,7 @@ export class PromptBox {
     // what makes a handle a chip is not in the text: the cast and the pool
     // decide it, and either can change while the sentence does not.
     if (!this.sameAs(built)) this.root.replaceChildren(...built);
-    // A handle that stopped being a chip because its asset was detached from the
-    // asset row is not a deletion the user made *here*, and re-noting the census
-    // after the rebuild is what keeps `onEdit` from reporting it as one.
+    // An external connection change is not a citation edit made in this box.
     this.censusChips();
     this.syncExcerpt();
     // Whatever moved the host — a seed re-rolled, a card retaken — may have
@@ -1309,7 +1342,8 @@ export class PromptBox {
       const text = node.nodeType === Node.TEXT_NODE;
       const length = text ? bare(node.nodeValue).length
         : node.dataset?.say !== undefined ? node.dataset.say.length
-        : node.dataset?.handle ? node.dataset.handle.length + 1 : 1;
+        : node.dataset?.handle ? node.dataset.handle.length + 1
+          + (node.dataset.scope ? node.dataset.scope.length + 1 : 0) : 1;
       if (!opened && start < at + length) {
         if (text) range.setStart(node, rawOffset(node.nodeValue, start - at));
         else range.setStartBefore(node);
@@ -1338,6 +1372,7 @@ export class PromptBox {
       if (want.nodeType === 3) return got.textContent === want.textContent;
       return got.className === want.className
           && got.dataset?.handle === want.dataset?.handle
+          && got.dataset?.scope === want.dataset?.scope
           && got.dataset?.say === want.dataset?.say;
     });
   }
@@ -1353,7 +1388,9 @@ export class PromptBox {
    * past.
    */
   censusChips() {
+    const missing = this.referenceStatus(this.getValue()).missing;
     const seen = [...this.root.querySelectorAll("[data-handle]")]
+      .filter(node => !node.classList.contains("mmc-ref-missing"))
       .map((node) => node.dataset.handle);
     // The speakers inside a spoken line count as cited, and have to: a line is
     // the *only* place @vera appears once the menu has absorbed the lead-in
@@ -1363,7 +1400,9 @@ export class PromptBox {
     // because its own `data-say` is the source text, which is what `getValue`
     // reads back.
     for (const chip of this.root.querySelectorAll("[data-speakers]")) {
-      for (const handle of chip.dataset.speakers.split(",")) seen.push(handle);
+      for (const handle of chip.dataset.speakers.split(",")) {
+        if (!missing.has(handle)) seen.push(handle);
+      }
     }
     this.chipped = new Set(seen);
   }
@@ -1465,6 +1504,59 @@ export class PromptBox {
       : range.startOffset);
   }
 
+  captureInsertion() {
+    const selection = window.getSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (range && this.root.contains(range.startContainer) && this.root.contains(range.endContainer)) {
+      const length = this.getValue().length;
+      const position = (node, offset, end) => {
+        let atomic = null;
+        for (let parent = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+          parent && parent !== this.root; parent = parent.parentElement) {
+          if (parent.dataset?.say !== undefined || parent.dataset?.handle) atomic = parent;
+        }
+        if (atomic) {
+          const index = [...atomic.parentNode.childNodes].indexOf(atomic);
+          const start = this.offsetOf(atomic.parentNode, index) ?? 0;
+          const size = atomic.dataset.say?.length ?? (atomic.dataset.handle.length + 1
+            + (atomic.dataset.scope ? atomic.dataset.scope.length + 1 : 0));
+          return start + (end ? size : 0);
+        }
+        return this.offsetOf(node, node.nodeType === Node.TEXT_NODE
+          ? bare(node.nodeValue.slice(0, offset)).length : offset) ?? length;
+      };
+      const start = position(range.startContainer, range.startOffset, false);
+      return { start, end: range.collapsed ? start : position(range.endContainer, range.endOffset, true) };
+    }
+    const end = this.getValue().length;
+    return { start: end, end };
+  }
+
+  replaceRange(spot, value) {
+    const text = this.getValue();
+    const start = Math.max(0, Math.min(text.length, spot?.start ?? text.length));
+    const end = Math.max(start, Math.min(text.length, spot?.end ?? start));
+    const before = this.chipped;
+    this.setValue(text.slice(0, start) + value + text.slice(end));
+    this.chipped = before;
+    this.onEdit();
+    this.placeCaret(start + value.length);
+  }
+
+  /** The visible margin belongs to the caret, not to the chip's click action. */
+  caretBeforeChip(event) {
+    let at = 0;
+    for (const node of this.root.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) { at += bare(node.nodeValue).length; continue; }
+      const rect = node.getClientRects?.()[0];
+      if (rect && event.clientX >= rect.left - 10 && event.clientX < rect.left + 1
+          && event.clientY >= rect.top && event.clientY <= rect.bottom) return at;
+      at += node.dataset?.say?.length ?? (node.dataset?.handle
+        ? node.dataset.handle.length + 1 + (node.dataset.scope ? node.dataset.scope.length + 1 : 0) : 1);
+    }
+    return null;
+  }
+
   /** Where a DOM position sits in the bare text — the offsets `getValue` and
    *  the compiler count in. `within` is a bare character offset into a text
    *  node `target`, or a child index into an element one, as a Range spells
@@ -1483,7 +1575,8 @@ export class PromptBox {
         if (node === target) { found = at + within; return; }
         if (node.nodeType === Node.TEXT_NODE) at += bare(node.nodeValue).length;
         else if (node.dataset?.say !== undefined) at += node.dataset.say.length;
-        else if (node.dataset?.handle) at += node.dataset.handle.length + 1;
+        else if (node.dataset?.handle) at += node.dataset.handle.length + 1
+          + (node.dataset.scope ? node.dataset.scope.length + 1 : 0);
         else if (node.tagName === "BR") at += 1;
         else {
           if (BLOCK.has(node.tagName) && at) at += 1;
@@ -1507,6 +1600,11 @@ export class PromptBox {
   }
 
   onKeyDown(event) {
+    if (event.isComposing) return;
+    const spoken = event.target.closest?.("[data-say]:not(.mmc-speaker-token)");
+    if (spoken && ["Enter", " "].includes(event.key)) {
+      event.preventDefault(); event.stopPropagation(); this.editSaid(spoken); return;
+    }
     // Out of a branch and back to the sources — the arrow that put you in it,
     // reversed. Only while one is open and only in the `/` menu; everywhere
     // else the left arrow is the caret's, which is what it must stay.
@@ -1797,6 +1895,8 @@ export class PromptBox {
       this.active = 0;
       this.signature = null;
       this.say = null;
+      this.mentionCategory = null;
+      this.mentionQuery = null;
     }
     if (mode === '"') {
       // The words are the trigger, so editing them inside the quotes is
@@ -1823,6 +1923,9 @@ export class PromptBox {
     // The looks, as soon as a slash is asking about them: inside the branch, or
     // against any query at all, since a query searches every source at once.
     if (mode === "/" && (this.branch === "style" || this.query)) this.readStyles();
+    // @ cites only what this work already holds. New files and kept cast
+    // members are brought in through / or the timeline shelves first.
+    if (mode === "@") return;
     // Nothing in the quote menu is a file. The roster below still is — casting
     // somebody is how a line gets a speaker in a piece that has none.
     const files = mode === '"' ? Promise.resolve(this.library ?? [])
@@ -1867,6 +1970,15 @@ export class PromptBox {
     if (refocus) this.placeCaret(spot.at);
   }
 
+  /** Leaving a typed tag must not erase it just because no file matches yet.
+   *  Blur also recognizes completed manual input without interrupting typing. */
+  finishTyping() {
+    if (this.mode === "@" && /^@[A-Za-z][A-Za-z0-9_]*(?:-\d+)?$/.test(this.typed?.text ?? "")) {
+      this.closeMenu();
+    } else this.dismissMenu(false);
+    this.refresh();
+  }
+
   /**
    * A press anywhere else is "not this", and Escape is the same answer typed.
    *
@@ -1889,9 +2001,10 @@ export class PromptBox {
    */
   watchAway() {
     this.away = (event) => {
+      if (this.replacing?.previewing) return;
       if (this.menu?.contains(event.target)) return;
       if (this.root.contains(event.target)) this.closeMenu();
-      else this.dismissMenu(false);
+      else this.finishTyping();
     };
     this.awayKey = (event) => {
       if (event.key !== "Escape" || !this.menu) return;
@@ -1910,6 +2023,7 @@ export class PromptBox {
   }
 
   closeMenu() {
+    const closePreview = this.replacing?.closePreview;
     if (this.away) {
       document.removeEventListener("pointerdown", this.away, true);
       document.removeEventListener("keydown", this.awayKey, true);
@@ -1923,6 +2037,8 @@ export class PromptBox {
     this.signature = null;
     this.branch = null;
     this.mode = null;
+    this.mentionCategory = null;
+    this.mentionQuery = null;
     this.typed = null;
     this.say = null;
     this.said = "";
@@ -1930,6 +2046,7 @@ export class PromptBox {
     this.anchor = null;
     this.asking = false;
     this.replacing = null;
+    closePreview?.();
   }
 
   place() {
@@ -1948,20 +2065,7 @@ export class PromptBox {
     this.menu.style.top = `${Math.max(8, Math.min(top, window.innerHeight - height - 8))}px`;
   }
 
-  /**
-   * The cast first, then the roster, then attached assets, the piece's pool and
-   * the input folder.
-   *
-   * The cast leads because a subject is what a sentence is usually about, and
-   * because citing one is how their files get here at all. The roster is second
-   * for the same reason a beat later: typing `@ann` in a piece that has never
-   * met Anna is somebody asking for *their*, and the answer is to cast them — with
-   * everything behind them — rather than to say the name matches nothing.
-   *
-   * Somebody already cast here is dropped from the roster half. They are in the
-   * list above under the name they actually has, and offering the kept copy
-   * beside them would be offering to cast a second Anna.
-   */
+  /** Registered names and files, shared by citations and handle replacement. */
   options() {
     const state = this.hooks.getState();
     const cast = (this.hooks.getCast?.() ?? [])
@@ -1987,26 +2091,6 @@ export class PromptBox {
           || asset.filename.toLowerCase().includes(this.query))
         .map((asset) => ({ kind: "pool", handle: asset.handle, path: asset.filename, mediaKind: asset.kind }));
 
-    const here = new Set((this.hooks.getCast?.() ?? []).map((subject) => subject.handle));
-    // Out while references are blocked here — a start or end frame is set — for
-    // the reason the pool and the input folder are out: casting them attaches
-    // their pictures, and a keyframe shot that also carries references is a node
-    // that refuses to queue. They are still on the shelf, where the refusal can
-    // be explained.
-    const roster = this.hooks.attachBlocked("reference") ? [] : (this.roster ?? [])
-      .filter((row) => !here.has(row.name))
-      .filter((row) => !this.query
-        || row.name.toLowerCase().includes(this.query)
-        || (row.note ?? "").toLowerCase().includes(this.query))
-      .map((row) => ({ kind: "roster", handle: row.name, row }));
-
-    const used = new Set(state.assets.map((a) => a.filename));
-    const library = (this.library ?? [])
-      .filter((row) => !used.has(row.path))
-      .filter((row) => !this.query || row.path.toLowerCase().includes(this.query))
-      .slice(0, MAX_SUGGESTIONS)
-      .map((row) => ({ kind: "library", path: row.path, mediaKind: row.kind, row }));
-
     // A screen is set up on the card, so it is only ever cited from here —
     // found by its handle, by what it is ("smart" finds `@phone-1`) or by the
     // file that goes on it.
@@ -2017,7 +2101,7 @@ export class PromptBox {
       .map((screen) => ({ kind: "screen", handle: screen.handle, path: screen.file,
                           label: screen.label }));
 
-    return { cast, roster, attached, screens, pool, library };
+    return { cast, attached, screens, pool };
   }
 
   /**
@@ -2025,10 +2109,8 @@ export class PromptBox {
    *
    * `@` answers "cite something this piece already has". `/` is the question
    * before it — where does a thing come from — which is why it is a layer over
-   * the same rows rather than a second menu of its own. Both halves of the
-   * cast branch are already here: the roster is what `@` shows when you type a
-   * name nobody has cast, and the input folder is what it shows when you type a
-   * filename. What `/` adds is being able to ask without knowing the name.
+   * the same rows rather than a second menu of its own. The roster and input
+   * folder belong here, before a name or file has been registered in the work.
    *
    * Typing filters across every source at once, so `/cla` finds Clara and
    * clay-turntable.png without choosing a branch first — the branches are a
@@ -2267,20 +2349,24 @@ export class PromptBox {
     return groups;
   }
 
-  /**
-   * The groups the menu is showing, head and rows, in the order they read.
-   *
-   * Two shapes over one renderer: `@` cites what is here, `/` says where a
-   * thing comes from — see `options` and `commandOptions`.
-   *
-   * **What is attached comes first.** The cast used to, on the argument that a
-   * person is the more important citation — but that is an argument about the
-   * prompt rather than about the moment `@` is typed. What somebody has just
-   * dropped on this card is the thing they are reaching for, and it was under a
-   * list of everybody in the piece; the cast is second because citing somebody
-   * is the next most common thing, and the two libraries and the pool are the
-   * cases where you are going to type a few letters anyway.
-   */
+  mentionCategories() {
+    const { cast, attached, screens, pool } = this.options();
+    const owned = new Set((this.hooks.getCast?.() ?? []).flatMap(subjectFiles));
+    const seen = new Set();
+    const files = [...attached, ...pool].filter((option) => {
+      if (seen.has(option.handle)) return false;
+      seen.add(option.handle);
+      return true;
+    });
+    const castFiles = files.filter((option) => owned.has(option.handle));
+    const refs = files.filter((option) => !owned.has(option.handle));
+    return [
+      { id: "cast", label: t("Cast"), options: [...sortByHandle(cast), ...sortByHandle(castFiles)] },
+      { id: "refs", label: t("Piece references"), options: sortByHandle([...refs, ...screens]) },
+    ];
+  }
+
+  /** @ cites registered material; / and quotes retain their own source menus. */
   groups() {
     if (this.replacing) {
       const { cast, attached, screens, pool } = this.options();
@@ -2293,22 +2379,14 @@ export class PromptBox {
     }
     if (this.mode === '"') return this.sayOptions();
     if (this.mode === "/") return this.commandOptions();
-    const { cast, roster, attached, screens, pool, library } = this.options();
-    return [
-      { head: this.hooks.attachedLabel?.() ?? t("Attached"), options: attached },
-      { head: t("Screens"), options: screens },
-      // Named for where they are, against the library under it: somebody
-      // taken out of the roster is in the piece from then on, the roster stops
-      // offering them (`options`), and with the shelf folded this row is the
-      // one place that says why.
-      { head: t("In this piece"), options: cast },
-      { head: t("Cast library — cast them with their files"), options: roster },
-      { head: t("Piece references"), options: pool },
-      { head: this.hooks.attachBlocked("reference")
-          ? t("Input folder — unavailable while a start/end frame is set")
-          : t("Input folder"),
-        options: library },
-    ].filter((group) => group.options.length);
+    const categories = this.mentionCategories();
+    let category = categories.find((item) => item.id === this.mentionCategory);
+    if (!category || (this.mentionQuery !== this.query && !category.options.length)) {
+      category = categories.find((item) => item.options.length) ?? categories[0];
+    }
+    this.mentionCategory = category.id;
+    this.mentionQuery = this.query;
+    return [{ options: category.options }];
   }
 
   renderMenu() {
@@ -2326,7 +2404,11 @@ export class PromptBox {
     // and every keystroke re-renders too. Rebuilding identical rows would throw
     // away the highlight and re-fire mouseenter under a stationary pointer, so
     // only rebuild when the list actually differs.
-    const signature = this.flat
+    const categorized = this.mode === "@" && !this.replacing;
+    this.menu.classList.toggle("mmc-mention-catalog", categorized);
+    // The containing editor must leave Escape to this transient menu.
+    this.menu.classList.toggle("mmc-pop", categorized || !!this.replacing);
+    const signature = (categorized ? `${this.mentionCategory}:${this.query}:` : "") + this.flat
       .map((option) => `${option.kind}:${
         option.handle ?? option.path ?? option.branch ?? option.door ?? option.row?.id}`)
       .join("\u0000");
@@ -2336,8 +2418,27 @@ export class PromptBox {
     const menu = this.replacing?.list ?? this.menu;
     menu.replaceChildren();
     this.rows = [];
+    let list = menu;
+    if (categorized) {
+      menu.appendChild(el("div", { class: "mmc-mention-categories" },
+        this.mentionCategories().map((category) => el("button", {
+          type: "button", class: "mmc-mention-category",
+          "data-mention-category": category.id,
+          text: category.label, "aria-pressed": category.id === this.mentionCategory,
+          onpointerdown: (event) => event.preventDefault(),
+          onclick: (event) => {
+            event.preventDefault();
+            this.mentionCategory = category.id;
+            this.active = 0;
+            this.signature = null;
+            this.renderMenu();
+          },
+        }))));
+      list = el("div", { class: "mmc-mention-items" });
+      menu.appendChild(list);
+    }
     if (!this.flat.length) {
-      menu.appendChild(el("div", { class: "mmc-mention-empty", text: t("Nothing matches.") }));
+      list.appendChild(el("div", { class: "mmc-mention-empty", text: t("Nothing matches.") }));
       this.place();
       return;
     }
@@ -2424,7 +2525,18 @@ export class PromptBox {
         ? [option.label, option.path.split("/").pop()].filter(Boolean).join(" · ")
         : option.handle ? option.path : (option.row?.subfolder || "");
 
-      const item = el("button", {
+      const replacing = this.replacing;
+      const text = el(replacing ? "button" : "span", {
+        class: `mmc-mention-text${replacing ? " mmc-handle-choice" : ""}`,
+        ...(replacing ? { type: "button" } : {}),
+      }, [
+        el("span", {
+          class: `mmc-mention-handle${option.handle ? ` mmc-tag-${tagIndex(option.handle)}` : ""}`,
+          text: title,
+        }),
+        ...(subtitle ? [el("span", { class: "mmc-mention-sub", text: subtitle })] : []),
+      ]);
+      const item = el(replacing ? "div" : "button", {
         class: `mmc-mention-row${option.kind === "branch" ? " mmc-mention-branch" : ""}${
           option.kind === "style" ? " mmc-mention-style" : ""}`,
         "aria-selected": here === this.active,
@@ -2441,18 +2553,22 @@ export class PromptBox {
         onmouseenter: () => this.highlight(here),
         onclick: (event) => { event.preventDefault(); this.choose(here); },
       }, [
-        thumb,
-        el("span", { class: "mmc-mention-text" }, [
-          el("span", {
-            class: `mmc-mention-handle${option.handle ? ` mmc-tag-${tagIndex(option.handle)}` : ""}`,
-            text: title,
-          }),
-          ...(subtitle ? [el("span", { class: "mmc-mention-sub", text: subtitle })] : []),
-        ]),
+        thumb, text,
         // A branch goes deeper; a door leaves. Said with the glyph rather than
         // with words, because the row already has two lines of them.
         ...(option.kind === "branch" ? [el("span", { class: "mmc-mention-more", text: "›" })] : []),
       ]);
+      if (replacing && this.replacementPreviewFiles(option).length) {
+        previewable(thumb, {
+          title: t("Click to select; double-click to preview @{handle}.", { handle: option.handle }),
+          click: () => {
+            if (this.replacing !== replacing || !thumb.isConnected || replacing.previewing) return;
+            const current = this.flat.findIndex((row) => row.kind === option.kind && row.handle === option.handle);
+            if (current !== -1) this.choose(current);
+          },
+          open: () => this.previewReplacement(option, replacing),
+        });
+      }
       // Keep focus in the box: a blurred contenteditable loses its caret, and
       // without a caret there is nowhere to insert the chip.
       item.addEventListener("pointerdown", (event) => event.preventDefault());
@@ -2483,8 +2599,8 @@ export class PromptBox {
     }
     for (const group of groups) {
       if (!group.options.length) continue;
-      menu.appendChild(el("div", { class: "mmc-mention-head", text: group.head }));
-      for (const option of group.options) menu.appendChild(row(option));
+      if (group.head) list.appendChild(el("div", { class: "mmc-mention-head", text: group.head }));
+      for (const option of group.options) list.appendChild(row(option));
     }
     if (this.mode === '"' && !this.branch) this.menu.appendChild(this.sayBar());
     this.place();
@@ -2597,37 +2713,37 @@ export class PromptBox {
    * because that text is the only thing that was ever stored.
    */
   editSaid(chip) {
-    SPOKEN.lastIndex = 0;
-    const match = SPOKEN.exec(chip.dataset.say);
-    if (!match) return;
+    const text = this.getValue();
+    const index = [...this.root.childNodes].indexOf(chip);
+    const start = this.offsetOf(this.root, index);
+    const span = parseDialogue(text).find((item) => item.start === start && item.complete);
+    if (!span) return;
+    const speech = parseSpeech(text, span);
+    const edit = this.hooks.onDialogueEdit ?? dialogueEditor;
+    if (edit) {
+      this.closeMenu();
+      edit({ ...span, box: this, speech });
+      return;
+    }
+    if (!speech) {
+      this.closeMenu();
+      this.ask({ head: t("Dialogue"), value: span.words,
+        hint: t("Only the spoken words are replaced. The surrounding prompt stays as written."),
+        done: (words) => this.replaceRange(span, `<d>${span.language ? `[${span.language}] ` : ""}${words}</d>`) });
+      return;
+    }
     // Whatever was open belongs to a different question. Closed first, and the
     // mode set by hand afterwards, because `openMenu` clears the choice on a
     // change of mode — which is right when a quote is being typed and wrong
     // here, where the choice is the thing being carried in.
     this.closeMenu();
-    const [, names, lead, language, words] = match;
-    const said = lead.trim();
-    const known = DELIVERY.find((d) => said === d.lead || said === d.together);
+    const { who, language, words, delivery, lead } = speech;
     this.say = {
-      who: names.split(",").map((handle) => handle.trim().slice(1)),
-      language,
-      delivery: known?.id ?? SAYS.id,
-      // Kept verbatim where this menu did not write it — see `sayLine`.
-      lead: known ? null : said,
+      who, language, delivery, lead,
     };
     // Where the chip sits in the text, so choosing rewrites it in place rather
     // than adding a second line beside it.
-    let at = 0;
-    for (const node of this.root.childNodes) {
-      if (node === chip) {
-        this.editing = { at, length: chip.dataset.say.length };
-        break;
-      }
-      at += node.nodeType === Node.TEXT_NODE ? bare(node.nodeValue).length
-        : node.dataset?.say !== undefined ? node.dataset.say.length
-        : node.dataset?.handle ? node.dataset.handle.length + 1 : 1;
-    }
-    if (!this.editing) return;
+    this.editing = { at: speech.start, length: speech.end - speech.start };
     // The menu opens over the line rather than over the caret: there is no
     // caret, and the line is what is being changed.
     this.anchor = chip.getBoundingClientRect?.() ?? null;

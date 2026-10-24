@@ -2,7 +2,7 @@
 // No backticks or ${} anywhere in the CSS: each chunk is one template literal.
 export const css = `
 /* --- the refiner ---------------------------------------------------------- */
-/* One press refines; the corner opens the settings. The corner sits inside the
+/* Two presses refine; the corner opens the settings. The corner sits inside the
    tile's own rounded box rather than floating over it, so the rail keeps its
    alignment and the control cannot be mistaken for a badge on its neighbour. */
 .mmc-refine-split { position: relative; display: flex; }
@@ -25,6 +25,17 @@ export const css = `
    is exactly what made the old control read as a notification dot. */
 .mmc-refine-more:focus:not(:focus-visible) { outline: none; }
 
+/* Confirmation keeps the control's measured width and its original hit box. */
+.mmc-refine-split > button.mmc-refine-confirm {
+  box-sizing: border-box; color: var(--mmc-bad);
+}
+.mmc-refine-split > button.mmc-refine-confirm:hover:not(:disabled) { color: var(--mmc-bad); }
+.mmc-refine-split > button.mmc-refine-confirm .mmc-tool-icon,
+.mmc-refine-split > button.mmc-refine-confirm:hover:not(:disabled) .mmc-tool-icon {
+  color: var(--mmc-bad); border-color: color-mix(in srgb, var(--mmc-bad) 60%, transparent);
+  background: color-mix(in srgb, var(--mmc-bad) 10%, var(--mmc-surface-2));
+}
+
 /* A refine is a round trip to a local model and can take a minute. The pulse is
    the only thing saying the click landed. */
 .mmc-tool.busy, .mmc-pill.busy { color: var(--mmc-accent); cursor: progress; }
@@ -42,6 +53,15 @@ export const css = `
 .mmc-tl-unrefine { color: var(--mmc-dim); }
 .mmc-tl-unrefine:hover { color: var(--mmc-text); }
 .mmc-refine-split.pill { align-items: stretch; }
+.mmc-refine-split.pill > .mmc-pill {
+  display: inline-flex; flex-direction: row; align-items: center; justify-content: center;
+  box-sizing: border-box; min-height: var(--mmc-pill-h); flex: 0 0 auto;
+}
+.mmc-refine-split.pill > .mmc-pill > .mmc-tool-icon {
+  flex: none; width: 16px; height: 16px; min-width: 0; min-height: 0;
+  padding: 0; border: 0; border-radius: 0; background: transparent;
+}
+.mmc-refine-split.pill > .mmc-pill > .mmc-tool-icon svg { width: 16px; height: 16px; }
 .mmc-refine-split.pill .mmc-refine-more {
   /* The pill's own height, not a number: the pill is --mmc-pill-h, which the
      text size scales, and a chevron fixed at 38 sat short inside a 43px pill
@@ -49,6 +69,7 @@ export const css = `
   position: static; width: 24px; height: var(--mmc-pill-h); border-radius: 0 19px 19px 0;
   margin-left: 0; background: var(--mmc-surface-2);
   border: 1px solid var(--mmc-line); border-left: 0; color: var(--mmc-dim);
+  box-sizing: border-box; flex: 0 0 24px;
 }
 .mmc-refine-split.pill .mmc-refine-more:hover { background: var(--mmc-surface-3); }
 /* Two halves of one pill: the label's end is squared where the chevron joins
@@ -56,10 +77,26 @@ export const css = `
    curve showed through as a notch in the outline. */
 .mmc-refine-split.pill .mmc-pill { padding-right: 12px; border-radius: 19px 0 0 19px; border-right: 0; }
 
-/* A card, not a strip: 264px stacked every section into a scroll of wrapped
-   chips and paragraphs. At 420 the chips sit in rows, the dials share a line,
-   and the popover reads top to bottom as decisions rather than documentation. */
-.mmc-refine-pop { width: 420px; max-width: calc(100vw - 24px); padding: 10px; }
+/* Related settings stay visible together. Constrained screens use labelled
+   section pages. File inventories alone are allowed their own scroll region. */
+.mmc-refine-pop {
+  width: 840px; max-width: calc(100vw - 24px); padding: 10px;
+  max-height: none; overflow: visible; box-sizing: border-box;
+}
+.mmc-refine-settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+.mmc-refine-settings-page { min-width: 0; }
+.mmc-refine-model-page { grid-row: 1 / 3; padding-right: 12px; border-right: 1px solid var(--mmc-line); }
+.mmc-refine-sampling-page { border-top: 1px solid var(--mmc-line); padding-top: 10px; }
+.mmc-refine-sampling-page > .mmc-note-key { display: block; padding: 0 10px 6px; }
+.mmc-refine-prompt-page > .mmc-refine-section:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.mmc-refine-settings-tabs { display: none; gap: 5px; flex-wrap: wrap; padding: 0 2px 10px; }
+.mmc-refine-settings-tabs [aria-selected="true"] { background: var(--mmc-accent); color: var(--mmc-bg); }
+.mmc-refine-pop.paged { width: 480px; }
+.mmc-refine-pop.paged .mmc-refine-settings-tabs { display: flex; }
+.mmc-refine-pop.paged .mmc-refine-settings-grid { display: block; }
+.mmc-refine-pop.paged .mmc-refine-settings-page:not(.active) { display: none; }
+.mmc-refine-pop.paged .mmc-refine-model-page { padding-right: 0; border-right: 0; }
+.mmc-refine-pop.paged .mmc-refine-sampling-page { border-top: 0; padding-top: 0; }
 
 /* The header holds the first decision: the title names the tool, the switch
    says where it runs. A segmented track rather than two loose chips — this is
@@ -112,8 +149,15 @@ export const css = `
 .mmc-refine-status.bad .mmc-dot { color: var(--mmc-warn); }
 .mmc-refine-status-text { min-width: 0; }
 
-/* Only the lists scroll; the card and the sections stay put. */
-.mmc-refine-list, .mmc-refine-remote-rows { max-height: 210px; overflow-y: auto; }
+/* All file names remain in one vertical list. Only this inventory scrolls. */
+.mmc-refine-list, .mmc-refine-remote-rows { max-height: none; overflow: visible; }
+.mmc-refine-choice-list { min-width: 0; }
+.mmc-refine-choice-rows {
+  display: flex; flex-direction: column; max-height: 210px;
+  overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+  scrollbar-width: thin; scrollbar-gutter: stable;
+}
+.mmc-refine-choice-rows > .mmc-opt { flex: 0 0 auto; }
 
 /* A hairline starts each section, which is what lets the uppercase eyebrows
    read as headings instead of drowning between paragraphs. */
@@ -121,6 +165,9 @@ export const css = `
 .mmc-refine-section:empty { display: none; }
 .mmc-refine-section > .mmc-note-key { display: block; padding: 0 10px 6px; }
 .mmc-refine-section > .mmc-chips { padding: 0 10px 4px; }
+.mmc-refine-visual { display: flex; flex-direction: column; gap: 5px; padding: 8px 10px 2px; }
+.mmc-refine-visual .mmc-refine-row { align-items: center; }
+.mmc-refine-visual-title { font-size: calc(14px * var(--mmc-type)); color: var(--mmc-text); }
 /* Names run to a folder-qualified qwen3vl/qwen3vl_4b_instruct_fp8.safetensors.
    The row ellipsises and the title carries the whole of it. */
 .mmc-refine-name {
@@ -134,6 +181,12 @@ export const css = `
   flex: none; margin-left: auto; margin-right: 8px;
   font-size: calc(10px * var(--mmc-type)); color: var(--mmc-dim);
   border: 1px solid var(--mmc-line); border-radius: 999px; padding: 1px 7px;
+}
+.mmc-refine-beta {
+  flex: none; margin-left: 8px; color: var(--mmc-accent);
+  font-size: calc(10px * var(--mmc-type)); line-height: 1.2;
+  border: 1px solid color-mix(in srgb, var(--mmc-accent) 45%, var(--mmc-line));
+  border-radius: 999px; padding: 2px 7px;
 }
 .mmc-refine-hint { font-size: calc(11px * var(--mmc-type)); color: var(--mmc-dim); line-height: 1.4; }
 /* The eject chip sits inside the server card, under its hint: it is a
@@ -198,6 +251,9 @@ export const css = `
    it should not mean running the model again. */
 .mmc-refined { display: flex; flex-direction: column; gap: 8px; }
 .mmc-refined:empty { display: none; }
+.mmc-field-refined { display: flex; flex-direction: column; gap: 7px; margin: 8px 0 0;
+  padding-top: 10px; border-top: 1px solid var(--mmc-line); }
+.mmc-field-refined:empty { display: none; }
 .mmc-refined-head { display: flex; align-items: center; gap: 8px; font-size: calc(12px * var(--mmc-type)); }
 .mmc-refined-toggle {
   display: flex; align-items: center; gap: 6px; background: none; border: 0;

@@ -9,6 +9,13 @@ const css = ['base', 'picker', 'overlays'].map(name =>
   read(`styles/${name}.js`).match(/export const css = `([^]*)`;\s*$/)[1]).join('\n');
 const picker = read('picker.js').replace(/^import [^]*?;\r?\n/gm, '').replace(/^export /gm, '');
 const dom = read('dom.js').replace(/^export /gm, '');
+const memory = `
+const {readViewPrefs,patchViewPrefs,pickerViewContext,pickerViewKind,clearViewPrefs}=(()=>{
+  ${read('viewprefs.js').replace(/^export /gm,'')}
+  return {readViewPrefs,patchViewPrefs,pickerViewContext,pickerViewKind,clearViewPrefs};})();
+const {pickerSelectionContext,readPickedPaths,writePickedPaths}=(()=>{
+  ${read('picker-checks.js').replace(/^export /gm,'')}
+  return {pickerSelectionContext,readPickedPaths,writePickedPaths};})();`;
 let browser, passed = 0;
 async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok ${passed} - ${name}\n`); }
 
@@ -19,12 +26,12 @@ async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok $
   page.on('pageerror', error => errors.push(error.message));
   await page.route('**/*', route => { requests.push(route.request().url()); route.abort(); });
   await page.setContent(`<style>:root {--comfy-menu-bg:#191919;--fg-color:#ddd;--input-text:#ddd;--descrip-text:#999;--bg-color:#111;--warning-background:#f0a930;--primary-background:#467cb8;}body {background:#111;} ${css}</style><body></body>`);
-  await page.evaluate(({ dom, picker }) => {
+  await page.evaluate(({ dom, picker, memory }) => {
     window.fixture = {
       folders: [{ id: 'a', name: 'Project media', path: 'H:\\Projects\\Media' },
         { id: 'b', name: 'Other folder', path: 'H:\\Projects\\Other' }],
       prefs: { favorites: [], lastShelf: {}, externalFolder: null },
-      calls: [], imports: [], choice: null, delay: null, importError: null,
+      calls: [], directoryCalls: [], imports: [], choice: null, delay: null, importError: null,
       files: [
         { path: 'external:a/face.png', kind: 'image', name: 'Face', subfolder: '', size: 23, mtime: 1 },
         { path: 'external:a/sub/scene.png', kind: 'image', name: 'Scene', subfolder: 'sub', size: 42, mtime: 2 },
@@ -52,15 +59,22 @@ async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok $
       const chooseExternalFolder=async()=>fixture.choice?{folder:structuredClone(fixture.choice)}:null;
       const removeExternalFolder=async id=>{fixture.calls.push(['forget',id]);fixture.folders=fixture.folders.filter(f=>f.id!==id);};
       const revealExternalFolder=async id=>{fixture.calls.push(['reveal',id]);return fixture.folders.find(f=>f.id===id)?.path;};
-      const listExternalAssets=async({folder,kind})=>{
+      const listExternalAssets=async({folder,kind,directory=''})=>{
         fixture.calls.push(['external',folder,kind]);
-        const rows=fixture.files.filter(row=>row.path.startsWith('external:'+folder+'/'))
+        fixture.directoryCalls.push([folder,kind,directory]);
+        const prefix='external:'+folder+'/'+(directory?directory+'/':'');
+        const candidates=fixture.files.filter(row=>row.path.startsWith(prefix));
+        const names=[...new Set(candidates.map(row=>row.path.slice(prefix.length)).filter(name=>name.includes('/')).map(name=>name.split('/')[0]))];
+        const folders=names.map(name=>({name,directory:(directory?directory+'/':'')+name}));
+        const rows=candidates.filter(row=>!row.path.slice(prefix.length).includes('/'))
           .filter(row=>kind==='refmods'?row.mod:!row.mod&&(kind==='renders'||kind==='guides'
             ? ['image','video'].includes(row.kind):row.kind===kind));
         if(fixture.delay) await fixture.delay(folder,kind);
         if(fixture.listError) throw Error(fixture.listError);
-        return {assets:structuredClone(rows),truncated:fixture.truncated===true};
+        return {assets:structuredClone(rows),folders,directory,parent:directory?directory.split('/').slice(0,-1).join('/'):null,truncated:fixture.truncated===true};
       };
+      const checkExternalAssets=async({paths})=>({assets:paths.map(path=>fixture.files.find(row=>row.path===path)).filter(Boolean)});
+      const memberFromMod=async()=>{};
       const importExternalAssets=async rows=>{
         fixture.imports.push(structuredClone(rows));
         if(fixture.importDelay) await fixture.importDelay();
@@ -70,23 +84,24 @@ async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok $
       };
       const viewUrl=()=>${JSON.stringify(preview)},stillUrl=asset=>asset.kind==='audio'?null:viewUrl();
       const greyField=()=> '#222',cropLabel=()=>'',trimLabel=()=>'',dropQueued=()=>{};
-      const queueState=()=>({remaining:0});
+      const queueState=()=>({remaining:0}),watchQueue=()=>()=>{};
       const openTrim=async options=>{fixture.calls.push(['trim',options.path]);return {trim:{start:1,end:3},track:'picture+sound'};};
       const openPicture=async options=>{fixture.calls.push(['picture',options.path]);return null;};
       const cutPanel=async options=>{fixture.calls.push(['cut',options.panels.map(p=>p.path)]);return URL.createObjectURL(new Blob(['x']));};
       const buildPlate=async options=>{fixture.calls.push(['plate',options.panels.map(p=>p.path)]);return {path:'_plates/test.png'};};
       const moveAsset=async()=>{throw Error('external originals must not move');};
       const deleteAsset=async()=>{throw Error('external originals must not delete');};
-      ${dom}\n${picker}\nwindow.Picker=Picker;
+      ${dom}\n${memory}\n${picker}\nwindow.Picker=Picker;window.clearFixtureViews=clearViewPrefs;
     `);
     window.makePicker = options => {
       if (window.subject && !subject.closed) subject.close(null);
+      window.clearFixtureViews();
       window.result = undefined;
       window.subject = new Picker({ kinds: ['image','video','audio','renders','refmods'], kind: 'image', ...options },
         result => { window.result = result; });
       subject.mount();
     };
-  }, { dom, picker });
+  }, { dom, picker, memory });
   const open = async (options = {}) => {
     await page.evaluate(options => makePicker(options), options);
     await page.waitForFunction(() => subject.loaded);
@@ -124,7 +139,8 @@ async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok $
     const before=await builtinShelves();
     const builtinCalls=(await calls()).filter(c=>c[0]==='builtin').length;
     await choose('a');
-    assert.deepEqual(await paths(),['external:a/face.png','external:a/sub/scene.png']);
+    assert.deepEqual(await paths(),['external:a/face.png']);
+    assert.deepEqual(await page.evaluate(()=>subject.externalDirectories),[{name:'sub',directory:'sub'}]);
     assert.equal(await page.evaluate(()=>fixture.imports.length),0);
     assert.equal(await page.locator('.mmc-external-folder .mmc-shelf').count(),2);
     assert.equal(await page.locator('.mmc-organize').isVisible(),false);
@@ -138,13 +154,25 @@ async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok $
     await page.getByRole('button',{name:'Open folder',exact:true}).click();
     assert.ok((await calls()).some(c=>c[0]==='reveal'&&c[1]==='a'));
   });
+  await test('child folders remain navigable and list their own files without scanning other grants', async () => {
+    const before=(await calls()).filter(c=>c[0]==='builtin').length;
+    await page.evaluate(()=>subject.openExternalDirectory('sub'));
+    await page.waitForFunction(()=>subject.loaded);
+    assert.deepEqual(await paths(),['external:a/sub/scene.png']);
+    assert.equal(await page.evaluate(()=>subject.externalParent),'');
+    await page.evaluate(()=>subject.openExternalDirectory(''));
+    await page.waitForFunction(()=>subject.loaded);
+    assert.deepEqual(await paths(),['external:a/face.png']);
+    assert.deepEqual(await page.evaluate(()=>fixture.directoryCalls.slice(-2)),[['a','image','sub'],['a','image','']]);
+    assert.equal((await calls()).filter(c=>c[0]==='builtin').length,before);
+  });
   await test('reclick refreshes only the chosen folder and notices manually added files', async () => {
     const before=(await calls()).filter(c=>c[0]==='builtin').length;
     await page.evaluate(()=>fixture.files.push({path:'external:a/new.png',kind:'image',name:'New image',mtime:7}));
     await selectFolder('a');
     assert.ok((await paths()).includes('external:a/new.png'));
     assert.equal((await calls()).filter(c=>c[0]==='builtin').length,before);
-    assert.deepEqual((await calls()).filter(c=>c[0]==='external').map(c=>c[1]),['a','a']);
+    assert.deepEqual((await calls()).filter(c=>c[0]==='external').map(c=>c[1]),['a','a','a','a']);
   });
   await test('video, audio, render and RefMod tabs scan the same selected folder with their own filters', async () => {
     const expected={video:['video'],audio:['audio'],renders:['image','video'],refmods:['image']};
@@ -266,11 +294,11 @@ async function test(name, fn) { await fn(); passed++; process.stdout.write(`ok $
     assert.equal(await page.evaluate(()=>fixture.imports.at(-1).length),1);
   });
   await test('copy failure leaves picker open with original selection and an actionable message', async () => {
-    await open();await page.evaluate(()=>{subject.toggle(subject.visible()[0]);fixture.importError='Cannot copy selected file';});
+    await open();await page.evaluate(()=>{window.failedSelection=subject.visible()[0].path;subject.toggle(subject.visible()[0]);fixture.importError='Cannot copy selected file';});
     await page.getByRole('button',{name:'Add',exact:true}).click();
     await page.waitForFunction(()=>!subject.committing && subject.slots.textContent==='Cannot copy selected file');
     assert.equal(await page.evaluate(()=>result),undefined);
-    assert.equal(await page.evaluate(()=>subject.selected[0].path),'external:a/face.png');
+    assert.equal(await page.evaluate(()=>subject.selected[0].path),await page.evaluate(()=>failedSelection));
     await page.evaluate(()=>{fixture.importError=null;});
   });
   await test('cancelling while copying cannot later close or attach results', async () => {

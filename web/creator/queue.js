@@ -93,11 +93,12 @@ if (typeof api.queuePrompt === "function") {
   const original = api.queuePrompt;
   api.queuePrompt = async function (...args) {
     const output = args[1]?.output;
+    const workflow = args[1]?.workflow;
     const targets = (args[2]?.partialExecutionTargets ?? []).map(String);
     const snapshots = [];
     for (const listener of submissions) {
       try {
-        const snapshot = listener.capture(output, targets);
+        const snapshot = listener.capture(output, targets, workflow);
         if (snapshot) snapshots.push([listener, snapshot]);
       } catch (error) { console.warn("[Continuity] could not snapshot a submitted strip", error); }
     }
@@ -111,7 +112,7 @@ if (typeof api.queuePrompt === "function") {
       const items = refusalItems(error?.response, titlesOf(output));
       if (!items.length) items.push({ nodeId: null, where: null, what: String(error?.message ?? error) });
       api.dispatchEvent(new CustomEvent("mmc_refused", {
-        detail: { nodes: Object.keys(output ?? {}), targets, items },
+        detail: { nodes: Object.keys(output ?? {}), targets, items, workflow },
       }));
       throw error;
     }
@@ -272,9 +273,15 @@ export function watch(listener) {
  * `client_id` goes in the body because `executed` is addressed to the tab that
  * queued the job, exactly as it is for a render.
  *
- * A refine on the remote backend answers with `{result}` in the reply itself —
- * no GPU here, nothing to queue behind — and this hands that straight back.
- * So does a plate with nothing cut out.
+ * A reply with `{result}` in it needed no waiting at all — a plate with
+ * nothing cut out — and this hands that straight back.
+ *
+ * A refine or a chat turn on the remote backend is neither: no GPU here and
+ * nothing to queue behind, but too long to answer inside the request, which
+ * the frontend aborts after 60 seconds (issue #120). Its reply names an
+ * `answer_id`, and the result follows on `mmc_answer` under that id
+ * (`jobs.answer_later`). The same wait, minus `onQueued`: there is no queue
+ * entry to take off.
  *
  * `onQueued(promptId)` fires once the reply names the queue entry, for a
  * caller that may want to take it off the queue again — a picker closed while
@@ -299,6 +306,10 @@ export async function run(route, body, { onProgress, onQueued } = {}) {
                                         { status: response.status }));
     }
     if (answer.result !== undefined) { pending.abandon(); return answer.result; }
+    if (answer.answer_id) {
+      pending.expect(answer.answer_id, answer.answer_token);
+      return await pending.promise;
+    }
     if (!answer.prompt_id) throw new Error(t("the server queued nothing"));
     pending.expect(answer.prompt_id);
     onQueued?.(answer.prompt_id);
@@ -325,8 +336,18 @@ function collect(onProgress) {
   let resolve, reject;
   const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
   const off = [];
+  let finished = false, remote = null;
+  let recoveryTimer = null, cancelLookup = null, recovering = false, retryNow = false;
+  let retryDelay = 2000;
+  const stop = () => {
+    if (finished) return false;
+    finished = true;
+    for (const remove of off.splice(0)) remove();
+    held.length = 0;
+    return true;
+  };
   const done = (finish) => (...args) => {
-    for (const remove of off) remove();
+    if (!stop()) return;
     finish(...args);
   };
   const settle = done(resolve);
@@ -339,6 +360,7 @@ function collect(onProgress) {
   const held = [];
   const on = (name, handler) => {
     const gated = (event) => {
+      if (finished) return;
       if (promptId === null) { held.push([name, event]); return; }
       if (event.detail?.prompt_id !== promptId) return;
       handler(event);
@@ -348,11 +370,101 @@ function collect(onProgress) {
     return gated;
   };
   const handlers = {};
-  const expect = (id) => {
-    promptId = id;
-    for (const [name, event] of held.splice(0)) handlers[name]?.(event);
+  const acknowledge = () => {
+    if (!remote) return;
+    // A receipt clears only this completed answer. It never cancels or repeats
+    // the remote work, and a failed receipt may safely expire on the server.
+    try {
+      Promise.resolve(api.fetchApi("/continuity/answers", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer_id: remote.id, answer_token: remote.token, ack: true }),
+      })).catch(() => {});
+    } catch (_) { /* best effort */ }
   };
-  const abandon = () => { for (const remove of off) remove(); };
+  const remoteAnswer = (detail) => {
+    if (finished || detail?.prompt_id !== promptId) return;
+    if (detail.error !== undefined) {
+      const error = new Error(detail.error || t("the job failed"));
+      if (detail.cancelled === true) error.cancelled = true;
+      fail(error);
+      acknowledge();
+    } else if (detail.result !== undefined) {
+      settle(detail.result);
+      acknowledge();
+    } else {
+      fail(new Error(t("the job finished without an answer")));
+    }
+  };
+  const scheduleRecovery = (delay) => {
+    clearTimeout(recoveryTimer);
+    if (!finished) recoveryTimer = setTimeout(recover, delay);
+  };
+  const recover = async () => {
+    if (finished || !remote || recovering) return;
+    recovering = true;
+    const controller = new AbortController();
+    let deadline = null;
+    // Bound the wait even if a host's fetch wrapper replaces our signal. This
+    // is only a lookup: a timeout never posts the original work again.
+    const interrupted = new Promise((_, rejectLookup) => {
+      cancelLookup = () => {
+        controller.abort();
+        rejectLookup(new Error("remote answer lookup interrupted"));
+      };
+      deadline = setTimeout(cancelLookup, 10000);
+    });
+    try {
+      const lookup = (async () => {
+        const response = await api.fetchApi("/continuity/answers", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ answer_id: remote.id, answer_token: remote.token }),
+          signal: controller.signal,
+        });
+        return { response, answer: await response.json().catch(() => ({})) };
+      })();
+      const { response, answer } = await Promise.race([lookup, interrupted]);
+      if (finished) return;
+      if ([400, 401, 403, 404, 410].includes(response.status)) {
+        // Expired/missing answers and rejected tickets cannot be repaired by
+        // waiting. Reuse the caller's existing error path so it can retry.
+        fail(new Error(t("the job finished without an answer")));
+      } else if (!response.ok) {
+        retryDelay = Math.min(10000, retryDelay * 2);
+      } else if (answer.status === "complete") {
+        remoteAnswer(answer);
+      } else {
+        retryDelay = 2000;
+      }
+    } catch (_) {
+      // The websocket and this request can both be down briefly. Keep the
+      // same ticket and retry the lookup rather than starting a second call.
+      retryDelay = Math.min(10000, retryDelay * 2);
+    } finally {
+      clearTimeout(deadline);
+      cancelLookup = null;
+      recovering = false;
+      if (!finished) scheduleRecovery(retryNow ? 0 : retryDelay);
+      retryNow = false;
+    }
+  };
+  const expect = (id, token = null) => {
+    promptId = id;
+    if (typeof token === "string" && token) remote = { id, token };
+    for (const [name, event] of held.splice(0)) handlers[name]?.(event);
+    if (remote && !finished) {
+      const reconnect = () => {
+        if (finished) return;
+        clearTimeout(recoveryTimer);
+        if (recovering) { retryNow = true; cancelLookup?.(); }
+        else recover();
+      };
+      api.addEventListener("reconnected", reconnect);
+      off.push(() => api.removeEventListener("reconnected", reconnect));
+      off.push(() => { clearTimeout(recoveryTimer); cancelLookup?.(); });
+      scheduleRecovery(2000);
+    }
+  };
+  const abandon = stop;
 
     // The bar this job's node ticks — `jobs.progress()` on the server — arrives
     // on ComfyUI's own channel now, where it used to come back on a channel per
@@ -387,6 +499,10 @@ function collect(onProgress) {
     handlers.execution_error = on("execution_error", ({ detail }) => {
       fail(new Error(detail.exception_message || t("the job failed")));
     });
+
+    // An answer that never went on the queue — see `run` — under the same id
+    // key, so it is gated and replayed exactly as `executed` is.
+    handlers.mmc_answer = on("mmc_answer", ({ detail }) => remoteAnswer(detail));
 
     handlers.execution_interrupted = on("execution_interrupted", ({ detail }) => {
       const cancelled = new Error(t("cancelled"));

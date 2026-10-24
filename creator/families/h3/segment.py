@@ -25,7 +25,7 @@ import json
 from comfy_api.latest import io
 
 from ... import compile as compiler, lora, media, raylight
-from . import declare, encode as encoder, payload as payload_repair
+from . import contextir, declare, encode as encoder, payload as payload_repair
 
 SEGMENT_NODE = declare.SEGMENT_NODE
 
@@ -233,17 +233,19 @@ class MiniMaxH3TimelineSegment(io.ComfyNode):
                 "— so it needs the audio VAE on 'audio_vae'."
             )
 
-        # `prompt_override` replaces the composed prompt verbatim, after
+        # `prompt_override` replaces the composed prompt's content, after
         # compiling — routing, canvas and references are all still worked out
         # from the request, and only the text the DiT reads is swapped. It has no
         # control of its own any more: the node has no sockets, and the refiner's
         # editable rewrite is the same escape hatch with a UI on it. Still read
         # here because a hand-written blob may carry one, and because it lives
         # inside the string this node caches on, so changing it re-runs the
-        # generation exactly as editing the prompt would.
+        # generation exactly as editing the prompt would. It uses the same
+        # outgoing heading/annotation formatting as an ordinary compiled prompt,
+        # without adding references or sections to the supplied override.
         override = payload.get("prompt_override")
         if override:
-            compiled.prompt = override
+            compiled.prompt = contextir.normalize_model_prompt(override)
 
         # Nothing to patch, and nothing to hand back: the multi-GPU backend
         # loads the transformer inside Ray's workers and merges the LoRAs there,

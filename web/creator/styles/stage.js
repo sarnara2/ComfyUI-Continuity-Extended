@@ -226,9 +226,12 @@ export const css = `
    before you queue instead of after. */
 .mmc-weights.missing { border-color: color-mix(in srgb, var(--mmc-warn) 45%, transparent); color: var(--mmc-warn); }
 .mmc-weights.missing:hover:not(:disabled) { border-color: color-mix(in srgb, var(--mmc-warn) 75%, transparent); }
-/* Wider with a device column: "cuda:0" beside a folder-qualified filename needs
-   the room, and a popover that ellipsises both tells you neither. */
-.mmc-weights-pop { width: 380px; padding: 8px; }
+/* Filenames get twice the old desktop room. The popover remains inside the
+   viewport; long values travel inside a stationary one-line button. */
+.mmc-weights-pop {
+  width: 760px; max-width: calc(100vw - 16px); min-width: 0;
+  padding: 8px; box-sizing: border-box;
+}
 .mmc-weight-row {
   display: flex; align-items: center; gap: 8px; width: 100%;
   padding: 3px 4px; box-sizing: border-box;
@@ -249,6 +252,32 @@ export const css = `
 }
 .mmc-weight-file.empty { color: var(--mmc-off); direction: ltr; }
 .mmc-weight-row.missing .mmc-weight-file { color: var(--mmc-warn); }
+.mmc-weights-pop .mmc-weight-name {
+  width: calc(112px * var(--mmc-type)); max-width: 190px; min-width: 0;
+  overflow-wrap: anywhere;
+}
+.mmc-weights-pop .mmc-weight-file {
+  direction: ltr; white-space: nowrap; overflow: hidden;
+  text-overflow: clip; line-height: 1.45;
+}
+.mmc-weights-pop .mmc-weight-file-label {
+  display: block; width: max-content; white-space: nowrap;
+}
+/* With motion disabled the same full text can be read by horizontal scrolling
+   (including Left/Right/Home/End while focused), or its complete tooltip. */
+@media (prefers-reduced-motion: reduce) {
+  .mmc-weights-pop .mmc-weight-file.mmc-weight-marquee { overflow-x: auto; scrollbar-width: thin; }
+}
+/* On compact screens the label/device share the first line and the filename
+   gets the full second line, without changing which control owns the click. */
+@media (max-width: 600px) {
+  .mmc-weights-pop .mmc-weight-row {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px;
+  }
+  .mmc-weights-pop .mmc-weight-name { grid-column: 1; grid-row: 1; width: auto; max-width: none; }
+  .mmc-weights-pop .mmc-weight-file { grid-column: 1 / -1; grid-row: 2; width: 100%; box-sizing: border-box; }
+  .mmc-weights-pop .mmc-weight-device { grid-column: 2; grid-row: 1; }
+}
 /* The device this field's weights load on. Quiet at "auto", which is the answer
    on every single-GPU machine and most multi-GPU ones; lit once it is a decision
    somebody made, because which card a thing is on is worth seeing at a glance. */
